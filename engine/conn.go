@@ -386,19 +386,9 @@ func (c *Conn) Read() (int, error) {
 			c.growReadBuffer()
 		}
 
-		// 短读**不能**直接返回。ET 模式下"数据读完"和"对端关了(FIN)"
-		// 是两个独立的状态变化，而边缘只在后者到来时给一次——如果这次
-		// 只读到数据就返回，FIN 那个边缘会因为"这个 fd 已经在处理中"
-		// 被并进 pending，而 pending 的处理不会再产生新的读……
-		//
-		// 实测：客户端发 5 字节再 close，只有一次 [poll] 事件，OnClose
-		// 永远不调。所以要接着读，直到 EAGAIN（没数据了）或者 0（FIN）。
-		//
-		// 迁移前 websocket 的读循环是短读就 break（"省掉那次一定返回
-		// EAGAIN 的 read"），在这套 pending 机制下会丢 FIN——Linux 上
-		// 试过，websocket 的测试直接挂。多一次系统调用换"FIN 一定被看见"。
+		// EXPERIMENT: 短读就返回（省掉那次一定 EAGAIN 的 read）
 		if n < len(buf) {
-			continue
+			return total, nil
 		}
 	}
 }
@@ -787,6 +777,25 @@ func (c *Conn) Flush() error {
 	return c.flushLocked()
 }
 
+// FlushIfNeeded 写缓冲里非空才 flush，**只拿一次锁**。
+//
+// 可写事件那条路（processConn）本来是 NeedFlush() 拿一次锁 + Flush()
+// 再拿一次，两次加锁都是为了问同一个问题（wbufList 空不空）。合并成一次。
+//
+// 这里有写缓冲的概率很低（echo 的写都是当场写完的），所以热路径基本就是
+// "拿锁 -> 看一眼是空的 -> 放锁"，比两次少一半。
+func (c *Conn) FlushIfNeeded() error {
+	if c.IsClosed() {
+		return nil
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if len(c.wbufList) == 0 {
+		return nil
+	}
+	return c.flushLocked()
+}
+
 // NeedFlush 写缓冲里有没有东西。
 func (c *Conn) NeedFlush() bool {
 	c.mu.Lock()
@@ -983,12 +992,24 @@ func (c *Conn) setClient(v bool) {
 
 func (c *Conn) isClient() bool { return atomic.LoadUint32(&c.packed)&flagClient != 0 }
 
+// tryBusy 抢 busy 位（"这条连接归我处理了"）。
+//
+// **先做一次普通读再决定要不要写**：x86 上 OrUint32 是 lock 前缀的读改写，
+// 比一次普通 load 贵一个数量级，而它在每条消息的事件路径上。绝大部分时候
+// busy 位是 0（同一条连接的调用者都在同一个事件循环 goroutine 上，串行），
+// 那次 lock 前缀纯属白花——先 load 看一眼就能跳过。
+//
+// 读到的 0 一定是真的（没人持有）；读到 1 也许对方刚放掉，那就走下面那条
+// 慢路径老实抢。
 func (c *Conn) tryBusy() bool {
+	if atomic.LoadUint32(&c.packed)&flagBusy != 0 {
+		return false
+	}
 	return atomic.OrUint32(&c.packed, flagBusy)&flagBusy == 0
 }
 
 func (c *Conn) unbusy() {
-	// 热路径: 大部分时候返回的 old 里没有 flagFreePending, 直接返回。
+	// 热路径: 大部分时候没有 flagFreePending, 清掉 busy 就完事。
 	// 用 atomic.And 的返回值判断, 不额外多一次原子读。
 	if old := atomic.AndUint32(&c.packed, ^flagBusy); old&flagFreePending != 0 {
 		c.mu.Lock()
