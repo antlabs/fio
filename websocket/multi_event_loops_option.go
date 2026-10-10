@@ -51,16 +51,16 @@ func WithMaxEventNum(num int) EvOption {
 // event loop 只做事件的分发，websocket frame 的读取和解析放到一组
 // goroutine 里面做。
 //
-// **engine 现在只支持就地执行**(事件、解析、回调都在事件循环自己的
-// goroutine 上), 没有独立的解析池, 所以这个选项填了不生效。保留签名是
-// 为了不改用户代码。
+// 现在落到 engine 的事件移交（worker 池）上, 见 engine.WithEventWorkers:
+// event loop 只收事件和投递, 读/解析/回调跑在一组 worker 上, 按 fd 取模
+// 分片。**迁移前的默认行为就是它**。
 func WithParseInWorkerPool() EvOption {
-	return func(e *evOptionConfig) {}
+	return func(e *evOptionConfig) { e.eventWorkers = 0 }
 }
 
-// 解析 goroutine 的数量。engine 现在没有解析池, 不生效。
+// 解析 goroutine 的数量。engine 那边是 worker 池的 worker 数。
 func WithParseGoroutines(n int) EvOption {
-	return func(e *evOptionConfig) {}
+	return func(e *evOptionConfig) { e.eventWorkers = n }
 }
 
 // WithParseWorkersPerShard 让每个解析分片起 n 个常驻 worker。
@@ -81,12 +81,10 @@ func WithBusinessGoNum(initCount, min, max int) EvOption {
 	}
 }
 
-// 关掉解析池, 让 event loop 自己读和解析 websocket frame。
-//
-// engine 现在就是就地执行, 这个选项正好是现在的默认行为, 所以填了不出错,
-// 也不需要额外动作。
+// 关掉解析池, 让 event loop 自己读和解析 websocket frame（事件就地处理,
+// 不往 worker 池投）。
 func WithParseInEventLoop() EvOption {
-	return func(e *evOptionConfig) {}
+	return func(e *evOptionConfig) { e.eventWorkers = -1 }
 }
 
 // 投完一批让出 P。engine 现在不给这个开关, 不生效。

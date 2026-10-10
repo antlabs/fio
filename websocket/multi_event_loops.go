@@ -40,9 +40,15 @@ type evOptionConfig struct {
 	level       slog.Level // 日志级别
 	maxEventNum int        // 一次 epoll/kqueue 最多处理多少事件
 
-	// 下面几个只为了"保留 WithXxx 签名且能编译"。engine 现在只支持就地
-	// 执行(事件、解析、回调都在同一个 goroutine 上), 没有协程池/解析池
-	// 这一层, 所以填了也不生效。
+	// eventWorkers 是解析池（engine 那边叫事件移交: event loop 只分发,
+	// 读/解析/回调交给一组 worker）。0 = 没填，用 engine 的默认（和
+	// 迁移前一样，NumCPU*5/3）；负数 = 就地执行。
+	//
+	// 迁移前这几个选项（WithParseInWorkerPool / WithParseGoroutines /
+	// WithParseInEventLoop）配置的就是这条路径，现在接着往下传。
+	eventWorkers int
+
+	// 下面几个只为了"保留 WithXxx 签名且能编译"。
 	businessInit int
 	businessMin  int
 	businessMax  int
@@ -65,8 +71,8 @@ type MultiEventLoop struct {
 
 // 默认事件循环: 用户没显式传 WithXxxMultiEventLoop 时用它。
 var (
-	defaultOnce             sync.Once
-	DefaultMultiEventLoop   *MultiEventLoop
+	defaultOnce           sync.Once
+	DefaultMultiEventLoop *MultiEventLoop
 )
 
 func getDefaultMultiEventLoop() *MultiEventLoop {
@@ -123,5 +129,6 @@ func toEngineOptions(opts ...EvOption) []engine.Option {
 		engine.WithEventLoops(cfg.numLoops),
 		engine.WithMaxEventNum(cfg.maxEventNum),
 		engine.WithLogLevel(cfg.level),
+		engine.WithEventWorkers(cfg.eventWorkers),
 	}
 }

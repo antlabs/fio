@@ -1090,14 +1090,4 @@ func (c *Conn) takePendingWrite() bool {
 	return atomic.AndUint32(&c.packed, ^flagPendingWrite)&flagPendingWrite != 0
 }
 
-// isActivated OnOpen 跑过了没有。
-func (c *Conn) isActivated() bool { return atomic.LoadUint32(&c.packed)&flagActivated != 0 }
-
-// setActivated 标记 OnOpen 跑完了。返回"之前有没有待处理的事件"
-// ——有的话调用方要接着处理（见 eventloop 里 activate 的用法）。
-func (c *Conn) setActivated() (pendingRead, pendingWrite bool) {
-	old := atomic.OrUint32(&c.packed, flagActivated)
-	return old&flagPendingRead != 0, old&flagPendingWrite != 0
-}
-
 // cork 相关的 isCorking/setCorking 在 cork.go 里（那边有完整说明）。

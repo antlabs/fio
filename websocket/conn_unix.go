@@ -84,8 +84,8 @@ type Conn struct {
 	//
 	// payloadView 只给"零拷贝"那条路用；拷贝那条路直接用池给出来的那块
 	// 自己的头（见 readPayload）。
-	bufView     []byte
-	payloadView []byte
+	bufView              []byte
+	payloadView          []byte
 	rr                   int                // rbuf 读索引
 	rw                   int                // rbuf 写索引
 	lenAndMaskSize       int                // payload长度和掩码的长度

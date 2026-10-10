@@ -43,6 +43,10 @@ type MultiEventLoop struct {
 	started int32
 	loopsWg sync.WaitGroup
 	curConn int64
+
+	// pool 是事件移交用的 worker 池（WithEventWorkers 开了才有），
+	// 见 worker.go。
+	pool *taskPool
 }
 
 // Options
@@ -50,6 +54,8 @@ type options struct {
 	numLoops    int
 	maxEventNum int
 	level       slog.Level
+	// eventWorkers > 0 时开启事件移交（worker 池），见 worker.go。
+	eventWorkers int
 }
 
 // Option 配 MultiEventLoop。
@@ -62,6 +68,16 @@ type Option func(*options)
 // 都试过，差别在噪声里。
 func WithEventLoops(n int) Option {
 	return func(o *options) { o.numLoops = n }
+}
+
+// WithEventWorkers 让事件循环只做分发，连接的读写解析交给 n 个 worker
+// goroutine（按 fd 取模分片）。0（默认）表示不开，事件就地处理。
+//
+// 见 worker.go 开头那段：循环既是唯一的服务者、又是唯一的等待者，
+// 交出去一部分能把"每个事件都要 park 一次"和"服务者只有 CPU 数那么多"
+// 这两件事都松开。
+func WithEventWorkers(n int) Option {
+	return func(o *options) { o.eventWorkers = n }
 }
 
 // WithMaxEventNum 一次 epoll_wait 最多拿多少事件。
@@ -91,9 +107,15 @@ func New(opts ...Option) (*MultiEventLoop, error) {
 		o.maxEventNum = defMaxEventNum
 	}
 
+	// worker 数：没指定(0)用默认，负数表示关掉（事件就地处理）。
+	workers := o.eventWorkers
+	if workers == 0 {
+		workers = defEventWorkers()
+	}
 	m := &MultiEventLoop{
 		numLoops:    o.numLoops,
 		maxEventNum: o.maxEventNum,
+		pool:        newTaskPool(workers),
 	}
 	m.log = slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: o.level}))
 	m.conns.Init(core.GetMaxFd())
@@ -140,6 +162,10 @@ func (m *MultiEventLoop) Start() {
 	// Add 必须在起 goroutine **之前**：WaitGroup 的规矩是"Add 要发生在
 	// Wait 之前"，在 goroutine 里 Add 的话，Free 可能已经走到 Wait 了，
 	// 那个 Add 就丢了（-race 报的就是这个）。
+	// worker 先起：循环一开跑就可能往环里投任务。
+	if m.pool != nil {
+		m.pool.start()
+	}
 	for _, el := range m.loops {
 		m.loopsWg.Add(1)
 		go el.Loop()
@@ -166,6 +192,9 @@ func (m *MultiEventLoop) Free() {
 		el.wake()
 	}
 	m.loopsWg.Wait()
+	if m.pool != nil {
+		m.pool.stop()
+	}
 	for _, el := range m.loops {
 		el.PollingApi.Free()
 		el.closeWake()
@@ -233,39 +262,40 @@ func (m *MultiEventLoop) Add(fd int, h Handler) (*Conn, error) {
 	return c, nil
 }
 
-// activate 在事件循环的 goroutine 上跑 OnOpen，再把它跑完之前攒下的事件
-// 补处理掉。
+// activate 跑 OnOpen，再把它跑完之前攒下的事件补处理掉。
 //
-// 它跑在事件循环的 goroutine 上（runOnLoop 投过来的），所以和事件处理
-// 是同一个 goroutine 串行的。
+// **谁把 flagActivated 从 0 变 1，谁跑 OnOpen**，其余调用者直接返回。
+// 原来这里是"先 isActivated() 看一眼"，靠"两条路都在同一个 goroutine 上"
+// 成立（Add 投的任务在事件循环的 goroutine 上、事件处理也在）；
+// 开了 worker 池（见 worker.go）之后，任务在循环的 goroutine 上跑、
+// 事件在 worker 上跑，两边可能同时进来——必须原子地决出一个执行者，
+// 不然 OnOpen 跑两遍（http2/tls 的状态机初始化跑两遍就是状态错乱）。
 //
 // **可重入**：Add 投的任务和事件处理两条路都可能调它（后者是"事件比
-// 任务先到"的情况，见 EventLoop.processConn），谁先到谁跑 OnOpen，
-// 后到的直接返回。两次调用都在同一个 goroutine 上，没有竞争。
-func (el *EventLoop) activate(c *Conn) {
-	if c.IsClosed() || c.isActivated() {
+// 任务先到"的情况，见 EventLoop.processConn 的 activateBusy）。
+func (el *EventLoop) activate(c *Conn) { el.activateInner(c, false) }
+
+// activateBusy 同上，但调用方**已经持有 busy**（processConn 里那条路）。
+//
+// 这条路不能再 tryBusy/unbusy 一次：会把人家持有的位清掉——之后另一个
+// goroutine 就能同时进来处理同一条连接，状态直接乱掉（实测：多线程下
+// 大量 TLS 握手卡在 Start，因为连接被两个 goroutine 交错处理）。
+func (el *EventLoop) activateBusy(c *Conn) { el.activateInner(c, true) }
+
+func (el *EventLoop) activateInner(c *Conn, alreadyBusy bool) {
+	if c.IsClosed() {
+		return
+	}
+	// 原子抢执行权，见上。
+	if atomic.OrUint32(&c.packed, flagActivated)&flagActivated != 0 {
 		return
 	}
 
-	// **busy 位归调用方管，这里不碰**。
-	//
-	// 两条路都会走到这儿，而它们对 busy 的所有权不一样：
-	//
-	//	1. Add 投的任务（runOnLoop -> activate）
-	//	   这条路是自己进来的，没人持有 busy——但要占上，因为后面
-	//	   processConn 也要占（见下面），而且"正在处理这个连接"的语义
-	//	   本来就该成立。
-	//
-	//	2. processConn 里调（事件比任务先到）
-	//	   这条路**调用方已经持有 busy 了**（Poll 回调里 tryBusy 拿的）。
-	//	   这里要是再 tryBusy/unbusy 一次，会把人家持有的位清掉——之后
-	//	   另一个 goroutine 就能同时进来处理同一条连接，状态直接乱掉
-	//	   （实测：多线程下大量 TLS 握手卡在 Start，因为连接被两个
-	//	   goroutine 交错处理）。
-	//
-	// 所以用"进来的时候有没有人持有"来判断：没有就自己占（并负责还），
-	// 有就什么都别动。
-	owned := c.tryBusy() // 返回 true 表示"之前没人持有，现在归我了"
+	// busy 位：没人持有就自己占上、跑完自己还；alreadyBusy 那条路不碰。
+	owned := false
+	if !alreadyBusy {
+		owned = c.tryBusy()
+	}
 	if c.handler != nil {
 		c.handler.OnOpen(c)
 	}
@@ -273,16 +303,17 @@ func (el *EventLoop) activate(c *Conn) {
 		c.unbusy()
 	}
 
-	// 置位并取回"OnOpen 之前就到的事件"。
+	// OnOpen 之前（或者期间）到的事件：补处理掉。
 	//
 	// 有 pending 的话要接着处理（那些是 epoll 边缘，丢了就没有下一次
-	// 通知了）。这时候自己要占 busy——但如果**调用方本来就持有**
-	// （processConn 那条路），就不能再占：processConn 自己会接着跑，
+	// 通知了）。alreadyBusy 那条路不补：processConn 自己会接着跑，
 	// 它拿着循环去取 pending。
-	pendingRead, pendingWrite := c.setActivated()
-	if (pendingRead || pendingWrite) && owned {
-		if c.tryBusy() {
-			el.processConn(c, pendingRead, pendingWrite)
+	if owned {
+		pendingRead, pendingWrite := c.takePendingRead(), c.takePendingWrite()
+		if pendingRead || pendingWrite {
+			if c.tryBusy() {
+				el.processConn(c, pendingRead, pendingWrite)
+			}
 		}
 	}
 }

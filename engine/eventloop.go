@@ -164,6 +164,21 @@ func (el *EventLoop) Loop() {
 				return
 			}
 
+			// 开了 worker 池就把这一轮事件交给连接归属的 worker，见
+			// worker.go：fd 固定分片，同一条连接的事件还是串行的（busy
+			// 位继续兜底，撞上就记 pending）。
+			//
+			// 上面那条 EOF 路不走移交：它要读最后一段数据再关连接，
+			// 就地做完更简单，而且它本来就不在热路径上。
+			if el.parent.pool != nil {
+				el.parent.pool.nodeFor(fd).push(task{
+					c:       c,
+					isRead:  state.IsRead(),
+					isWrite: state.IsWrite(),
+				})
+				return
+			}
+
 			// 一个连接同时只有一个人在处理。处理期间又来的事件记在
 			// pending 位上，处理完的那个取走再跑一轮——ET 的边缘只来
 			// 一次，丢了就再也没有通知，连接会卡住。
@@ -206,7 +221,7 @@ func (el *EventLoop) processConn(c *Conn, isRead, isWrite bool) {
 		//
 		// 这条路径实测撞到过：Add 返回后立刻有数据的连接（客户端连上
 		// 就发）在 -race 下必报 http2.ConnHandler.conn 的竞争。
-		el.activate(c) // 幂等
+		el.activateBusy(c) // 调用方已经持有 busy，见 activateBusy
 		if c.IsClosed() {
 			return
 		}
