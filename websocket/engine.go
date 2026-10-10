@@ -212,15 +212,21 @@ func (c *Conn) nextFrameSize() int {
 
 // InitialReadBufferSize 起始读缓冲区多大，实现 engine.ReadBufferSizer。
 //
-// 按配置里的 windowsMultipleTimesPayloadSize 算，和迁移前一致：
-// (1024+14) × 倍数，默认 2.0 → 约 2KB。1KB 的 echo 一条消息正好装下，
-// 10000 连接就是 20MB 而不是 80MB——**每连接一块读缓冲区，这个数直接乘
-// 连接数**，也直接决定工作集能不能装进 L3。
+// 按配置里的 windowsMultipleTimesPayloadSize 算，**和迁移前那条公式一致**：
+// PayloadLen × 倍数 + 帧头，PayloadLen 取 1024（常见的小报文），默认 2.0
+// → 2062 字节。
 //
-// 报文比它大时引擎自己会长（growReadBuffer 一次跳到 16KB，那一跳正好够
-// 把 Pipeline 那种"一次 write 十条"的批次读完）。
+// 为什么抠这 14 字节：bytespool 按 1KB 分档（1KB+14、2KB+14、…），要 2076
+// 会落到 3KB 档拿回 3086 字节，而要 2062 正好是 2KB+14 那一档。**每连接一块
+// 读缓冲区，档位差一格就是 10000 连接下多 10MB**，也影响它们能不能一起
+// 装进 L3。基线（迁移前）用 readBufferSize() 要的就是 2062，所以数据面
+// 的缓冲区大小和基线一模一样。
+//
+// 1KB 的 echo 一条消息（1030 字节）正好装下；报文比它大时引擎自己会长
+// （growReadBuffer 一次跳到 16KB，那一跳正好够把 Pipeline 那种"一次 write
+// 十条"的批次读完）。
 func (h *ConnHandler) InitialReadBufferSize() int {
-	n := int(float32(1024+enum.MaxFrameHeaderSize) * h.conf.windowsMultipleTimesPayloadSize)
+	n := int(float32(1024)*h.conf.windowsMultipleTimesPayloadSize) + enum.MaxFrameHeaderSize
 	if n < 1024 {
 		n = 1024
 	}
