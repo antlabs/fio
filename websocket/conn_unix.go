@@ -70,8 +70,22 @@ type Conn struct {
 	// 走的是嵌入的 *Config 指针，多一跳，profile 里这一行的加载每消息要
 	// 100ns 上下（1KB echo 实测 1.51s / 8s 窗口，占 1.9% CPU）。抄到这片
 	// 热区（和 rbuf/rr/rw 同一两行）就没了。
-	readTimeout          time.Duration
-	rbuf                 *[]byte            // 借来的读缓冲区（只在 OnData 期间有效）
+	readTimeout time.Duration
+	rbuf        *[]byte // 借来的读缓冲区（只在 OnData 期间有效）
+
+	// bufView / payloadView 是给 c.rbuf 和 frame.Payload 用的切片头。
+	//
+	// **必须挂在连接上，不能让局部变量取址**：parseBuf 里原来是
+	// `b := buf; c.rbuf = &b`、readPayload 里是 `payload := ...;
+	// f.Payload = &payload`，那两个局部变量每消息都逃逸成一次堆分配
+	// （实测 1KB echo 6M 消息：parseBuf 132MB + readPayload 118MB，
+	// 全是 24 字节的切片头）。连接的处理是串行的（一条连接同一时间只有
+	// 一个 goroutine 碰它），这两个头挂在连接上不会有并发问题。
+	//
+	// payloadView 只给"零拷贝"那条路用；拷贝那条路直接用池给出来的那块
+	// 自己的头（见 readPayload）。
+	bufView     []byte
+	payloadView []byte
 	rr                   int                // rbuf 读索引
 	rw                   int                // rbuf 写索引
 	lenAndMaskSize       int                // payload长度和掩码的长度

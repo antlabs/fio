@@ -237,8 +237,8 @@ func (c *Conn) readPayload(needCopy bool) (f frame.Frame2, success bool, err err
 		// 注意这里 rr 必须照常推进: 数据在 rbuf 里, 但所有权已经算
 		// 交出去了, 后面的解析不能再看它。回调返回后这块内存随
 		// rbuf 一起复用。
-		payload := (*c.rbuf)[c.rr : c.rr+int(c.rh.PayloadLen) : c.rr+int(c.rh.PayloadLen)]
-		f.Payload = &payload
+		c.payloadView = (*c.rbuf)[c.rr : c.rr+int(c.rh.PayloadLen) : c.rr+int(c.rh.PayloadLen)]
+		f.Payload = &c.payloadView
 		f.FrameHeader = c.rh
 		c.rr += int(c.rh.PayloadLen)
 		// 别在这里 leftMove: 那会把 rbuf 里刚别名出去的那段搬走,
@@ -249,8 +249,14 @@ func (c *Conn) readPayload(needCopy bool) (f frame.Frame2, success bool, err err
 
 	newBuf := bytespool.GetBytes(int(c.rh.PayloadLen) + enum.MaxFrameHeaderSize)
 	copy(*newBuf, (*c.rbuf)[c.rr:c.rr+int(c.rh.PayloadLen)])
-	newBuf2 := (*newBuf)[:c.rh.PayloadLen] //修改下len
-	f.Payload = &newBuf2
+	// 用池里这块自己的切片头改 len，不要再另取一个局部切片头再取址
+	// （原来是 newBuf2）——那个局部头每消息逃逸一次（实测 6M 消息 118MB）。
+	// putPayload 还回池子时用的是 cap，不受 len 影响；分片要长期持有这块
+	// 内存时（takePayload(needCopy=true) 原样返回这个指针）也没问题：
+	// 头跟着池里那块一起活着。
+	payload := (*newBuf)[:c.rh.PayloadLen] //修改下len
+	*newBuf = payload
+	f.Payload = newBuf
 
 	f.FrameHeader = c.rh
 	c.rr += int(c.rh.PayloadLen)
