@@ -267,9 +267,9 @@ func (el *EventLoop) readAndDispatch(c *Conn) error {
 		}
 	}
 
-	// 轮末把"长过的"读缓冲区还回池子（起始那一档留着，见 ReleaseReadBuf）。
-	// 不还的话连接会在"两批之间"攥着它——10000 连接的 Pipeline 负载下
-	// 就是每连接 15KB 常驻（实测堆上 180MB）。
+	// 轮末把读缓冲区还回池子（见 ReleaseReadBuf）。不还的话连接会在
+	// "两批之间"攥着它——10000 连接的 Pipeline 负载下就是每连接 15KB
+	// 常驻（实测堆上 180MB）。
 	c.ReleaseReadBuf()
 
 	// 读出错（含对端关了）：缓冲区已经空了，可以把错误交给上层了
