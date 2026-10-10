@@ -15,6 +15,7 @@ package websocket
 
 import (
 	"context"
+	"log/slog"
 	"sync"
 
 	"github.com/antlabs/task/task/driver"
@@ -55,7 +56,18 @@ const (
 // 没有 localTask 了, 改成进程级的一份。
 func newTaskExecutor(taskName string) driver.TaskExecutor {
 	defaultTasksOnce.Do(func() {
-		var c driver.Conf
+		// **Log 必须非 nil**：`driver.Conf` 只有这一个字段，而 elastic
+		// 驱动会无条件读它（task/elastic 里 `s.conf.Log.Debug("status",...)`
+		// 每秒采一次 CPU，还有任务 panic 时 `Log.Error`）。留 nil 就是
+		// **nil 指针解引用**——服务端进程直接 SIGSEGV，而且时机在第一条
+		// 消息之后 1 秒（那个每秒定时器），autobahn 的 elastic 配置因此
+		// 成片 FAILED（客户端看到的是 connection refused）。
+		//
+		// 迁移前这里传的是事件循环的 logger（`c.Log = parent.Logger`），
+		// 那条线后来归了 engine，websocket 这层拿不到它了。用全局默认
+		// logger：默认级别下 elastic 那句每秒一次的 Debug 状态行会被丢掉
+		// （不刷屏），任务 panic 的 Error 仍然出得来。
+		c := driver.Conf{Log: slog.Default()}
 		defaultTasks = newSelectTask(context.Background(), defTaskInitCount, defTaskMin, defTaskMax, &c)
 	})
 	return defaultTasks.newTask(taskName)
