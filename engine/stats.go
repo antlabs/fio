@@ -36,6 +36,26 @@ type stats struct {
 	pollEv       int64  // 一次 Poll 返回的事件数
 	realloc      int64  // 重新分配读缓冲区次数
 	moveBytes    uint64 // compact 时移动的字节数
+	rbufGet      int64  // 读缓冲区从池里取了几个（诊断复用是否生效）
+	rbufPut      int64  // 读缓冲区还回池里几个
+}
+
+// RbufGetNum / RbufPutNum 诊断用：读缓冲区的池往返次数。
+func (m *MultiEventLoop) RbufGetNum() int64 { return atomic.LoadInt64(&m.stats.rbufGet) }
+func (m *MultiEventLoop) RbufPutNum() int64 { return atomic.LoadInt64(&m.stats.rbufPut) }
+
+func (c *Conn) countRbufGet() {
+	if statOff || c.parent == nil {
+		return
+	}
+	atomic.AddInt64(&c.parent.parent.stats.rbufGet, 1)
+}
+
+func (c *Conn) countRbufPut() {
+	if statOff || c.parent == nil {
+		return
+	}
+	atomic.AddInt64(&c.parent.parent.stats.rbufPut, 1)
 }
 
 // statOff 关掉每消息的原子计数。

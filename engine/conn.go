@@ -87,6 +87,14 @@ type Conn struct {
 	handler Handler
 	// parent 是它挂在哪个事件循环上
 	parent *EventLoop
+	// initRbSize 是起始读缓冲区大小（Init 时问了一次 ReadBufferSizer）。
+	// 不实现 ReadBufferSizer 的协议是 0。
+	initRbSize int
+
+	// keepReadBuf 表示当前这块 rbuf 是"起始大小那一档"，全消费完可以留着
+	// 下轮接着用（省一次池往返）。一旦长过（growReadBuffer/growToNextMessage
+	// 换了更大的块）就清掉——长过的留着会变成每连接常驻，见 ConsumeRead。
+	keepReadBuf bool
 
 	// mu 保护 rbuf/wbufList: Close 可能从任意 goroutine 来, 它要在锁里
 	// 释放这两块内存。
@@ -134,6 +142,13 @@ func (c *Conn) Init(fd int, h Handler, parent *EventLoop) {
 	c.rbuf = nil
 	c.rr, c.rw = 0, 0
 	c.wbufList = c.wbufList[:0]
+	c.keepReadBuf = false
+	// 起始读缓冲区大小问一次协议就够，之后不再变——热路径上（ConsumeRead）
+	// 要拿它判断"这块是不是起始大小那块、能不能留"，每消息一次接口断言不划算。
+	c.initRbSize = 0
+	if s, ok := h.(ReadBufferSizer); ok && s != nil {
+		c.initRbSize = s.InitialReadBufferSize()
+	}
 	// userData 是 atomic.Value，清成"没设过"（存一个 nil 指针）
 	c.userData.Store((*any)(nil))
 }
@@ -270,15 +285,27 @@ func (c *Conn) Read() (int, error) {
 	// 上一轮指向那块内存的 buf 已经没人用了。
 	c.mu.Lock()
 	if c.releaseReadBuf && c.rbuf != nil {
+		c.countRbufPut()
 		bytespool.PutBytes(c.rbuf)
 		c.rbuf = nil
 		c.rr, c.rw = 0, 0
 	}
 	c.releaseReadBuf = false
+	// 上一轮全消费完、缓冲区又留着复用（ConsumeRead 里没还的那种）：
+	// 把索引复位到开头，这块就接着用。不复位的话 buf := (*rbuf)[rw:] 是
+	// 空的，会走"缓冲区满"那条路去 compact——白绕一圈。
+	if c.rbuf != nil && c.rr == c.rw && c.rr > 0 {
+		c.rr, c.rw = 0, 0
+	}
 	c.mu.Unlock()
 
 	if c.rbuf == nil {
+		// 起始那块用完之后可以留着复用（见 ConsumeRead）。池按档位给，
+		// 拿到的比请求的大一点，所以记的是"这块就是起始档"这个事实，
+		// 不是长度本身。
 		c.rbuf = bytespool.GetBytes(c.initialReadBufSize())
+		c.keepReadBuf = true
+		c.countRbufGet()
 	}
 
 	total := 0
@@ -416,13 +443,22 @@ func (c *Conn) ConsumeRead(n int) {
 	// 所以只把索引推到底；真正的释放留给下一次 Read（那时候上一轮的
 	// 栈肯定已经退干净了）和 Close。
 	//
-	// **试过"小的留着下次接着用"（省一次池往返），内存反而更差**：
-	// 缓冲区在连接刚建、一批消息挤进来的时候会长到 16KB，留着就变成
-	// 每连接常驻 16KB——实测 10000 连接下 MEM 从 119MB 涨到 417MB。
-	// 还回池子，让空闲连接只留起始大小那块。
-	c.mu.Lock()
+	// **没长过一批大小的那块留着下次接着用**（keepReadBuf，见 Read）：
+	// 每条消息都"还回池子再取一块新的"是三笔开销——一次 PutBytes、
+	// 一次 GetBytes、以及池子每处理一次消息就多攒一块驻留内存（sync.Pool
+	// 按 P 缓存，实测 10000 连接下多留 29MB，而它们本该是每连接常驻的
+	// 那几 KB）。基线（迁移前）本来就是每连接持有一块不再还的，这里对齐。
+	//
+	// **长过一批大小（> batchReadBufferSize）的必须还**：那种是"协议还在
+	// 等半条大报文、缓冲区一路翻倍长上去"的，留着就变成每连接常驻一块
+	// 大的——实测无上限地留，10000 连接下 MEM 从 119MB 涨到 417MB。
+	// 所以留的口子限在 batchReadBufferSize（一批消息装得下就够）。
+	if c.rbuf != nil && c.keepReadBuf {
+		c.releaseReadBuf = false
+		return
+	}
+
 	c.releaseReadBuf = true
-	c.mu.Unlock()
 }
 
 // maxReadBufferSize 是读缓冲区能长到多大。
@@ -496,6 +532,9 @@ func (c *Conn) EnsureReadSpace(n int) bool {
 			want = maxReadBufferSize
 		}
 		c.rbuf = bytespool.GetBytes(want)
+		// 这是"按报文大小要到的一块"，比起始档可能大很多——不算可复用的
+		// 起始块，消费完要还（见 ConsumeRead）。
+		c.keepReadBuf = false
 		return cap(*c.rbuf)-c.rw >= n
 	}
 
@@ -529,6 +568,7 @@ func (c *Conn) EnsureReadSpace(n int) bool {
 	nb := bytespool.GetBytes(need)
 	copy(*nb, (*old)[:c.rw])
 	c.rbuf = nb
+	c.keepReadBuf = false
 	bytespool.PutBytes(old)
 	return len(*c.rbuf)-c.rw >= n
 }
@@ -536,13 +576,11 @@ func (c *Conn) EnsureReadSpace(n int) bool {
 // 读缓冲区起始大小的默认值：8KB 够把常见的报文一次读完。
 const defReadBufferSize = 8 * 1024
 
-// initialReadBufSize 起始读缓冲区多大：问协议（ReadBufferSizer），
-// 不问就按默认。
+// initialReadBufSize 起始读缓冲区多大：Init 时问过一次，缓存起来了
+// （见 Conn.initRbSize）。
 func (c *Conn) initialReadBufSize() int {
-	if s, ok := c.handler.(ReadBufferSizer); ok && s != nil {
-		if n := s.InitialReadBufferSize(); n > 0 {
-			return n
-		}
+	if c.initRbSize > 0 {
+		return c.initRbSize
 	}
 	return defReadBufferSize
 }
@@ -604,6 +642,14 @@ func (c *Conn) growReadBuffer() bool {
 	nb := bytespool.GetBytes(want)
 	copy(*nb, (*old)[:c.rw])
 	c.rbuf = nb
+	// 长到"一批装得下"为止都算可复用（keepReadBuf）：一批消息挤满起始那块
+	// 是很常见的（一次 write 带 3~10 条），这时长到 16KB 是个稳定的落点，
+	// 留着复用省掉每消息的池往返。再往上（半条大报文那种翻倍）就不是
+	// "稳定的落点"了，留着会每连接常驻一块大的，必须还（见 ConsumeRead）。
+	// 注意用 want 而不是 len(*nb) 比：bytespool 按档位给，要 16KB 拿回来
+	// 是 16398（多加了一个帧头），拿实际长度去比会把"刚好一批大小"判成
+	// 太大。
+	c.keepReadBuf = want <= batchReadBufferSize
 	bytespool.PutBytes(old)
 	if c.parent != nil {
 		c.parent.addRealloc()
@@ -921,6 +967,7 @@ func (c *Conn) releaseBuffersLocked() {
 	c.wbufList = c.wbufList[:0]
 	c.rr, c.rw = 0, 0
 	c.releaseReadBuf = false
+	c.keepReadBuf = false
 }
 
 // ---------------------------------------------------------------------------
