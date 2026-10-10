@@ -700,6 +700,12 @@ func (c *Conn) Write(data []byte) error {
 	return err
 }
 
+// maxStackWrite 是"拼到栈上一次写"的长度上限。
+//
+// 4KB 是这么定的: maxCopiedPayload, 和 fnet 的一致——超过这个长度,
+// 拼一次的 memcpy 就比多一个 iovec 贵了。
+const maxStackWrite = 4096
+
 // Writev 写多段(header + payload 这类), 不拷成一个块。
 //
 // 段数上限是 2: 内核的 iovec 支持更多, 但攒包路径只用得到两段; 需要更多
@@ -708,6 +714,29 @@ func (c *Conn) Writev(a, b []byte) error {
 	if c.IsClosed() {
 		return ErrClosed
 	}
+
+	// 有写拦截器（TLS）就先给它——**和 Write 一样，这条路不能绕过去**。
+	//
+	// 不拦的话两段明文直接进了 socket：TLS 那层看到的是一段没加密的
+	// 东西，对端解密失败，回一个 protocol_version 的告警就断（实测：
+	// 握手正常结束、请求也发出去了，然后客户端报
+	// "LibreSSL: tlsv1 alert protocol version"）。
+	//
+	// 两段合成一段再给，不是分两次给：拦截器按 TLS 记录分帧，分两次就会
+	// 编成两条记录（多一层 5 字节包头）。
+	if h := c.writeHook(); h != nil {
+		if total := len(a) + len(b); total <= maxStackWrite {
+			var stack [maxStackWrite]byte
+			n := copy(stack[:], a)
+			copy(stack[n:], b)
+			return h(stack[:total])
+		}
+		all := make([]byte, 0, len(a)+len(b))
+		all = append(all, a...)
+		all = append(all, b...)
+		return h(all)
+	}
+
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
@@ -728,10 +757,6 @@ func (c *Conn) Writev(a, b []byte) error {
 	// sendmsg 要读 iovec 数组、sendto 只要一个指针, 小消息下后者更便宜;
 	// 大消息才值得用 iovec 省那次拷贝。之前无线程池的 websocket 在小消息
 	// 上也用 sendmsg, 测下来多花 CPU。
-	//
-	// 4KB 是这么定的: maxCopiedPayload, 和 fnet 的一致——超过这个长度,
-	// 拼一次的 memcpy 就比多一个 iovec 贵了。
-	const maxStackWrite = 4096
 	if total <= maxStackWrite {
 		var stack [maxStackWrite]byte
 		n := copy(stack[:], a)
