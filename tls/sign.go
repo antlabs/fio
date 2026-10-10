@@ -74,6 +74,28 @@ func certificateVerifyInput(isClient bool, transcriptHash []byte) []byte {
 	return append(out, transcriptHash...)
 }
 
+// pssOptions 是 RSA-PSS 的签名参数。
+//
+// **盐长必须显式给 PSSSaltLengthEqualsHash**（RFC 8446 4.2.3 对
+// rsa_pss_rsae_* 的要求："The salt length MUST be Hash.length"）。
+//
+// 给 nil 的话 crypto/rsa 会按 PSSSaltLengthAuto 处理，也就是**用能塞下的
+// 最大盐长**——签出来的东西自己验得过，但所有按标准写的验签方都拒收。
+// 实测（Go 的 crypto/rsa，2048 位密钥、SHA-256）：
+//
+//	nil         签名 -> EqualsHash 验签: verification error
+//	nil         签名 -> nil        验签: ok
+//	EqualsHash  签名 -> EqualsHash 验签: ok
+//
+// 这个坑能藏住的原因是**两端都错**：fio 自己的客户端也拿 nil 验签，自家
+// client/server 互通无碍，只有跟标准实现（crypto/tls、OpenSSL、浏览器）
+// 对话时才现形——症状是握手一路走到 CertificateVerify，然后客户端报
+// "invalid signature"（LibreSSL 报 "salt length check failed"）。
+var pssOptions = &rsa.PSSOptions{
+	SaltLength: rsa.PSSSaltLengthEqualsHash,
+	Hash:       crypto.SHA256,
+}
+
 // signWithKey 用私钥签名。
 func signWithKey(priv crypto.PrivateKey, message []byte) ([]byte, error) {
 	digest := sha256.Sum256(message)
@@ -82,7 +104,7 @@ func signWithKey(priv crypto.PrivateKey, message []byte) ([]byte, error) {
 	case *ecdsa.PrivateKey:
 		return ecdsa.SignASN1(rand.Reader, k, digest[:])
 	case *rsa.PrivateKey:
-		return rsa.SignPSS(rand.Reader, k, crypto.SHA256, digest[:], nil)
+		return rsa.SignPSS(rand.Reader, k, crypto.SHA256, digest[:], pssOptions)
 	case ed25519.PrivateKey:
 		// Ed25519 是"签原文不是签哈希"，而且它内部自己做 SHA512
 		return ed25519.Sign(k, message), nil
@@ -101,7 +123,9 @@ func verifyWithKey(pub crypto.PublicKey, message, sig []byte, algo uint16) error
 		}
 		return nil
 	case *rsa.PublicKey:
-		if err := rsa.VerifyPSS(k, crypto.SHA256, digest[:], sig, nil); err != nil {
+		// 和签名那边同一套参数：标准要求盐长等于哈希长度，验签也照这个
+		// 口径收（见 pssOptions 的注释）。
+		if err := rsa.VerifyPSS(k, crypto.SHA256, digest[:], sig, pssOptions); err != nil {
 			return ErrBadSignature
 		}
 		return nil
