@@ -20,7 +20,6 @@ import (
 	"errors"
 	"io"
 	"log/slog"
-	"time"
 
 	"github.com/antlabs/pulse/core"
 	"golang.org/x/sys/unix"
@@ -51,118 +50,25 @@ type EventLoop struct {
 	log *slog.Logger
 }
 
-// pollSpinRounds 是"没事件时先自旋几轮非阻塞 poll 再 park"的轮数。
-//
-// 为什么：park 一次要过 runtime 的 netpoller（gopark 挂起、事件到了唤醒、
-// 重新调度），一个来回几微秒；而"刚处理完事件"之后紧接着往往还有下一个
-// （echo、ping-pong 这类一问一答的负载），自旋几轮就能就地接住，省掉那次
-// park 和唤醒。
-//
-// 实测（10 连接 1KB echo，24 核）：每次没事件就 park 的时候平均 RTT
-// 16.11µs / 607k TPS；先自旋几轮 10.08µs / 944k TPS。高并发（10000 连接）
-// 下每次 park 的代价摊薄了，但 loop 只要有一瞬间排空就会 park 一次，
-// 那份唤醒延迟同样落在请求上。
-//
-// 轮数取小值：一轮就是一次 epoll_wait(0)（几百纳秒），真闲下来几轮之后
-// 照样走永久等把 P 让出去，空闲时多烧的 CPU 可以忽略。
-const pollSpinRounds = 4
-
 // Loop 跑事件循环，直到 Free。
 func (el *EventLoop) Loop() {
 	// WaitGroup 的 Add 在 Start 里做（Add 要先于 Wait），这里只负责 Done
 	defer el.parent.loopsWg.Done()
 
-	// 事件回调：自旋那条路和永久等那条路共用（见下面 pollSpinRounds）。
-	onEvent := func(fd int, state core.State, err error) {
-		// io.EOF 不是"出错"，是"对端关了"。kqueue 那边尤其要紧：
-		// 对端发 FIN 时它回调的是 cb(fd, WRITE, io.EOF)——状态是
-		// WRITE 不是 READ，错误位带着 io.EOF。早先把 io.EOF 当成
-		// 普通错误记一行日志就 return 了，OnClose 永远不会调
-		// （实测：客户端发几个字节再 close，服务端一点反应都没有）。
-		eof := errors.Is(err, io.EOF)
-		if err != nil && !eof {
-			if errors.Is(err, core.EAGAIN) {
-				return
-			}
-			el.parent.err("apiPoll", "err", err.Error())
-			return
-		}
-
-		// 唤醒管道：投过来的任务在队列里等着，循环得先醒过来。
-		if fd == el.wakeR {
-			el.drainWake()
-			return
-		}
-
-		el.addPollEvNum(1)
-
-		c := el.parent.getConn(fd)
-		if c == nil {
-			// 连接已经关了（epoll 里可能还有一个待处理的事件）
-			return
-		}
-
-		if eof {
-			// **必须先读**：kqueue 会把"对端最后一段数据 + FIN"合并成
-			// 一个事件报过来（而且状态是 WRITE，不是 READ），这时候
-			// 还没有任何人调过 Read()，ReadBuffer() 是空的——但内核
-			// 缓冲区里躺着对端最后发的那段数据，直接 close 就一起丢了。
-			//
-			// 实测：TLS 场景下内层协议发的 "ping"（以及回显）都在 FIN
-			// 前面一点点到，对端 write+close 几乎同时，这边 OnData 就
-			// 永远不调——一个字节都收不到。而对端把 close 推迟 50ms 就
-			// "好了"（那 50ms 让数据单独成了一个可读事件）。
-			//
-			// **先补 activation**：连接可能刚 Add 进来，Add 投的
-			// OnOpen 任务还没轮到，而 FIN 已经到了（客户端连上就
-			// close）。不激活就跑 OnData 就是和 OnOpen 抢。
-			el.activate(c) // 幂等：已经激活过就直接返回
-			if c.IsClosed() {
-				return
-			}
-
-			// **这条路也要占 busy**：读的时候手上捏着读缓冲区（喂给
-			// 协议的那段就是它的别名），而 closeWith 只在"没人在处理
-			// 这条连接"时才当场释放缓冲区（见 flagFreePending）。
-			// 不占的话，别的 goroutine 一句 Close() 就能把缓冲区从
-			// 脚下抽走（-race 实测：用户 goroutine 的 Close 和这里的
-			// ReadBuffer 抢 rbuf）。
-			//
-			// 同一条连接的事件不会并发到达，所以这里一定拿得到；
-			// 真拿不到（不该发生）也**不能**空手去读——直接关掉。
-			if !c.tryBusy() {
-				c.closeWith(io.EOF)
-				return
-			}
-			// readAndDispatch 返回的 io.EOF 不用管：下面就 closeWith(io.EOF)，
-			// 这里只是要把最后的数据喂给协议、让它把该处理的处理完。
-			_ = el.readAndDispatch(c)
-			c.closeWith(io.EOF)
-			c.unbusy()
-			return
-		}
-
-		// 一个连接同时只有一个人在处理。处理期间又来的事件记在
-		// pending 位上，处理完的那个取走再跑一轮——ET 的边缘只来
-		// 一次，丢了就再也没有通知，连接会卡住。
-		if !c.tryBusy() {
-			if state.IsRead() {
-				c.setPendingRead()
-			}
-			if state.IsWrite() {
-				c.setPendingWrite()
-			}
-			return
-		}
-
-		el.processConn(c, state.IsRead(), state.IsWrite())
-	}
-
 	for {
 		if el.parent.isFreed() {
 			return
 		}
-		// 投过来的任务（比如新连接的 OnOpen）先跑掉，见下面注释块。
+		// 先把投过来的任务跑掉（比如新连接的 OnOpen）。
+		//
+		// 放在 Poll **之前**：OnOpen 要在该连接的任何数据之前跑（协议
+		// 靠它初始化状态）。投递方（Add）保证任务先入队，这里保证它先
+		// 于 Poll 返回的事件被处理。
+		//
+		// 先 len() 看一眼：绝大多数轮次队列是空的（新连接才走这条路），
+		// 空队列时那次 select+default 也要过一次 runtime 的 chanrecv 快
+		// 路径，而这是每轮都要跑的。投递方入队后会 wake 一次，就算这里
+		// 漏看一轮也马上会回来。
 		if len(el.tasks) > 0 {
 			for {
 				select {
@@ -174,41 +80,105 @@ func (el *EventLoop) Loop() {
 				break
 			}
 		}
-		// 先自旋几轮非阻塞 poll（超时给 1ns：pulse 只对 (0,1s) 走非阻塞
-		// epoll_wait(0)，永久等那条路会 park），见 pollSpinRounds。
-		var (
-			n   int
-			err error
-		)
-		for i := 0; i < pollSpinRounds; i++ {
-			n, err = el.Poll(time.Nanosecond, onEvent)
-			if n > 0 || err != nil {
-				break
+		// **超时必须是"永久等"（-1），不能是 100ms 这种小超时**。
+		//
+		// pulse 按超时选等待方式（见它 waiter_linux.go 的 parkAbove）：永久
+		// 等 → park 在 runtime 的 poller 上，一瞬间就把 P 交出去；而
+		// (0, 1s) 区间里的小超时 → 走 RawSyscall6 版的 epoll_wait，
+		// **RawSyscall 不通知 runtime**，于是这个 goroutine 抱着 P 睡满整个
+		// 超时，runtime 要等 sysmon 一个 tick 才能把 P 抢走。
+		//
+		// 代价实测（Linux，24 核）：单测里每轮泄漏一个 24 loop 的
+		// MultiEventLoop，几轮之后 24 个 P 全被睡着的循环占住，同进程里
+		// 一个 loopback 的 net.Dial 要等 95ms+，握手失败那一组用例集体超时
+		// （基线用永久等，0.26s 跑完，迁移后 4.08s）。
+		//
+		// Free 的停止不靠超时：它往唤醒管道写一个字节（见 wake.go），
+		// epoll fd 立刻可读，park 着的循环马上就醒。
+		_, err := el.Poll(-1, func(fd int, state core.State, err error) {
+			// io.EOF 不是"出错"，是"对端关了"。kqueue 那边尤其要紧：
+			// 对端发 FIN 时它回调的是 cb(fd, WRITE, io.EOF)——状态是
+			// WRITE 不是 READ，错误位带着 io.EOF。早先把 io.EOF 当成
+			// 普通错误记一行日志就 return 了，OnClose 永远不会调
+			// （实测：客户端发几个字节再 close，服务端一点反应都没有）。
+			eof := errors.Is(err, io.EOF)
+			if err != nil && !eof {
+				if errors.Is(err, core.EAGAIN) {
+					return
+				}
+				el.parent.err("apiPoll", "err", err.Error())
+				return
 			}
-		}
-		if n == 0 && err == nil {
-			// 真空转：走永久等（-1）park 着等。
-			//
-			// **超时必须是"永久等"（-1），不能是 100ms 这种小超时**。
-			//
-			// pulse 按超时选等待方式（见它 waiter_linux.go 的 parkAbove）：永久
-			// 等 → park 在 runtime 的 poller 上，一瞬间就把 P 交出去；而
-			// (0, 1s) 区间里的超时 → 走 RawSyscall6 版的 epoll_wait，
-			// **RawSyscall 不通知 runtime**，于是这个 goroutine 抱着 P 睡满整个
-			// 超时，runtime 要等 sysmon 一个 tick 才能把 P 抢走。
-			//
-			// 代价实测（Linux，24 核）：单测里每轮泄漏一个 24 loop 的
-			// MultiEventLoop，几轮之后 24 个 P 全被睡着的循环占住，同进程里
-			// 一个 loopback 的 net.Dial 要等 95ms+，握手失败那一组用例集体超时
-			// （基线用永久等，0.26s 跑完，迁移后 4.08s）。
-			//
-			// 上面那个"自旋几轮"给的是 1ns（走非阻塞 epoll_wait(0)），
-			// 到这里就是真的没活了，让 P 出去不亏。
-			//
-			// Free 的停止不靠超时：它往唤醒管道写一个字节（见 wake.go），
-			// epoll fd 立刻可读，park 着的循环马上就醒。
-			_, err = el.Poll(-1, onEvent)
-		}
+
+			// 唤醒管道：投过来的任务在队列里等着，循环得先醒过来。
+			if fd == el.wakeR {
+				el.drainWake()
+				return
+			}
+
+			el.addPollEvNum(1)
+
+			c := el.parent.getConn(fd)
+			if c == nil {
+				// 连接已经关了（epoll 里可能还有一个待处理的事件）
+				return
+			}
+
+			if eof {
+				// **必须先读**：kqueue 会把"对端最后一段数据 + FIN"合并成
+				// 一个事件报过来（而且状态是 WRITE，不是 READ），这时候
+				// 还没有任何人调过 Read()，ReadBuffer() 是空的——但内核
+				// 缓冲区里躺着对端最后发的那段数据，直接 close 就一起丢了。
+				//
+				// 实测：TLS 场景下内层协议发的 "ping"（以及回显）都在 FIN
+				// 前面一点点到，对端 write+close 几乎同时，这边 OnData 就
+				// 永远不调——一个字节都收不到。而对端把 close 推迟 50ms 就
+				// "好了"（那 50ms 让数据单独成了一个可读事件）。
+				//
+				// **先补 activation**：连接可能刚 Add 进来，Add 投的
+				// OnOpen 任务还没轮到，而 FIN 已经到了（客户端连上就
+				// close）。不激活就跑 OnData 就是和 OnOpen 抢。
+				el.activate(c) // 幂等：已经激活过就直接返回
+				if c.IsClosed() {
+					return
+				}
+
+				// **这条路也要占 busy**：读的时候手上捏着读缓冲区（喂给
+				// 协议的那段就是它的别名），而 closeWith 只在"没人在处理
+				// 这条连接"时才当场释放缓冲区（见 flagFreePending）。
+				// 不占的话，别的 goroutine 一句 Close() 就能把缓冲区从
+				// 脚下抽走（-race 实测：用户 goroutine 的 Close 和这里的
+				// ReadBuffer 抢 rbuf）。
+				//
+				// 同一条连接的事件不会并发到达，所以这里一定拿得到；
+				// 真拿不到（不该发生）也**不能**空手去读——直接关掉。
+				if !c.tryBusy() {
+					c.closeWith(io.EOF)
+					return
+				}
+				// readAndDispatch 返回的 io.EOF 不用管：下面就 closeWith(io.EOF)，
+				// 这里只是要把最后的数据喂给协议、让它把该处理的处理完。
+				_ = el.readAndDispatch(c)
+				c.closeWith(io.EOF)
+				c.unbusy()
+				return
+			}
+
+			// 一个连接同时只有一个人在处理。处理期间又来的事件记在
+			// pending 位上，处理完的那个取走再跑一轮——ET 的边缘只来
+			// 一次，丢了就再也没有通知，连接会卡住。
+			if !c.tryBusy() {
+				if state.IsRead() {
+					c.setPendingRead()
+				}
+				if state.IsWrite() {
+					c.setPendingWrite()
+				}
+				return
+			}
+
+			el.processConn(c, state.IsRead(), state.IsWrite())
+		})
 		if err != nil {
 			el.parent.err("apiPoll", "err", err.Error())
 			return
@@ -297,9 +267,9 @@ func (el *EventLoop) readAndDispatch(c *Conn) error {
 		}
 	}
 
-	// 轮末把读缓冲区还回池子（见 ReleaseReadBuf）。不还的话连接会在
-	// "两批之间"攥着它——10000 连接的 Pipeline 负载下就是每连接 15KB
-	// 常驻（实测堆上 180MB）。
+	// 轮末把"长过的"读缓冲区还回池子（起始那一档留着，见 ReleaseReadBuf）。
+	// 不还的话连接会在"两批之间"攥着它——10000 连接的 Pipeline 负载下
+	// 就是每连接 15KB 常驻（实测堆上 180MB）。
 	c.ReleaseReadBuf()
 
 	// 读出错（含对端关了）：缓冲区已经空了，可以把错误交给上层了
