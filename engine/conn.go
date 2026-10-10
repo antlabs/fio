@@ -91,11 +91,6 @@ type Conn struct {
 	// 不实现 ReadBufferSizer 的协议是 0。
 	initRbSize int
 
-	// keepReadBuf 表示当前这块 rbuf 是"起始大小那一档"，全消费完可以留着
-	// 下轮接着用（省一次池往返）。一旦长过（growReadBuffer/growToNextMessage
-	// 换了更大的块）就清掉——长过的留着会变成每连接常驻，见 ConsumeRead。
-	keepReadBuf bool
-
 	// grewToBatch 表示这条连接的读缓冲区因为"一次读装满"长到过
 	// batchReadBufferSize 那一档（见 growReadBuffer）。之后每轮 Read 直接
 	// 按这一档取，省掉"先取一块起始大小的、装满、再换大的"那一步：
@@ -152,7 +147,6 @@ func (c *Conn) Init(fd int, h Handler, parent *EventLoop) {
 	c.rbuf = nil
 	c.rr, c.rw = 0, 0
 	c.wbufList = c.wbufList[:0]
-	c.keepReadBuf = false
 	c.grewToBatch = false
 	// 起始读缓冲区大小问一次协议就够，之后不再变——热路径上（ConsumeRead）
 	// 要拿它判断"这块是不是起始大小那块、能不能留"，每消息一次接口断言不划算。
@@ -310,20 +304,14 @@ func (c *Conn) Read() (int, error) {
 	c.mu.Unlock()
 
 	if c.rbuf == nil {
-		// 起始那块用完之后可以留着复用（见 ConsumeRead）。池按档位给，
-		// 拿到的比请求的大一点，所以记的是"这块就是起始档"这个事实，
-		// 不是长度本身。
-		//
 		// 长到过一批大小的连接（grewToBatch）直接按那一档取：不然每批
 		// 都要"取 2KB -> 装满 -> 换 15KB"走一遍，白多一次读系统调用和
-		// 一次 memcpy。这一档的块不常驻（keepReadBuf 为 false，轮末还回
-		// 池子，见 ReleaseReadBuf）。
+		// 一次 memcpy。取到之后轮末还回池子（见 ReleaseReadBuf）。
 		size := c.initialReadBufSize()
 		if c.grewToBatch {
 			size = batchReadBufferSize
 		}
 		c.rbuf = bytespool.GetBytes(size)
-		c.keepReadBuf = !c.grewToBatch
 	}
 
 	total := 0
@@ -457,47 +445,29 @@ func (c *Conn) ConsumeRead(n int) {
 	// 卡住（h2spec 复现过：同一个用例十次里挂一两次，而明文模式
 	// 100% 通过）。
 	//
-	// 所以只把索引推到底；真正的释放留给下一次 Read（那时候上一轮的
-	// 栈肯定已经退干净了）和 Close。
-	//
-	// **起始那一档的缓冲区留着下次接着用**（keepReadBuf，见 Read）：
-	// echo 这种"一条一条"的负载，缓冲区就是起始那 ~2KB，每消息都"还回
-	// 池子再取一块新的"是三笔开销——一次 PutBytes、一次 GetBytes、以及
-	// 池子每处理一次消息就多攒一块驻留内存（sync.Pool 按 P 缓存，实测
-	// 10000 连接下多留 29MB）。基线（迁移前）本来就是每连接持有一块不再
-	// 还的，这里对齐它。
-	//
-	// **长过的（growReadBuffer/growToNextMessage 换过更大的）一律还**——
-	// 见 growReadBuffer 里那段：留着会变成每连接常驻一块大的（Pipeline
-	// 实测 176MB 留在池子里，基线只有 58MB）。
-	if c.rbuf != nil && c.keepReadBuf {
-		c.releaseReadBuf = false
-		return
-	}
-
+	// 所以这里只把索引推到底、记个"该还了"；真正的释放放在轮末
+	// （ReleaseReadBuf，OnData 已经返回、栈退干净了）兜底在下一次 Read。
 	c.releaseReadBuf = true
 }
 
-// ReleaseReadBuf 把"长过的"读缓冲区当场还回池子。**每一轮 OnData 全部
-// 跑完之后调**（事件循环的轮末，见 readAndDispatch）。
+// ReleaseReadBuf 把读缓冲区当场还回池子。**每一轮 OnData 全部跑完之后
+// 调**（事件循环的轮末，见 readAndDispatch）。
 //
-// 为什么不学起始那一档、留到下一次 Read 再还：留着的话，"这一批读完"到
+// 为什么不留在连接上、等下一次 Read 再还：留着的话，"这一批读完"到
 // "下一批到来"之间的整段空闲里，每条连接都攥着一块。Pipeline 压测
 // （10000 连接，每 5ms 一批 10KB，缓冲区长到 15KB 那一档）实测堆上
 // **180MB** 全是这个（`Read -> growReadBuffer` 一条路径），RSS 从基线的
-// 55MB 涨到 375MB——常驻涨上去之后 GC 目标跟着涨，连池子里那些都没人
-// 清，滚雪球。
+// 55MB 涨到 375MB；echo 那种"每连接一块 2KB 起始块"也值 20MB 堆、约
+// 35MB RSS——每一档都不划算，统一还回池子。常驻涨上去之后 GC 目标跟着
+// 涨，连池子里那些都没人清，滚雪球。
 //
 // 时机是安全的：OnData 已经返回，协议手上没有这块内存的别名了（零拷贝
 // payload 只在 OnData 调用期间有效，这是引擎和协议的约定）。
-//
-// 起始那一档（keepReadBuf）不还：它小（~2KB），留着省每消息一次池往返。
 func (c *Conn) ReleaseReadBuf() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if c.rbuf == nil || c.keepReadBuf || c.rr != c.rw {
-		// 还没开始读、是起始那一档、或者还有没消费的数据（半条帧），
-		// 都留着。
+	if c.rbuf == nil || c.rr != c.rw {
+		// 还没开始读，或者还有没消费的数据（半条帧），留着。
 		return
 	}
 	bytespool.PutBytes(c.rbuf)
@@ -577,9 +547,6 @@ func (c *Conn) EnsureReadSpace(n int) bool {
 			want = maxReadBufferSize
 		}
 		c.rbuf = bytespool.GetBytes(want)
-		// 这是"按报文大小要到的一块"，比起始档可能大很多——不算可复用的
-		// 起始块，消费完要还（见 ConsumeRead）。
-		c.keepReadBuf = false
 		return cap(*c.rbuf)-c.rw >= n
 	}
 
@@ -613,7 +580,6 @@ func (c *Conn) EnsureReadSpace(n int) bool {
 	nb := bytespool.GetBytes(need)
 	copy(*nb, (*old)[:c.rw])
 	c.rbuf = nb
-	c.keepReadBuf = false
 	bytespool.PutBytes(old)
 	return len(*c.rbuf)-c.rw >= n
 }
@@ -709,15 +675,9 @@ func (c *Conn) growReadBuffer() bool {
 	}
 	copy(*nb, (*old)[:c.rw])
 	c.rbuf = nb
-	// **长过起始大小就不再算"可复用"**（keepReadBuf 清掉）。常驻的只能是
-	// 起始那一档——它小（~2KB），每连接一块也就 20MB 级别；长过的（一般
-	// 15KB 起）每轮结束当场还回池子，见 ReleaseReadBuf。
-	//
-	// 试过"长到一批大小(16KB)也留着"：echo 场景确实省池往返，但 Pipeline
-	// 场景每条连接都会长到 16KB 并留着，**10000 连接变成 160MB 常驻**
-	// （实测 bytespool 里 176MB），而基线是每消费完就还、稳定在 58MB。
-	// 拿一批大小的内存换那点池往返不划算。
-	c.keepReadBuf = false
+	// 长过之后的块一律不常驻：每轮结束当场还回池子，见 ReleaseReadBuf。
+	// （试过"长到一批大小(16KB)就留着"：echo 省一次池往返，但 Pipeline
+	// 每条连接都长到那一档并留着，**10000 连接 160MB 常驻**。）
 	bytespool.PutBytes(old)
 	if c.parent != nil {
 		c.parent.addRealloc()
@@ -1054,7 +1014,6 @@ func (c *Conn) releaseBuffersLocked() {
 	c.wbufList = c.wbufList[:0]
 	c.rr, c.rw = 0, 0
 	c.releaseReadBuf = false
-	c.keepReadBuf = false
 }
 
 // ---------------------------------------------------------------------------
