@@ -96,6 +96,16 @@ type Conn struct {
 	// 换了更大的块）就清掉——长过的留着会变成每连接常驻，见 ConsumeRead。
 	keepReadBuf bool
 
+	// grewToBatch 表示这条连接的读缓冲区因为"一次读装满"长到过
+	// batchReadBufferSize 那一档（见 growReadBuffer）。之后每轮 Read 直接
+	// 按这一档取，省掉"先取一块起始大小的、装满、再换大的"那一步：
+	// 每批少一次读系统调用、少一次 memcpy、少两次池操作。
+	//
+	// **只记这一档**。协议大报文翻倍长上去的那种块不记（它们可能很大，
+	// 记下来就成了每连接常驻一块大的）；这一档的块每轮结束就还回池子
+	// （见 ReleaseReadBuf），不常驻。
+	grewToBatch bool
+
 	// mu 保护 rbuf/wbufList: Close 可能从任意 goroutine 来, 它要在锁里
 	// 释放这两块内存。
 	mu sync.Mutex
@@ -143,6 +153,7 @@ func (c *Conn) Init(fd int, h Handler, parent *EventLoop) {
 	c.rr, c.rw = 0, 0
 	c.wbufList = c.wbufList[:0]
 	c.keepReadBuf = false
+	c.grewToBatch = false
 	// 起始读缓冲区大小问一次协议就够，之后不再变——热路径上（ConsumeRead）
 	// 要拿它判断"这块是不是起始大小那块、能不能留"，每消息一次接口断言不划算。
 	c.initRbSize = 0
@@ -302,8 +313,17 @@ func (c *Conn) Read() (int, error) {
 		// 起始那块用完之后可以留着复用（见 ConsumeRead）。池按档位给，
 		// 拿到的比请求的大一点，所以记的是"这块就是起始档"这个事实，
 		// 不是长度本身。
-		c.rbuf = bytespool.GetBytes(c.initialReadBufSize())
-		c.keepReadBuf = true
+		//
+		// 长到过一批大小的连接（grewToBatch）直接按那一档取：不然每批
+		// 都要"取 2KB -> 装满 -> 换 15KB"走一遍，白多一次读系统调用和
+		// 一次 memcpy。这一档的块不常驻（keepReadBuf 为 false，轮末还回
+		// 池子，见 ReleaseReadBuf）。
+		size := c.initialReadBufSize()
+		if c.grewToBatch {
+			size = batchReadBufferSize
+		}
+		c.rbuf = bytespool.GetBytes(size)
+		c.keepReadBuf = !c.grewToBatch
 	}
 
 	total := 0
@@ -456,6 +476,34 @@ func (c *Conn) ConsumeRead(n int) {
 	}
 
 	c.releaseReadBuf = true
+}
+
+// ReleaseReadBuf 把"长过的"读缓冲区当场还回池子。**每一轮 OnData 全部
+// 跑完之后调**（事件循环的轮末，见 readAndDispatch）。
+//
+// 为什么不学起始那一档、留到下一次 Read 再还：留着的话，"这一批读完"到
+// "下一批到来"之间的整段空闲里，每条连接都攥着一块。Pipeline 压测
+// （10000 连接，每 5ms 一批 10KB，缓冲区长到 15KB 那一档）实测堆上
+// **180MB** 全是这个（`Read -> growReadBuffer` 一条路径），RSS 从基线的
+// 55MB 涨到 375MB——常驻涨上去之后 GC 目标跟着涨，连池子里那些都没人
+// 清，滚雪球。
+//
+// 时机是安全的：OnData 已经返回，协议手上没有这块内存的别名了（零拷贝
+// payload 只在 OnData 调用期间有效，这是引擎和协议的约定）。
+//
+// 起始那一档（keepReadBuf）不还：它小（~2KB），留着省每消息一次池往返。
+func (c *Conn) ReleaseReadBuf() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.rbuf == nil || c.keepReadBuf || c.rr != c.rw {
+		// 还没开始读、是起始那一档、或者还有没消费的数据（半条帧），
+		// 都留着。
+		return
+	}
+	bytespool.PutBytes(c.rbuf)
+	c.rbuf = nil
+	c.rr, c.rw = 0, 0
+	c.releaseReadBuf = false
 }
 
 // maxReadBufferSize 是读缓冲区能长到多大。
@@ -636,12 +684,34 @@ func (c *Conn) growReadBuffer() bool {
 	}
 
 	old := c.rbuf
+	// **这块一定得比现在的大**。池按 1KB 分档给货：要 16KB 拿回来的是
+	// 15374，而 cur 可能已经就是 15374 了（上一跳从池里拿的这一档），
+	// "换了等于没换"——调用方（Read）看到长成功会再走一轮，缓冲区还是
+	// 满的，就是死循环。对端一次发来 ≥15KB、把这一档读满时 100% 复现
+	// （-rbs 16384 的压测客户端两个批次并到一起就是 20KB）。
 	nb := bytespool.GetBytes(want)
+	for len(*nb) <= cur {
+		bytespool.PutBytes(nb)
+		if want >= maxReadBufferSize {
+			return false
+		}
+		want *= 2
+		if want > maxReadBufferSize {
+			want = maxReadBufferSize
+		}
+		nb = bytespool.GetBytes(want)
+	}
+
+	if want == batchReadBufferSize {
+		// 长到的就是"一批大小"那一档：记下来，后面每轮直接按它取，
+		// 省掉"取一块小的、装满、再换大的"（见 grewToBatch）。
+		c.grewToBatch = true
+	}
 	copy(*nb, (*old)[:c.rw])
 	c.rbuf = nb
-	// **长过起始大小就不再算"可复用"**（keepReadBuf 清掉，全消费完还回
-	// 池子）。留下的只能是起始那一档——它小（~2KB），每连接一块也就
-	// 20MB 级别，和基线一样。
+	// **长过起始大小就不再算"可复用"**（keepReadBuf 清掉）。常驻的只能是
+	// 起始那一档——它小（~2KB），每连接一块也就 20MB 级别；长过的（一般
+	// 15KB 起）每轮结束当场还回池子，见 ReleaseReadBuf。
 	//
 	// 试过"长到一批大小(16KB)也留着"：echo 场景确实省池往返，但 Pipeline
 	// 场景每条连接都会长到 16KB 并留着，**10000 连接变成 160MB 常驻**
