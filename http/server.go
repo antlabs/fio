@@ -57,6 +57,9 @@ type ResponseWriter struct {
 	// 唯一能给客户端划出体边界的办法就是关连接。
 	closeAfterWrite bool
 
+	// deferred 这次响应由业务稍后写（见 Defer）。
+	deferred bool
+
 	// chunked 这个响应用 chunked（调用方没设 Content-Length）
 	chunked bool
 	// finished chunked 的收尾块发过没有
@@ -359,6 +362,13 @@ func (ch *ConnHandler) state(c *engine.Conn) *connState {
 // 规矩：**缓冲只有一处**，就是引擎的读缓冲区。解析器不攒。
 func (ch *ConnHandler) OnData(c *engine.Conn, buf []byte) (int, error) {
 	st := ch.state(c)
+	if st.pending {
+		// 上一个请求的响应还挂在那儿没写（业务调了 Defer）。**一个字节都
+		// 不能消费**：返回 0 引擎就不丢这些字节，等 Resume 复位之后再喂回来。
+		// 这里要是照常解析，第二个请求会盖掉第一个的状态（解析器、响应
+		// 写出器都是同一个）。
+		return 0, nil
+	}
 	consumed := 0
 
 	for consumed < len(buf) {
@@ -397,6 +407,14 @@ func (ch *ConnHandler) OnData(c *engine.Conn, buf []byte) (int, error) {
 		}
 		st.w.reset(c, req.Proto)
 		ch.handler.ServeHTTP(st.w, req)
+
+		// 业务把响应推后了（见 Defer）：不要补头、不要 Reset 解析器——那会
+		// 把还没写的响应变成空响应，也会让下一个请求踩掉当前的状态。把连接
+		// 挂起来，交给 Resume 收尾。
+		if st.w.deferred {
+			st.pending = true
+			return consumed, nil
+		}
 
 		// 响应收尾。
 		//
@@ -501,6 +519,41 @@ type connState struct {
 	parser *Parser
 	// w 是复用的响应写出器
 	w *ResponseWriter
+
+	// pending 有一个被 Defer 挂起的请求还没收尾（见 Resume）。
+	pending bool
+}
+
+// Resume 收尾一个被 Defer 挂起的请求：补头、收 chunked、按 keep-alive 决定
+// 关不关连接、复位解析器。
+//
+// **必须在这条连接所属的事件循环的 goroutine 上调**（engine.Conn.SyncOnLoop
+// 就是干这个的）。解析器和 ResponseWriter 都是那个 goroutine 的状态，从别的
+// goroutine 碰它们就是数据竞争。
+//
+// 调之前要把响应写完（w.Write / w.WriteHeader），这之后的收尾和同步 handler
+// 那条路完全一样——所以两种 handler 写出来的报文没有区别。
+//
+// 连接已经关了的话什么都不做。
+func Resume(c *engine.Conn, req *Request) error {
+	st, ok := c.UserData().(*connState)
+	if !ok || st == nil || !st.pending {
+		return nil
+	}
+	st.pending = false
+
+	if err := st.w.flushHeader(); err != nil {
+		return err
+	}
+	if err := st.w.finish(); err != nil {
+		return err
+	}
+	if wantClose(req) || st.w.closeAfterWrite {
+		c.Close()
+		return nil
+	}
+	st.parser.Reset()
+	return nil
 }
 
 // reset 把 ResponseWriter 复位到"新一个响应"的状态。
@@ -515,10 +568,29 @@ func (w *ResponseWriter) reset(c *engine.Conn, proto string) {
 	w.chunked = false
 	w.finished = false
 	w.closeAfterWrite = false
+	w.deferred = false
 	for k := range w.header {
 		delete(w.header, k)
 	}
 }
+
+// Defer 声明这次响应稍后再写。
+//
+// 业务调了它就该**立刻返回**，别再往 w 上写任何东西；之后的某一刻（可以在
+// 别的 goroutine 上）准备好响应，用 Resume 收尾。写本身要回到事件循环上
+// 做（engine.Conn.SyncOnLoop），因为 w 和解析器都是那条连接的循环 goroutine
+// 的状态。
+//
+// **这个接口存在的理由是不许阻塞事件循环**。handler 就跑在循环的 goroutine
+// 上，在里面 time.Sleep 等于把同一个循环上所有连接一起冻住——而 event loop
+// 的分片是按 fd 的，睡一次影响一批连接。这类"要等一会儿才回"的请求（定时、
+// 等下游）是事件循环架构上唯一必须显式让出的地方。
+//
+// 挂起期间这条连接上不会处理新请求：OnData 看到 pending 就返回 0，把字节
+// 留在引擎的读缓冲区里（返回 0 的语义就是"没消费"），等 Resume 复位之后再喂。
+// 所以**挂起期间客户端再 pipelining 进来一条请求，要等上一条回完才会被处理**
+// ——对"一问一答"的客户端没有影响，对 pipelining 的会有额外延迟。
+func (w *ResponseWriter) Defer() { w.deferred = true }
 
 // errNoUpgrade 没有 Upgrade 处理器时的错误。
 var errNoUpgrade = errors.New("http: upgrade request but no handler")
