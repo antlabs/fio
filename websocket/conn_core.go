@@ -55,35 +55,27 @@ const (
 	frameStatePayload
 )
 
-// packed 里只有两个状态位了:
+// packed 现在只剩客户端这一个位了:
 //
-//	bit 0-1  curState(帧头解析的状态机, 只有 3 个值)
-//	bit 2    客户端为 1, 服务端为 0
+//	bit 0  客户端为 1, 服务端为 0
 //
-// busy/pendingRead/pendingWrite/corking 那几个位以前也在这儿，现在归 engine
-// ——它们是"这条连接正被谁处理、要不要攒包"的调度状态，和 websocket 协议
-// 本身无关。
+// curState 挪出去了(见 curState 字段)。busy/pendingRead/pendingWrite/corking
+// 那几个位以前也在这儿，现在归 engine——它们是"这条连接正被谁处理、要不要
+// 攒包"的调度状态，和 websocket 协议本身无关。
 const (
-	stateMask  uint32 = 0x3
-	flagClient uint32 = 1 << 2
+	flagClient uint32 = 1 << 0
 )
 
-// curState 和 client 都走原子: Go 的 atomic 在 x86 上就是普通 load/store
-// (带编译器屏障), 统一用原子不会变慢, 还避免了非原子读改写把别的 goroutine
-// 原子置的位覆盖掉。
-func (c *Conn) getCurState() frameState {
-	return frameState(atomic.LoadUint32(&c.packed) & stateMask)
-}
+// curState 是帧头解析状态机。**普通字段，不走原子**：它只在事件循环的
+// goroutine 上被碰（OnData 里），而这条连接的读事件都在同一个循环上串行，
+// 没有第二个 goroutine 会碰它。
+//
+// 以前它和 client 位挤在 packed 里、用 CAS 循环改，是热路径上最贵的一次
+// 操作（每条消息好几个帧、每个帧头状态机要推进两三次）。分开之后 setCurState
+// 就是一次普通赋值。
+func (c *Conn) getCurState() frameState { return c.curState }
 
-func (c *Conn) setCurState(st frameState) {
-	for {
-		old := atomic.LoadUint32(&c.packed)
-		nv := (old &^ stateMask) | (uint32(st) & stateMask)
-		if atomic.CompareAndSwapUint32(&c.packed, old, nv) {
-			return
-		}
-	}
-}
+func (c *Conn) setCurState(st frameState) { c.curState = st }
 
 func (c *Conn) isClient() bool { return atomic.LoadUint32(&c.packed)&flagClient != 0 }
 

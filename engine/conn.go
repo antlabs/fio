@@ -440,16 +440,16 @@ func (c *Conn) ConsumeRead(n int) {
 	// 所以只把索引推到底；真正的释放留给下一次 Read（那时候上一轮的
 	// 栈肯定已经退干净了）和 Close。
 	//
-	// **没长过一批大小的那块留着下次接着用**（keepReadBuf，见 Read）：
-	// 每条消息都"还回池子再取一块新的"是三笔开销——一次 PutBytes、
-	// 一次 GetBytes、以及池子每处理一次消息就多攒一块驻留内存（sync.Pool
-	// 按 P 缓存，实测 10000 连接下多留 29MB，而它们本该是每连接常驻的
-	// 那几 KB）。基线（迁移前）本来就是每连接持有一块不再还的，这里对齐。
+	// **起始那一档的缓冲区留着下次接着用**（keepReadBuf，见 Read）：
+	// echo 这种"一条一条"的负载，缓冲区就是起始那 ~2KB，每消息都"还回
+	// 池子再取一块新的"是三笔开销——一次 PutBytes、一次 GetBytes、以及
+	// 池子每处理一次消息就多攒一块驻留内存（sync.Pool 按 P 缓存，实测
+	// 10000 连接下多留 29MB）。基线（迁移前）本来就是每连接持有一块不再
+	// 还的，这里对齐它。
 	//
-	// **长过一批大小（> batchReadBufferSize）的必须还**：那种是"协议还在
-	// 等半条大报文、缓冲区一路翻倍长上去"的，留着就变成每连接常驻一块
-	// 大的——实测无上限地留，10000 连接下 MEM 从 119MB 涨到 417MB。
-	// 所以留的口子限在 batchReadBufferSize（一批消息装得下就够）。
+	// **长过的（growReadBuffer/growToNextMessage 换过更大的）一律还**——
+	// 见 growReadBuffer 里那段：留着会变成每连接常驻一块大的（Pipeline
+	// 实测 176MB 留在池子里，基线只有 58MB）。
 	if c.rbuf != nil && c.keepReadBuf {
 		c.releaseReadBuf = false
 		return
@@ -639,14 +639,15 @@ func (c *Conn) growReadBuffer() bool {
 	nb := bytespool.GetBytes(want)
 	copy(*nb, (*old)[:c.rw])
 	c.rbuf = nb
-	// 长到"一批装得下"为止都算可复用（keepReadBuf）：一批消息挤满起始那块
-	// 是很常见的（一次 write 带 3~10 条），这时长到 16KB 是个稳定的落点，
-	// 留着复用省掉每消息的池往返。再往上（半条大报文那种翻倍）就不是
-	// "稳定的落点"了，留着会每连接常驻一块大的，必须还（见 ConsumeRead）。
-	// 注意用 want 而不是 len(*nb) 比：bytespool 按档位给，要 16KB 拿回来
-	// 是 16398（多加了一个帧头），拿实际长度去比会把"刚好一批大小"判成
-	// 太大。
-	c.keepReadBuf = want <= batchReadBufferSize
+	// **长过起始大小就不再算"可复用"**（keepReadBuf 清掉，全消费完还回
+	// 池子）。留下的只能是起始那一档——它小（~2KB），每连接一块也就
+	// 20MB 级别，和基线一样。
+	//
+	// 试过"长到一批大小(16KB)也留着"：echo 场景确实省池往返，但 Pipeline
+	// 场景每条连接都会长到 16KB 并留着，**10000 连接变成 160MB 常驻**
+	// （实测 bytespool 里 176MB），而基线是每消费完就还、稳定在 58MB。
+	// 拿一批大小的内存换那点池往返不划算。
+	c.keepReadBuf = false
 	bytespool.PutBytes(old)
 	if c.parent != nil {
 		c.parent.addRealloc()
