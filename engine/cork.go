@@ -150,6 +150,9 @@ func (c *Conn) CorkWrite(header, payload []byte) error {
 	// 一次发出去, 三段时间接进 iovec, 都不拷。
 	seg := *b
 	n, err := socketWritev3(int(atomic.LoadInt64(&c.fd)), seg, header, payload)
+	if c.parent != nil {
+		c.parent.addWriteSyscall()
+	}
 	if n < 0 {
 		// 兜底: 下面要拿 n 切 slices, 负数就是"从一个负下标切", 直接
 		// panic。socketWritev3 保证出错时返回 0, 但这条路径不该因为一个

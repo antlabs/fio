@@ -22,11 +22,10 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"syscall"
 	"time"
 
-	"github.com/antlabs/wsutil/bytespool"
 	"github.com/antlabs/wsutil/deflate"
-	"github.com/antlabs/wsutil/enum"
 	"github.com/antlabs/wsutil/hostname"
 )
 
@@ -184,9 +183,9 @@ func (d *DialOption) Dial() (wsCon *Conn, err error) {
 		return nil, ErrEventLoopEmpty
 	}
 
-	if !d.Config.multiEventLoop.isStart() {
-		return nil, ErrEventLoopNotStart
-	}
+	// 默认事件循环在 defaultSettingAfter 里 Start 过了, 用户自己传的那份
+	// 由用户 Start。engine 的 Start 是幂等的。
+	d.Config.multiEventLoop.Start()
 	req, secWebSocket, err := d.handshake()
 	if err != nil {
 		return nil, err
@@ -248,6 +247,21 @@ func (d *DialOption) Dial() (wsCon *Conn, err error) {
 		return nil, err
 	}
 
+	// bufio 里可能已经多读了数据(服务端在握手响应之后紧跟了几个帧):
+	// 先收下来, 挂到引擎之后再喂给解析器。
+	//
+	// 为什么先 peek 再 dup fd: net.Conn 的 bufio 和事件循环读的是同一个
+	// socket, 两边都读就会把数据抢走。这里把 bufio 多读的字节拿出来自己
+	// 处理, 事件循环只往后读, 不重不漏。
+	var leftover []byte
+	if br.Buffered() > 0 {
+		b, perr := br.Peek(br.Buffered())
+		if perr != nil {
+			return nil, perr
+		}
+		leftover = append([]byte(nil), b...)
+	}
+
 	fd, err := getFdFromConn(conn)
 	if err != nil {
 		conn.Close()
@@ -257,28 +271,35 @@ func (d *DialOption) Dial() (wsCon *Conn, err error) {
 	if err = conn.Close(); err != nil {
 		return nil, err
 	}
-	if wsCon, err = newConn(int64(fd), true, &d.Config); err != nil {
+
+	// 连接对象由引擎在**注册 fd 之前**、在**这个 goroutine 上**调 Bind 建
+	// 出来（见 ConnHandler.Bind），所以 Dial 返回时对象一定已经是好的——
+	// 不需要再去事件循环上等一圈。**这个"不等"是有意义的**：等的话事件
+	// 循环会先跑一轮 poll，对端"握手完立刻 close"时对象等回来就已经关了
+	// （数据 + FIN 一起到，一轮 poll 全处理完）。
+	h := NewClientConnHandler(&d.Config)
+	h.SetPermessageDeflate(pd)
+	h.OnConn = func(c *Conn) error {
+		// 握手多读的那几个字节喂给解析器。走的是和 OnData 一样的"借
+		// 缓冲区"那套；比注册早，事件循环看不见这条连接，没有并发。
+		if len(leftover) > 0 {
+			if _, err := c.parseBuf(c.ec, leftover); err != nil {
+				return err
+			}
+		}
+		c.Callback.OnOpen(c)
+		return nil
+	}
+
+	d.Config.engineMode = true
+	ec, err := d.Config.multiEventLoop.Add(fd, h)
+	if err != nil {
+		syscall.Close(fd)
 		return nil, err
 	}
-	wsCon.pd = pd
-	wsCon.Callback = d.cb
-	wsCon.OnOpen(wsCon)
-	if br.Buffered() > 0 {
-		b, err := br.Peek(br.Buffered())
-		if err != nil {
-			return nil, err
-		}
-
-		wsCon.rbuf = bytespool.GetBytes(len(b) + enum.MaxFrameHeaderSize)
-
-		copy(*wsCon.rbuf, b)
-		wsCon.rw = len(b)
-		if err = wsCon.processHeaderPayloadCallback(); err != nil {
-			return nil, err
-		}
-	}
-	if err = d.Config.multiEventLoop.add(wsCon); err != nil {
-		return nil, err
+	if wsCon, _ = ec.UserData().(*Conn); wsCon == nil {
+		ec.Close()
+		return nil, ErrClosed
 	}
 	return wsCon, nil
 }

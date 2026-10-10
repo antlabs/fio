@@ -243,7 +243,18 @@ func (s *TcpServer) serve(fd int) {
 		return
 	}
 
-	if err := s.upgrade(fd, req); err != nil {
+	// 握手之后紧跟的字节（客户端把第一个帧和握手拼在一次 write 里发出来
+	// 就会这样）。readHandshake 是"读到空行"就返回的，多读的部分停在 buf
+	// 里，不带走就是丢——丢的可能是第一条消息。
+	//
+	// 要拷一份：buf 是池子里借的，serve 一返回就还了，而这段字节要到
+	// 事件循环上（OnConn 里）才喂给解析器。
+	var leftover []byte
+	if i := bytes.Index((*buf)[:n], []byte("\r\n\r\n")); i >= 0 && i+4 < n {
+		leftover = append([]byte(nil), (*buf)[i+4:n]...)
+	}
+
+	if err := s.upgrade(fd, req, leftover); err != nil {
 		unix.Close(fd)
 	}
 }
@@ -252,7 +263,7 @@ func (s *TcpServer) serve(fd int) {
 //
 // 这里不 dup fd, 也不经过 net: fd 是 accept4 直接给的, 只有我们持有它。
 // Hijack 那条路要 dup 是因为 http.Server 还攥着 net 那一份。
-func (s *TcpServer) upgrade(fd int, req *handshakeRequest) error {
+func (s *TcpServer) upgrade(fd int, req *handshakeRequest, leftover []byte) error {
 	if s.conf.tcpNoDelay {
 		if err := unix.SetsockoptInt(fd, unix.IPPROTO_TCP, unix.TCP_NODELAY, 1); err != nil {
 			return err
@@ -264,14 +275,24 @@ func (s *TcpServer) upgrade(fd int, req *handshakeRequest) error {
 		return err
 	}
 
-	wsCon, err := newConn(int64(fd), false, s.conf)
-	if err != nil {
-		return err
+	// 连接对象由引擎在注册 fd 之前、在这个 goroutine 上调 Bind 建出来
+	// （见 ConnHandler.Bind），这里只把"握手才知道的东西"交给 handler:
+	// 压缩参数、多读的字节、以及"建好之后调用户回调"这件事。
+	h := NewConnHandler(s.conf)
+	h.SetPermessageDeflate(req.deflate)
+	h.OnConn = func(c *Conn) error {
+		if len(leftover) > 0 {
+			if _, err := c.parseBuf(c.ec, leftover); err != nil {
+				return err
+			}
+		}
+		c.Callback.OnOpen(c)
+		return nil
 	}
-	wsCon.pd = req.deflate
-	wsCon.Callback = s.conf.cb
-	wsCon.Callback.OnOpen(wsCon)
-	return s.conf.multiEventLoop.add(wsCon)
+
+	s.conf.engineMode = true
+	_, err := s.conf.multiEventLoop.Add(fd, h)
+	return err
 }
 
 // writeAll 把 b 写完。

@@ -13,135 +13,54 @@
 // limitations under the License.
 package websocket
 
-import (
-	"os"
-	"sync/atomic"
-)
-
-// 统计信息
-type stat struct {
-	readSyssall  int64  // 读系统调用次数
-	writeSyscall int64  // 写系统调用次数
-	curConn      int64  // 当前tcp连接数
-	realloc      int64  // 重新分配内存次数
-	moveBytes    uint64 // 移动字节数
-	readEv       int64  // 读事件次数
-	writeEv      int64  // 写事件次数
-	pollEv       int64  // poll事件次数, 包含读,写, 错误事件
-}
-
-// 对外接口，查询当前业务协程池个数
-func (m *MultiEventLoop) GetCurGoNum() (total int) {
-	for _, v := range m.loops {
-		// 本地任务数
-		total += int(v.localTask.GetGoroutines())
-	}
-	return
-}
-
-// 对外接口，查询业务协程池运行的当前业务数
-func (m *MultiEventLoop) GetCurTaskNum() (total int64) {
-	for _, v := range m.loops {
-		// 本地任务数
-		total += int64(v.localTask.GetGoroutines())
-	}
-	return
-}
-
-// 对外接口，查询移动字节数
-func (m *MultiEventLoop) GetMoveBytesNum() uint64 {
-	return atomic.LoadUint64(&m.moveBytes)
-}
-
-// 对外接口，查询重新分配内存次数
-func (m *MultiEventLoop) GetReallocNum() int64 {
-	return atomic.LoadInt64(&m.realloc)
-}
-
-// 对外接口，查询read syscall次数
-func (m *MultiEventLoop) GetReadSyscallNum() int64 {
-	return atomic.LoadInt64(&m.readSyssall)
-}
-
-// 对外接口，查询write syscall次数
-func (m *MultiEventLoop) GetWriteSyscallNum() int64 {
-	return atomic.LoadInt64(&m.writeSyscall)
-}
-
-// 对外接口，查询当前websocket连接数
-func (m *MultiEventLoop) GetCurConnNum() int64 {
-	return atomic.LoadInt64(&m.curConn)
-}
-
-// 对外接口，查询poll read事件次数
-func (m *MultiEventLoop) GetReadEvNum() int64 {
-	return atomic.LoadInt64(&m.readEv)
-}
-
-// 对外接口，查询poll write事件次数
-func (m *MultiEventLoop) GetWriteEvNum() int64 {
-	return atomic.LoadInt64(&m.writeEv)
-}
-
-// 对外接口，查询poll 返回的事件总次数
-func (m *MultiEventLoop) GetPollEvNum() int64 {
-	return atomic.LoadInt64(&m.pollEv)
-}
-
-// 对外接口，返回当前使用的api名字
-func (m *MultiEventLoop) GetApiName() string {
-	if len(m.loops) == 0 {
-		return ""
-	}
-
-	return m.loops[0].GetApiName()
-}
-
-// 对内接口
-func (m *MultiEventLoop) addRealloc() {
-	atomic.AddInt64(&m.realloc, 1)
-}
-
-// statOff 关掉每消息的两次原子计数, 用于量这两次原子加值多少。
+// 诊断接口。
 //
-// 这两个计数是诊断用的(GetReadSyscallNum 给压测的控制口读), 但它们打在
-// 同一个 cache line 上, 而每条消息都要写两次、每个解析 goroutine 都在写
-// ——多核之间来回争抢那一行。关掉它跑一轮, 差值就是这层竞争的代价。
-var statOff = os.Getenv("GREATWS_NO_STAT") != ""
+// **数字本身现在归 engine 数**（syscall 发生在它那儿，协议层看不见），
+// 这里只把方法名转发过去——名字是公开 API，压测的控制口（bench-ws 的
+// greatws-io / greatws-onebyone）每秒读一次这些数，改名就是编译不过。
+//
+// 想量"没有诊断开销时能跑多快"用 FIO_NO_STAT（或老的 GREATWS_NO_STAT）
+// 环境变量把计数关掉，见 engine/stats.go。
 
-// 系统调用计数。就是两个原子加, 没做本地批量——试过按分片本地累加再
-// 攒批上报, 但写路径可以从任意 go 程调(用户的 OnMessage、超时线程),
-// 本地字段就要跨 go 程写, 反而要加锁; 换来的是 1.7% 的吞吐, 不值。
-func (c *Conn) addReadSyscall() {
-	if statOff {
-		return
-	}
-	atomic.AddInt64(&c.multiEventLoop.readSyssall, 1)
+// GetCurConnNum 当前连接数。
+func (m *MultiEventLoop) GetCurConnNum() int64 { return m.NumConns() }
+
+// GetCurGoNum 当前业务协程数。
+//
+// 以前是"每个 event loop 一个业务池"的协程数之和；现在回调默认就地执行
+// （在事件循环自己的 goroutine 上），进程里唯一的池子是给非 io 模式用的
+// selectTask，没启用就是 0。
+func (m *MultiEventLoop) GetCurGoNum() (total int) {
+	return defaultTasks.GetGoroutines()
 }
 
-func (c *Conn) addWriteSyscall() {
-	if statOff {
-		return
-	}
-	atomic.AddInt64(&c.multiEventLoop.writeSyscall, 1)
+// GetCurTaskNum 当前正在跑的业务数。
+//
+// 同 GetCurGoNum：就地执行下没有独立的业务协程，所以和协程数同值。
+func (m *MultiEventLoop) GetCurTaskNum() (total int64) {
+	return int64(defaultTasks.GetGoroutines())
 }
 
-// 对内接口
-func (m *MultiEventLoop) addMoveBytes(n uint64) {
-	atomic.AddUint64(&m.moveBytes, n)
-}
+// GetApiName 当前用的多路复用 api 名字（epoll / kqueue）。
+func (m *MultiEventLoop) GetApiName() string { return m.ApiName() }
 
-// 对内接口
-func (m *MultiEventLoop) addReadEvNum() {
-	atomic.AddInt64(&m.readEv, 1)
-}
+// GetReadSyscallNum 读系统调用次数。
+func (m *MultiEventLoop) GetReadSyscallNum() int64 { return m.ReadSyscallNum() }
 
-// 对内接口
-func (m *MultiEventLoop) addWriteEvNum() {
-	atomic.AddInt64(&m.writeEv, 1)
-}
+// GetWriteSyscallNum 写系统调用次数。攒包的效果就是看它。
+func (m *MultiEventLoop) GetWriteSyscallNum() int64 { return m.WriteSyscallNum() }
 
-// 对内接口
-func (m *MultiEventLoop) addPollEvNum() {
-	atomic.AddInt64(&m.pollEv, 1)
-}
+// GetReallocNum 读缓冲区重新分配次数。
+func (m *MultiEventLoop) GetReallocNum() int64 { return m.ReallocNum() }
+
+// GetMoveBytesNum compact 时移动的字节数。
+func (m *MultiEventLoop) GetMoveBytesNum() uint64 { return m.MoveBytesNum() }
+
+// GetReadEvNum 读事件次数。
+func (m *MultiEventLoop) GetReadEvNum() int64 { return m.ReadEvNum() }
+
+// GetWriteEvNum 写事件次数。
+func (m *MultiEventLoop) GetWriteEvNum() int64 { return m.WriteEvNum() }
+
+// GetPollEvNum Poll 返回的事件总数。
+func (m *MultiEventLoop) GetPollEvNum() int64 { return m.PollEvNum() }

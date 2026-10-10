@@ -18,6 +18,10 @@ import (
 	"sync"
 
 	"github.com/antlabs/task/task/driver"
+	// 空导入: 各个任务驱动的 init() 会把自己注册到 driver 的注册表里。
+	// 少了它 GetAllRegister() 是空的, newTask 找不到 "onebyone"/"elastic"
+	// 这些名字, 直接 panic(fio: no task driver found)。
+	_ "github.com/antlabs/task/task"
 )
 
 type selectTask struct {
@@ -25,6 +29,37 @@ type selectTask struct {
 	task           driver.Tasker
 }
 type selectTasks []selectTask
+
+// 默认的业务协程池。以前是"每个 event loop 一个"(绑定到它自己的
+// localTask), 现在事件循环归 engine, websocket 这层只在用户显式
+// 选了非 io 模式时用到——一份进程级的就够。
+//
+// 惰性建: 默认 io 模式根本走不到这儿, 不该为一个没用到的模式起协程池。
+var (
+	defaultTasks     selectTasks
+	defaultTasksOnce sync.Once
+)
+
+// 业务协程池的默认参数。原来是每个 event loop 一份配置，现在进程一份，
+// 数值沿用迁移前的（8 起步、50 保底、3 万上限）——非 io 模式不是热路径，
+// 没跟着重新调。
+const (
+	defTaskMin       = 50
+	defTaskMax       = 30000
+	defTaskInitCount = 8
+)
+
+// newTaskExecutor 按任务驱动名(elastic/onebyone/...)取一个 executor。
+//
+// 以前是 c.parent.localTask.newTask(taskName); event loop 搬去 engine 之后
+// 没有 localTask 了, 改成进程级的一份。
+func newTaskExecutor(taskName string) driver.TaskExecutor {
+	defaultTasksOnce.Do(func() {
+		var c driver.Conf
+		defaultTasks = newSelectTask(context.Background(), defTaskInitCount, defTaskMin, defTaskMax, &c)
+	})
+	return defaultTasks.newTask(taskName)
+}
 
 // newTaskMu 串行化 newTask。
 //

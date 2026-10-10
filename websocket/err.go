@@ -50,3 +50,13 @@ var (
 	// 事件循环没有启动
 	ErrEventLoopNotStart = errors.New("event loop not start")
 )
+
+// 读写超时相关。以前定义在带平台 build tag 的 conn_syscall_* 文件里,
+// 现在 IO 都归 engine, 这几个纯逻辑错误挪到这里(和平台无关)。
+var (
+	ErrInvalidDeadline = errors.New("invalid deadline")
+	// 读超时
+	ErrReadTimeout = errors.New("read timeout")
+	// 写超时
+	ErrWriteTimeout = errors.New("write timeout")
+)

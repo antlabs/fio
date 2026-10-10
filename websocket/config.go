@@ -15,6 +15,7 @@
 package websocket
 
 import (
+	"log/slog"
 	"time"
 
 	"github.com/antlabs/wsutil/deflate"
@@ -39,11 +40,18 @@ type Config struct {
 	delayWriteInitBufferSize        int32             // 延迟写入的初始缓冲区大小, 默认值是8k
 	maxDelayWriteDuration           time.Duration     // 最大延迟时间, 默认值是10ms
 	subProtocols                    []string          // 设置支持的子协议
-	multiEventLoop                  *MultiEventLoop   // 事件循环
+	multiEventLoop                  *MultiEventLoop   // 事件循环(engine 的 + websocket 的诊断接口)
 	runInGoTask                     string            // 运行业务OnMessage的策略, 现在fio集成三种OnMessage运行模式，分别是io, task
 	readMaxMessage                  int64             // 最大消息大小
 	flowBackPressureRemoveRead      bool              // 流控背压机制，移除读事件
 	zeroCopyPayload                 bool              // payload 直接指向读缓冲区, 见 WithServerZeroCopyPayload
+	// engineMode 表示这条连接挂在 engine 的事件循环上。
+	//
+	// engine 的事件循环一次只有一个 goroutine 碰这条连接, 回调就地执行
+	// 就够, 不用再往协程池投一层。所以 engineMode 下 runInGoTask 默认是
+	// "io"(就地执行)。
+	engineMode bool         // 是否使用 engine 事件循环
+	logger     *slog.Logger // 连接日志器, 没配用 slog.Default()
 }
 
 // func (c *Config) useIoUring() bool {
@@ -64,14 +72,10 @@ func (c *Config) defaultSetting() {
 	c.tcpNoDelay = true
 	// 对于text消息，默认不检查text是utf8字符
 	c.utf8Check = func(b []byte) bool { return true }
-	// 默认 elastic: 回调投给线程池, 保证同一连接有序。
-	//
-	// 但 event loop 只分发时(默认, 见 WithParseInWorkerPool)不能再叠加
-	// 这一层: 解析 goroutine 已经在自己的线程上跑, 回调再投一次池就是
-	// 白排一次队, 实测(12 核 1KB echo)从 165 万掉到 22 万 TPS。
-	// 那里在 newConn 里按 multiEventLoop 是不是开了解析池改, 见
-	// conn_unix.go 的 newConn。
-	c.runInGoTask = "elastic"
+	// 回调默认就地执行: engine 的事件循环一次只有一个 goroutine 碰这条
+	// 连接, 解析和回调都在它上面跑就够了, 不用再往协程池投一层。多投一次
+	// 就是白排一次队, 实测(12 核 1KB echo)从 165 万掉到 22 万 TPS。
+	c.runInGoTask = "io"
 }
 
 func (c *Config) defaultSettingAfter() {

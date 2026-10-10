@@ -35,8 +35,6 @@ type MultiEventLoop struct {
 
 	// 连接表。分片加锁，见 pulse 的 SafeConns。
 	conns core.SafeConns[Conn]
-	// 连接对象池：accept 一个就取一个，关了就还回去。
-	connPool sync.Pool
 
 	numLoops    int
 	maxEventNum int
@@ -45,6 +43,9 @@ type MultiEventLoop struct {
 	started int32
 	loopsWg sync.WaitGroup
 	curConn int64
+
+	// stats 是诊断计数（syscall/事件次数），见 stats.go
+	stats stats
 }
 
 // Options
@@ -99,7 +100,6 @@ func New(opts ...Option) (*MultiEventLoop, error) {
 	}
 	m.log = slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: o.level}))
 	m.conns.Init(core.GetMaxFd())
-	m.connPool.New = func() any { return &Conn{} }
 
 	m.loops = make([]*EventLoop, o.numLoops)
 	for i := range m.loops {
@@ -117,6 +117,9 @@ func New(opts ...Option) (*MultiEventLoop, error) {
 			return nil, err
 		}
 		el.PollingApi = api
+		if err := el.initWake(); err != nil {
+			return nil, err
+		}
 		m.loops[i] = el
 	}
 	return m, nil
@@ -152,16 +155,23 @@ func (m *MultiEventLoop) Start() {
 // pulse 的 Free 和 Poll 并发调是数据竞争（实测 -race 会报 api_kqueue.go
 // 里 kqfd 的读写撞车），而且正在处理的连接会被从脚下抽走。
 //
-// 循环每轮开头看一次标志位，所以这里用一个短超时的 Poll 唤醒它们——
-// 超时到了循环就回到开头看到 freed 并退出。等的是 WaitGroup，所以
-// Free 返回时所有循环真的已经停了。
+// 循环每轮开头看一次标志位，而它平时要么 park 在 runtime 的 poller 上、
+// 要么阻塞在 epoll_wait(-1) 里（见 Loop 里的说明），所以**得先把它们叫醒**：
+// 往唤醒管道写一个字节，epoll fd 立刻可读，循环醒来 -> 跑任务 -> 回到开头
+// 看到 freed 退出。不叫醒的话 Wait 会一直等下去。
+//
+// 等的是 WaitGroup，所以 Free 返回时所有循环真的已经停了。
 func (m *MultiEventLoop) Free() {
 	if !atomic.CompareAndSwapInt32(&m.freed, 0, 1) {
 		return
 	}
+	for _, el := range m.loops {
+		el.wake()
+	}
 	m.loopsWg.Wait()
 	for _, el := range m.loops {
 		el.PollingApi.Free()
+		el.closeWake()
 	}
 }
 
@@ -184,13 +194,22 @@ func (m *MultiEventLoop) Add(fd int, h Handler) (*Conn, error) {
 	if m.isFreed() {
 		return nil, ErrClosed
 	}
-	c := m.connPool.Get().(*Conn)
+	c := &Conn{}
 	el := m.loops[fd%len(m.loops)]
 	c.Init(fd, h, el)
+	// 注册之前给协议一次"在调用方 goroutine 上建连接对象"的机会，见 Binder。
+	//
+	// 放在 m.conns.Add 和 AddRead **之前**是关键：那两步之后事件循环就能
+	// 看见这个 fd 了，而 Bind 里协议要做的事（newConn、喂握手多读的字节、
+	// 调用户的 OnOpen）都不是并发安全的，必须发生在"没人看得见"的时候。
+	if b, ok := h.(Binder); ok {
+		if err := b.Bind(c); err != nil {
+			return nil, err
+		}
+	}
 	m.conns.Add(fd, c)
 	if err := el.AddRead(c); err != nil {
 		m.conns.Del(fd)
-		m.connPool.Put(c)
 		return nil, err
 	}
 	atomic.AddInt64(&m.curConn, 1)
@@ -282,9 +301,17 @@ func (m *MultiEventLoop) delConn(fd int) {
 	if c := m.conns.Get(fd); c != nil {
 		m.conns.Del(fd)
 		atomic.AddInt64(&m.curConn, -1)
-		m.connPool.Put(c)
 	}
 }
+
+// 连接对象不做池化。以前有个 sync.Pool，但还回去的时机很难找对：
+// closeWith 返回之后，**调用方还在碰这条连接**——processConn 的 defer
+// unbusy、事件循环 EOF 分支的 unbusy、用户回调里拿着的那个 *Conn。这时候
+// 对象要是被新连接取走，新连接会接着改 fd/handler/状态位，和这些读改写
+// 撞上（-race 会报，实际后果是清掉别人的 busy 位）。
+//
+// 一条连接一个 &Conn{} 就够：结构体不到 200 字节，省下的那点分配换不来
+// 这个风险。
 
 func (m *MultiEventLoop) addWrite(c *Conn) {
 	// 委托给连接所在的那个事件循环（见 EventLoop.addWrite 里

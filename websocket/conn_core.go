@@ -18,16 +18,14 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
-	"log/slog"
 	"math/rand"
 	"sync/atomic"
-	"syscall"
 	"time"
 
+	"github.com/antlabs/fio/engine"
 	"github.com/antlabs/wsutil/bytespool"
 	"github.com/antlabs/wsutil/enum"
 	"github.com/antlabs/wsutil/errs"
-	"github.com/antlabs/wsutil/fixedwriter"
 	"github.com/antlabs/wsutil/frame"
 	"github.com/antlabs/wsutil/mask"
 	"github.com/antlabs/wsutil/opcode"
@@ -57,53 +55,22 @@ const (
 	frameStatePayload
 )
 
-// 内部的conn, 只包含fd, 读缓冲区, 写缓冲区, 状态机, 分段帧缓冲区
-// 这一层本来是和epoll/kqueue 等系统调用打交道的
-type conn struct {
-	fd                   int64              // 文件描述符fd
-	rbuf                 *[]byte            // 读缓冲区
-	rr                   int                // rbuf读索引，rfc标准里面有超过4个字节的大包，所以索引只能用int类型
-	rw                   int                // rbuf写索引，rfc标准里面有超过4个字节的大包，所以索引只能用int类型
-	wbufList             []*[]byte          // 写缓冲区, 当直接Write失败时，会将数据写入缓冲区
-	lenAndMaskSize       int                // payload长度和掩码的长度
-	rh                   frame.FrameHeader  // frame头部
-	fragmentFramePayload *[]byte            // 存放分片帧的缓冲区, TODO: 这个可以优化下 把Test_DefaultCallback和 fragmentFrameHeader 放到一个结构体里面
-	fragmentFrameHeader  *frame.FrameHeader // 存放分段帧的头部
-	// curState / client / busy 压进一个 uint32:
-	//
-	//	bit 0-1  curState(状态机, 只有 3 个值)
-	//	bit 2    客户端为 1, 服务端为 0
-	//	bit 3    busy, 这个连接正被某个 goroutine 处理
-	//
-	// 前两个原来是 int8 + bool, 占 96/97 两个字节, 后面还有 6 字节填充;
-	// Conn 有 216 字节上限(conn_test.go 守着), 加不了新字段。busy 是
-	// "分片里有按需帮手时, 同一连接不被两个 goroutine 同时碰"的前提
-	// (见 task_parse.go 的 helpOne)。
-	packed uint32
-}
-
+// packed 里只有两个状态位了:
+//
+//	bit 0-1  curState(帧头解析的状态机, 只有 3 个值)
+//	bit 2    客户端为 1, 服务端为 0
+//
+// busy/pendingRead/pendingWrite/corking 那几个位以前也在这儿，现在归 engine
+// ——它们是"这条连接正被谁处理、要不要攒包"的调度状态，和 websocket 协议
+// 本身无关。
 const (
 	stateMask  uint32 = 0x3
 	flagClient uint32 = 1 << 2
-	flagBusy   uint32 = 1 << 3
-	// 处理期间又到了可读/可写事件。投递方发现 busy 已被占(说明有人在处理
-	// 这个连接)时, 不重复投任务, 只把事件记在这里; 正在处理的那个跑完
-	// 会取走它们再跑一轮。
-	//
-	// 为什么不能直接丢: ET 的边缘只来一次, 丢了就再也没有通知, 连接卡住
-	// (实测: 随机分片 + 只加 busy 位的版本, 服务端从 2,087,688 TPS 掉到
-	// 181,995)。
-	flagPendingRead  uint32 = 1 << 4
-	flagPendingWrite uint32 = 1 << 5
-	// flagCorking: 这一轮 read 里还有后续 frame, 回调写出去的消息先攒在
-	// wbufList 里, 轮末一次写出去。见 cork.go。
-	flagCorking uint32 = 1 << 6
 )
 
-// 下面几个都走原子: packed 里既有"只有本 goroutine 碰"的状态位
-// (curState), 也有跨 goroutine 的位(busy/client)。Go 的 atomic 在 x86 上
-// 就是普通 load/store(带编译器屏障), 所以统一用原子不会变慢, 反而避免了
-// 非原子读改写把别的 goroutine 原子置的位覆盖掉。
+// curState 和 client 都走原子: Go 的 atomic 在 x86 上就是普通 load/store
+// (带编译器屏障), 统一用原子不会变慢, 还避免了非原子读改写把别的 goroutine
+// 原子置的位覆盖掉。
 func (c *Conn) getCurState() frameState {
 	return frameState(atomic.LoadUint32(&c.packed) & stateMask)
 }
@@ -128,18 +95,6 @@ func (c *Conn) setClient(v bool) {
 	}
 }
 
-// tryBusy 在"这个连接没人在处理"时把 busy 置上, 返回是否抢到。
-func (c *Conn) tryBusy() bool {
-	return atomic.OrUint32(&c.packed, flagBusy)&flagBusy == 0
-}
-
-// unbusy 交回 busy。
-func (c *Conn) unbusy() { atomic.AndUint32(&c.packed, ^flagBusy) }
-
-func (c *Conn) getLogger() *slog.Logger {
-	return c.multiEventLoop.Logger
-}
-
 // addTask 把回调交给连接的任务执行器。
 //
 // io 模式的 task 是 nil: 那个模式就是"就地执行", 而它占了这个库绝大
@@ -161,19 +116,11 @@ func (c *Conn) addTask(f func() bool) {
 	}
 }
 
-func (c *Conn) getFd() int {
-	return int(atomic.LoadInt64(&c.fd))
-}
-
 // 基于状态机解析frame
 func (c *Conn) readHeader() (sucess bool, err error) {
 	state := c.getCurState()
 	// 开始解析frame
 	if state == frameStateHeaderStart {
-		// 小于最小的frame头部长度, 有空间就挪一挪
-		if len(*c.rbuf)-c.rr < enum.MaxFrameHeaderSize {
-			c.leftMove()
-		}
 		// fin rsv1 rsv2 rsv3 opcode
 		if c.rw-c.rr < 2 {
 			return false, nil
@@ -261,100 +208,30 @@ func (c *Conn) failRsv1(op opcode.Opcode) bool {
 	return false
 }
 
-func (c *Conn) leftMove() {
-	if c.rr == 0 {
-		return
-	}
-	// b.CountMove++
-	// b.MoveBytes += b.W - b.R
-	n := copy(*c.rbuf, (*c.rbuf)[c.rr:c.rw])
-	c.rw -= c.rr
-	c.rr = 0
-	c.multiEventLoop.addMoveBytes(uint64(n))
-}
-
-// readBufferSize 是读缓冲区的大小: 按上一条消息的 payload 算
-// (windowsMultipleTimesPayloadSize 倍, 默认 2.0, 见 Config.defaultSetting),
-// 留一倍余量, 免得帧头一多就要扩容。
-func (c *Conn) readBufferSize() int {
-	return int(float32(c.rh.PayloadLen)*c.windowsMultipleTimesPayloadSize) + enum.MaxFrameHeaderSize
-}
-
-// batchReadBufferSize 是"这条连接一次 read 能带一批消息"时读缓冲区抬到的
-// 大小。
-//
-// 为什么需要: readBufferSize 那个算法假设"一次 read 拿一条消息", 而客户端
-// 一次 write 可能带多条(压测的 Pipeline: -rpl 15, 一次 15480 字节)。缓冲区
-// 只装得下一条时, 内核把整批给它, 它只解析出一条, 剩下的留在 socket 里;
-// 这些数据已经不产生新的边缘了(ET 的边缘是"新数据到达"触发的), 只能等
-// 下一次事件——于是变成一条消息一次 read。实测(A 配置, 服务端计数): 读系统
-// 调用 2,000,000/s = 每条消息一次(写已经是每批一次 200,000/s); 抬上去之后
-// 读也降到 200,000/s, CPU 344% -> 271%, CPU EER 5,810 -> 7,384(超过 fnet)。
-//
-// 16KB 是因为常见的一次写批次是 8~16KB(-rbs 16384 就是按这个定的)。
-const batchReadBufferSize = 16 * 1024
-
-// growReadBuffer 把读缓冲区换成 batchReadBufferSize 大小, 已经读进来的
-// 数据跟着挪过去。
-//
-// 只在读循环里"刚读完、还没开始解析"那一刻调用: 那时候没有任何 payload
-// 别名指向这块缓冲区(零拷贝的别名只活在回调那次调用里, 见
-// WithServerZeroCopyPayload), 换掉它是安全的。解析中途换会把自己正在用
-// 的那块内存还回池子。
-func (c *Conn) growReadBuffer() {
-	old := c.rbuf
-	nb := bytespool.GetBytes(batchReadBufferSize)
-	copy(*nb, (*old)[:c.rw])
-	c.rbuf = nb
-	bytespool.PutBytes(old)
-	c.multiEventLoop.addRealloc()
-}
-
-func (c *Conn) writeCap() int {
-	return len((*c.rbuf)[c.rw:])
-}
-
-// 需要考虑几种情况
-// 返回完整Payload逻辑
-// 1. 当前的rbuf长度不够，需要重新分配
-// 2. 当前的rbuf长度够，但是数据没有读完整
-// 返回分片Paylod逻辑
-// TODO
+// readPayload 从借来的读缓冲区里取出一帧的 payload。
 //
 // needCopy 为 false 时 payload 直接指向 rbuf, 不拷也不从池里取内存。
 // 调用方保证这块内存只在本次回调里用(见 WithServerZeroCopyPayload)。
+//
+// 读缓冲区的扩容/搬迁以前在这儿做(缓冲区不够就 realloc、够就 leftMove
+// 挪一挪), 现在归 engine: 读到帧头就知道整条报文多大, 直接让引擎把空间
+// 要到位(它会先 compact 收掉已消费的前缀、再按需扩容), 下次一次读够。
+// 这里只管"数据够不够取"。
 func (c *Conn) readPayload(needCopy bool) (f frame.Frame2, success bool, err error) {
-	// 如果缓存区不够, 重新分配
-	multipletimes := c.windowsMultipleTimesPayloadSize
 	// 已读取未处理的数据
 	readUnhandle := int64(c.rw - c.rr)
-	// 情况 1，需要读的长度 > 剩余可用空间(未写的+已经被读取走的)
-	if c.rh.PayloadLen-readUnhandle > int64(len((*c.rbuf)[c.rw:])+c.rr) {
-		// 1.取得旧的buf
-		oldBuf := c.rbuf
-		// 2.获取新的buf
-		newBuf := bytespool.GetBytes(int(float32(c.rh.PayloadLen)*multipletimes) + enum.MaxFrameHeaderSize)
-		// 把旧的数据拷贝到新的buf里
-		copy(*newBuf, (*oldBuf)[c.rr:c.rw])
-		c.rw -= c.rr
-		c.rr = 0
-
-		// 3.重置缓存区
-		c.rbuf = newBuf
-		// 4.将旧的buf放回池子里
-		bytespool.PutBytes(oldBuf)
-		c.multiEventLoop.addRealloc()
-
-		// 情况 2。 空间是够的，需要挪一挪, 把已经读过的覆盖掉
-	} else if c.rh.PayloadLen-readUnhandle > int64(c.writeCap()) {
-		c.leftMove()
-	}
-
-	// 前面的reset已经保证了，buffer的大小是够的
 	needRead := c.rh.PayloadLen - readUnhandle
 
 	// fmt.Printf("needRead:%d:rr(%d):rw(%d):PayloadLen(%d), %v\n", needRead, c.rr, c.rw, c.rh.PayloadLen, c.rbuf)
 	if needRead > 0 {
+		// 数据不够，等下一次读。
+		//
+		// **不在这里让引擎扩缓冲区**：OnData 期间协议手里握着读缓冲区的
+		// 别名（解析器的 rbuf/rr/rw 就是照它摆的），compact 会把数据挪走、
+		// 扩容会把数组换掉——解析器读到的是错位/已释放的内存。
+		//
+		// 预扩交给引擎，它挑的是"两次 OnData 之间"那个安全点：问
+		// NextMessageSize（见 engine.go），一次要到最终大小。
 		return
 	}
 	// 普通frame
@@ -385,10 +262,6 @@ func (c *Conn) readPayload(needCopy bool) (f frame.Frame2, success bool, err err
 
 	f.FrameHeader = c.rh
 	c.rr += int(c.rh.PayloadLen)
-
-	if len(*c.rbuf)-c.rw < enum.MaxFrameHeaderSize {
-		c.leftMove()
-	}
 
 	return f, true, nil
 }
@@ -723,7 +596,7 @@ func (c *Conn) writeErrAndOnClose(code StatusCode, userErr error) error {
 	return userErr
 }
 
-func (c *Conn) readPayloadAndCallback() (sucess bool, err error) {
+func (c *Conn) readPayloadAndCallback(ec *engine.Conn) (sucess bool, err error) {
 	if c.getCurState() == frameStatePayload {
 		// 这几种情况必须拷: 压缩的要拿去解压(结果跟读缓冲区生命周期
 		// 无关, 但解压本身按 payload 的长度读, 拷与不拷收益一样, 统一
@@ -744,7 +617,17 @@ func (c *Conn) readPayloadAndCallback() (sucess bool, err error) {
 
 		// fmt.Printf("read payload, success:%t, %v\n", success, f.Payload)
 		if success {
-			c.maybeCork()
+			// 这一轮里如果还有后续 frame, 现在就开攒: 回调写出去的回包
+			// 先攒着, 轮末(OnData 末尾)一次写出去。剩多少字节就是给引擎
+			// 的 capHint(回包和请求大小往往差不多)。
+			//
+			// 以前是 maybeCork, 现在攒不攒的机制在 engine, 这里只负责
+			// "还有数据就告诉它开始攒"。
+			if rem := c.rw - c.rr; rem > 0 {
+				if ec != nil {
+					ec.StartCork(rem)
+				}
+			}
 			if err := c.processCallback(f, needCopy); err != nil {
 				c.closeWithLock(err)
 				return false, err
@@ -782,89 +665,75 @@ func (c *Conn) WriteMessage(op Opcode, writeBuf []byte) (err error) {
 		writeBuf = *writeBufPtr
 	}
 
-	maskValue := uint32(0)
-	if c.isClient() {
-		maskValue = rand.Uint32()
-	}
-
-	var fw fixedwriter.FixedWriter
-	_ = fw
-
 	// 这把锁必须拿着: 它不只是给"回调被投到线程池"那个模式用的——
-	// Close() 可能从任意 goroutine 来(用户代码、超时定时器), 它会在锁里
-	// 释放 wbufList(见 conn_unix.go 的 closeWithLock), 不拿锁写缓冲区
-	// 就会写到已释放的内存上。
+	// Close() 可能从任意 goroutine 来(用户代码、超时定时器), 它会释放
+	// 连接状态(见 conn_unix.go 的 closeWithLock), 不拿锁写就会写到已
+	// 释放的内存上。
 	//
 	// 实测(io 模式, 1KB echo, 交替 3 轮): 去掉这把锁 TPS 差 0.3%(噪声内)、
 	// TP99 好 1.8%。收益是零, 不值得拿这个风险换。
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	// 攒包期间(一轮 read 里有多个 frame, 见 cork.go): 回包先进缓冲区,
-	// 轮末一次写出去。这是 Pipeline 场景写路径 CPU 的主要来源。
-	if c.isCorking() && !rsv1 {
-		return c.corkWrite(uint8(op), writeBuf)
+	// 帧头在栈上拼。wsHeader 拼"FIN + opcode + 长度"，剩下的两位和掩码
+	// 在这里补：
+	//
+	//   - rsv1：压缩过的消息必须置位，不然对端按明文收（收到的就是
+	//     deflate 的原始字节）
+	//   - 掩码：客户端发的帧**必须**带掩码（RFC 6455 5.3），服务端发的
+	//     必须不带
+	//
+	// 这两件事以前是 frame.WriteFrame 干的（基线里所有快速路径都写着
+	// !c.isClient() && !rsv1，剩下的全走它）。手拼之后漏过两次，所以
+	// 这里一次说清楚。
+	var hdr [14]byte // 10 字节最长帧头 + 4 字节掩码
+	hn := wsHeader(hdr[:], uint8(op), len(writeBuf))
+	if rsv1 {
+		hdr[0] |= 1 << 6
+	}
+	if c.isClient() {
+		hdr[1] |= 1 << 7
+		key := rand.Uint32()
+		binary.LittleEndian.PutUint32(hdr[hn:], key)
+		hn += 4
+		// 掩码要写在拷贝上：writeBuf 可能是用户自己的切片（改了就污染
+		// 调用方的数据），也可能是压缩刚产出的池内存（下一次复用之前
+		// 就会被还回去，而它还带着掩码）。
+		masked := make([]byte, len(writeBuf))
+		copy(masked, writeBuf)
+		mask.Mask(masked, key)
+		writeBuf = masked
 	}
 
-	// io 模式 + 服务端 + 没压缩 + 长度放得进 2/4 字节头 + 没有积压:
-	// 走 writev, header 在栈上拼, payload 不拷贝直接交给内核。
+	// 攒包期间(一轮 read 里有多个 frame): 回包先攒着, 轮末一次写出去。
+	// 这是 Pipeline 场景写路径 CPU 的主要来源。
 	//
-	// WriteFrame 那条路每条消息多一次 1KB 的 memcpy(它要把 payload 拷进
-	// 池里取出的 buf 再整块写)。fnet 用的就是这个(sendmsg + iovec)。
-	//
-	// 实测(io 模式, 1KB echo, 交替 3 轮): TPS 差 0.24%(噪声内),
-	// TP95 好 1%(三轮全赢)、TP99 好 1%(三轮全赢)。收益很小但一致。
-	// 4KB 以下拼成一块用 sendto, 和 fnet 的 writeFrame 一样
-	// (maxCopiedPayload = 4KB)。
-	//
-	// sendmsg 要读 iovec 数组、sendto 只要一个指针, 小消息下后者更便宜;
-	// 大消息才值得用 iovec 省那次拷贝。之前无条件用 sendmsg, 测下来小消息
-	// 多花 CPU。
-	if c.task == nil && !c.isClient() && !rsv1 && len(writeBuf) <= 4096 && len(c.wbufList) == 0 {
-		var hdr [10]byte
-		hn := wsHeader(hdr[:], uint8(op), len(writeBuf))
-		var seg bufseg
-		all := seg.alloc(hn, len(writeBuf))
-		copy(all, hdr[:hn])
-		copy(all[hn:], writeBuf)
-		n, werr := socketWrite(c.getFd(), all)
-		seg.free()
-		c.addWriteSyscall()
-		if werr == nil && n == len(all) {
-			return nil
-		}
-		if werr == nil || werr == syscall.EAGAIN || werr == syscall.EINTR {
-			c.appendToWbufList(all[n:], len(all)-n)
-			if err := c.eventLoop().addWrite(c); err != nil {
-				return err
-			}
-			return nil
-		}
-		return werr
-	}
-	if c.task == nil && !c.isClient() && !rsv1 && len(writeBuf) <= 65535 && len(c.wbufList) == 0 {
-		var hdr [10]byte
-		hn := wsHeader(hdr[:], uint8(op), len(writeBuf))
-		n, werr := socketWritev(c.getFd(), hdr[:hn], writeBuf)
-		c.addWriteSyscall()
-		if werr == nil && n == hn+len(writeBuf) {
-			return nil
-		}
-		if werr == nil || werr == syscall.EAGAIN || werr == syscall.EINTR {
-			// 部分写: 把没写出去的拼起来进缓冲区, 剩下的交给可写事件
-			all := make([]byte, 0, hn+len(writeBuf))
-			all = append(all, hdr[:hn]...)
-			all = append(all, writeBuf...)
-			c.appendToWbufList(all[n:], len(all)-n)
-			if err := c.eventLoop().addWrite(c); err != nil {
-				return err
-			}
-			return nil
-		}
-		return werr
+	// 压缩的消息(rsv1)不攒: 它的 payload 是另外分配出来的, 攒包那条路
+	// 假设 payload 在攒完之前一直有效——而现在攒完之前它就解压拷贝走了,
+	// 还是走 Writev 更直白。
+	if c.ec != nil && c.ec.IsCorking() && !rsv1 {
+		return wrapEngineErr(c.ec.CorkWrite(hdr[:hn], writeBuf))
 	}
 
-	return frame.WriteFrame(&fw, connToNewConn(c), writeBuf, true, rsv1, c.isClient(), op, maskValue)
+	// 引擎的 Writev: header + payload 两段, 小消息(≤4KB)在引擎里拼到栈上
+	// 一次 sendto, 大消息走 iovec。部分写、EAGAIN、可写事件补写都在引擎里
+	// 处理完了, 这里不用管 wbufList。
+	if c.ec != nil {
+		return wrapEngineErr(c.ec.Writev(hdr[:hn], writeBuf))
+	}
+	return ErrClosed
+}
+
+// wrapEngineErr 把 engine 的 ErrClosed 换成 websocket 自己的。
+//
+// 两个包各有一个 ErrClosed（一个 "engine: connection closed"，一个
+// "fio: connection closed"），用户代码里比较的是 websocket 这个。
+// 不翻译的话，对端刚关连接时的写会拿到 engine 那个，比较不上。
+func wrapEngineErr(err error) error {
+	if errors.Is(err, engine.ErrClosed) {
+		return ErrClosed
+	}
+	return err
 }
 
 // 写分段数据, 目前主要是单元测试使用
@@ -889,27 +758,93 @@ func (c *Conn) writeFragment(op Opcode, writeBuf []byte, maxFragment int /*单�
 		writeBuf = *writeBufPtr
 	}
 
-	// f.Opcode = op
-	// f.PayloadLen = int64(len(writeBuf))
-	maskValue := uint32(0)
-	if c.isClient() {
-		maskValue = rand.Uint32()
-	}
-
-	var fw fixedwriter.FixedWriter
-	_ = fw
+	// 每个分片独立成帧、自己带掩码(客户端要 mask, 服务端不要), 所以这里
+	// 一个个分片拼帧头再交给 engine 写。以前走 frame.WriteFrame 那条慢路径,
+	// 现在统一到 wsHeader + ec.Writev, 和 WriteMessage 一致。
+	//
+	// 只给"这一片是 FIN"的那次置 fin, 中间的分片 op=Continuation。
 	for len(writeBuf) > 0 {
+		fin := true
+		chunk := writeBuf
 		if len(writeBuf) > maxFragment {
-			if err := frame.WriteFrame(&fw, connToNewConn(c), writeBuf[:maxFragment], false, rsv1, c.isClient(), op, maskValue); err != nil {
+			fin = false
+			chunk = writeBuf[:maxFragment]
+		}
+
+		head := frameHeaderBuf(fin, rsv1, op, chunk, c.isClient())
+		if c.ec != nil {
+			if err := wrapEngineErr(c.ec.Writev(head.hdr[:head.n], head.payload)); err != nil {
 				return err
 			}
-			writeBuf = writeBuf[maxFragment:]
-			op = Continuation
-			continue
+		} else {
+			return ErrClosed
 		}
-		return frame.WriteFrame(&fw, connToNewConn(c), writeBuf, true, rsv1, c.isClient(), op, maskValue)
+
+		if fin {
+			return nil
+		}
+		writeBuf = writeBuf[maxFragment:]
+		op = Continuation
 	}
 	return nil
+}
+
+// fragmentHeader 是分片帧的帧头 + 这是不是最后一片。
+//
+// writeFragment 以前靠 frame.WriteFrame 拼帧头(带掩码), 那条路删掉了;
+// 这里用 wsHeader 拼, 客户端再补一段 4 字节掩码。分片只在单元测试里用,
+// 不是热路径, 所以不追求零分配。
+type fragmentHeader struct {
+	hdr     [14]byte // 10 字节最长帧头 + 4 字节掩码
+	n       int
+	payload []byte
+}
+
+// frameHeaderBuf 拼一个分片帧的帧头（含客户端的掩码），顺带把 payload
+// 掩上。
+//
+// **rsv1 必须照实置位**：压缩过的分片不置 rsv1，对端就按明文收——收到的
+// 是 deflate 的原始字节（实测症状：服务端拿到的"hello"是
+// "\x00\x05\x00\xfa\xffhello\x00"，那是 deflate 的 stored block 头
+// 加明文）。以前走 frame.WriteFrame 那条路（它自己管 rsv1），换成这里
+// 手拼之后漏了一次。
+func frameHeaderBuf(fin, rsv1 bool, op Opcode, payload []byte, client bool) fragmentHeader {
+	var f fragmentHeader
+	b0 := byte(op) & 0x0F
+	if fin {
+		b0 |= 0x80
+	}
+	if rsv1 {
+		b0 |= 1 << 6
+	}
+	f.hdr[0] = b0
+
+	ln := len(payload)
+	switch {
+	case ln <= 125:
+		f.hdr[1] = byte(ln)
+		f.n = 2
+	case ln <= 65535:
+		f.hdr[1] = 126
+		binary.BigEndian.PutUint16(f.hdr[2:], uint16(ln))
+		f.n = 4
+	default:
+		f.hdr[1] = 127
+		binary.BigEndian.PutUint64(f.hdr[2:], uint64(ln))
+		f.n = 10
+	}
+
+	if client {
+		f.hdr[1] |= 1 << 7
+		key := rand.Uint32()
+		binary.LittleEndian.PutUint32(f.hdr[f.n:], key)
+		f.n += 4
+		// 掩码写的是拷贝, 不能原地改调用方的 buf(它可能被复用)。
+		payload = append([]byte(nil), payload...)
+		mask.Mask(payload, key)
+	}
+	f.payload = payload
+	return f
 }
 
 // TODO

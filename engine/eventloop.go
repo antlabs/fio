@@ -20,7 +20,6 @@ import (
 	"errors"
 	"io"
 	"log/slog"
-	"time"
 
 	"github.com/antlabs/pulse/core"
 	"golang.org/x/sys/unix"
@@ -38,6 +37,9 @@ type EventLoop struct {
 	tasks chan func()
 
 	parent *MultiEventLoop
+
+	// wakeR/wakeW 是自唤醒管道，见 wake.go
+	wakeR, wakeW int
 
 	// maxEventNum 是一次 epoll_wait 最多拿多少事件。
 	maxEventNum int
@@ -68,10 +70,22 @@ func (el *EventLoop) Loop() {
 			}
 			break
 		}
-		// 超时不能是 -1（永远等）：Free 是置标志位让循环自己退出，一直
-		// 阻塞在 epoll_wait 里就看不到那个标志位。100ms 是"空闲时每秒醒
-		// 十次看一眼"，代价可以忽略（事件来的时候立刻返回，不等超时）。
-		_, err := el.Poll(100*time.Millisecond, func(fd int, state core.State, err error) {
+		// **超时必须是"永久等"（-1），不能是 100ms 这种小超时**。
+		//
+		// pulse 按超时选等待方式（见它 waiter_linux.go 的 parkAbove）：永久
+		// 等 → park 在 runtime 的 poller 上，一瞬间就把 P 交出去；而
+		// (0, 1s) 区间里的小超时 → 走 RawSyscall6 版的 epoll_wait，
+		// **RawSyscall 不通知 runtime**，于是这个 goroutine 抱着 P 睡满整个
+		// 超时，runtime 要等 sysmon 一个 tick 才能把 P 抢走。
+		//
+		// 代价实测（Linux，24 核）：单测里每轮泄漏一个 24 loop 的
+		// MultiEventLoop，几轮之后 24 个 P 全被睡着的循环占住，同进程里
+		// 一个 loopback 的 net.Dial 要等 95ms+，握手失败那一组用例集体超时
+		// （基线用永久等，0.26s 跑完，迁移后 4.08s）。
+		//
+		// Free 的停止不靠超时：它往唤醒管道写一个字节（见 wake.go），
+		// epoll fd 立刻可读，park 着的循环马上就醒。
+		_, err := el.Poll(-1, func(fd int, state core.State, err error) {
 			// io.EOF 不是"出错"，是"对端关了"。kqueue 那边尤其要紧：
 			// 对端发 FIN 时它回调的是 cb(fd, WRITE, io.EOF)——状态是
 			// WRITE 不是 READ，错误位带着 io.EOF。早先把 io.EOF 当成
@@ -85,6 +99,14 @@ func (el *EventLoop) Loop() {
 				el.parent.err("apiPoll", "err", err.Error())
 				return
 			}
+
+			// 唤醒管道：投过来的任务在队列里等着，循环得先醒过来。
+			if fd == el.wakeR {
+				el.drainWake()
+				return
+			}
+
+			el.addPollEvNum(1)
 
 			c := el.parent.getConn(fd)
 			if c == nil {
@@ -111,10 +133,24 @@ func (el *EventLoop) Loop() {
 					return
 				}
 
+				// **这条路也要占 busy**：读的时候手上捏着读缓冲区（喂给
+				// 协议的那段就是它的别名），而 closeWith 只在"没人在处理
+				// 这条连接"时才当场释放缓冲区（见 flagFreePending）。
+				// 不占的话，别的 goroutine 一句 Close() 就能把缓冲区从
+				// 脚下抽走（-race 实测：用户 goroutine 的 Close 和这里的
+				// ReadBuffer 抢 rbuf）。
+				//
+				// 同一条连接的事件不会并发到达，所以这里一定拿得到；
+				// 真拿不到（不该发生）也**不能**空手去读——直接关掉。
+				if !c.tryBusy() {
+					c.closeWith(io.EOF)
+					return
+				}
 				// readAndDispatch 返回的 io.EOF 不用管：下面就 closeWith(io.EOF)，
 				// 这里只是要把最后的数据喂给协议、让它把该处理的处理完。
 				_ = el.readAndDispatch(c)
 				c.closeWith(io.EOF)
+				c.unbusy()
 				return
 			}
 
@@ -164,13 +200,17 @@ func (el *EventLoop) processConn(c *Conn, isRead, isWrite bool) {
 		if c.IsClosed() {
 			return
 		}
-		if isWrite && c.NeedFlush() {
-			if err := c.Flush(); err != nil {
-				c.closeWith(err)
-				return
+		if isWrite {
+			el.addWriteEvNum()
+			if c.NeedFlush() {
+				if err := c.Flush(); err != nil {
+					c.closeWith(err)
+					return
+				}
 			}
 		}
 		if isRead {
+			el.addReadEvNum()
 			err := el.readAndDispatch(c)
 			if err != nil {
 				c.closeWith(err)
@@ -239,10 +279,15 @@ func (el *EventLoop) readAndDispatch(c *Conn) error {
 // 等一下——反正只有"注册"走这条路，不是数据路径。
 func (el *EventLoop) runOnLoop(f func()) {
 	el.tasks <- f
+	// 不叫这一声，任务要等 Poll 超时才轮到（见 wake.go）
+	el.wake()
 }
 
-func (el *EventLoop) del(c *Conn) {
-	fd := c.Fd()
+// del 把连接从连接表里摘掉。**用调用方传进来的 fd**，不要从连接上读
+// ——closeWith 在调这里之前已经把 c.fd 置成 -1 了，读回来的是 -1，
+// delConn 直接早退：连接永远留在表里、curConn 只增不减、连接对象也
+// 永远回不到池子（实测：跑一轮 autobahn，curConn 涨到 2708 不掉）。
+func (el *EventLoop) del(fd int) {
 	el.parent.delConn(fd)
 }
 

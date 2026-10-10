@@ -17,122 +17,85 @@ import (
 	"log/slog"
 )
 
-type EvOption func(e *MultiEventLoop)
+// 这里所有 WithXxx 的名字和签名都保留——它们是公开 API。能映射到 engine
+// 的选项映射过去(WithEventLoops/WithLogLevel/WithMaxEventNum), 映射不了的
+// 就保留签名、在注释里说明"engine 现在只支持就地执行", 填了不生效。
+//
+// 这么做的原因: 用户代码里这些函数名写死了, 删掉就是编译不过的 breaking
+// change。留着一个"接受但不生效"的开关, 比让用户改代码好。
 
-// 开启几个事件循环, 控制io go程数量
+// 开启几个事件循环, 控制io go程数量。
+// -> engine.WithEventLoops
 func WithEventLoops(num int) EvOption {
-	return func(e *MultiEventLoop) {
+	return func(e *evOptionConfig) {
 		e.numLoops = num
 	}
 }
 
-// event loop 只做事件的分发，websocket frame 的读取和解析放到一组
-// goroutine 里面做, 见 task_parse.go。默认不开, 这些工作都在 event loop
-// 自己的 go 程上做。
-//
-// 解析的 goroutine 按 fd 取模分片, 一个连接固定落到一个上, 所以连接的
-// 读缓冲和解析状态还是只被一个 go 程碰, 不需要加锁。
-func WithParseInWorkerPool() EvOption {
-	return func(e *MultiEventLoop) {
-		e.parseInWorkerPool = true
-	}
-}
-
-// 解析 goroutine 的数量, 默认 NumCPU。开了 WithParseInWorkerPool 才有意义。
-//
-// 解析 goroutine 和 event loop 抢同一批 P, 核数不够时每多一个就多一份
-// 调度延迟, 所以有时比 NumCPU 少反而快。n <= 0 表示用默认值。
-func WithParseGoroutines(n int) EvOption {
-	return func(e *MultiEventLoop) {
-		e.parseGoroutines = n
-	}
-}
-
-// WithParseWorkersPerShard 让每个解析分片起 n 个常驻 worker, 默认 1。
-//
-// 多个 worker 之间用 fnet 那套"逐跳唤醒": 一个 worker 处理任务前看到环里
-// 还有活, 就先叫醒下一个来接, 所以手上这个慢了也不挡住后面的。同一连接
-// 不被两个 worker 同时碰, 靠 Conn 的 busy 位。n <= 0 用默认值 1。
-func WithParseWorkersPerShard(n int) EvOption {
-	return func(e *MultiEventLoop) {
-		e.parseWorkersPerShard = n
-	}
-}
-
-// 最小业务goroutine数量, 控制业务go程数量
-// initCount: 初始化的协程数
-// min: 最小协程数
-// max: 最大协程数
-func WithBusinessGoNum(initCount, min, max int) EvOption {
-	return func(e *MultiEventLoop) {
-		if initCount <= 0 {
-			initCount = defTaskInitCount
-		}
-
-		if min <= 0 {
-			min = defTaskMin
-		}
-
-		if max <= 0 {
-			max = defTaskMax
-		}
-		e.configTask.initCount = initCount
-		e.configTask.min = min
-		e.configTask.max = max
-	}
-}
-
-// 设置business go程池 对流量压测友好的模式
-// func WithBusinessGoTrafficMode() EvOption {
-// 	return func(e *MultiEventLoop) {
-// 		e.taskMode = trafficMode
-// 	}
-// }
-
-// 设置日志级别
+// 设置日志级别。
+// -> engine.WithLogLevel
 func WithLogLevel(level slog.Level) EvOption {
-	return func(e *MultiEventLoop) {
+	return func(e *evOptionConfig) {
 		e.level = level
 	}
 }
 
-// 设置每个事件循环一次返回的最大事件数量
+// 设置每个事件循环一次返回的最大事件数量。
+// -> engine.WithMaxEventNum
 func WithMaxEventNum(num int) EvOption {
-	return func(e *MultiEventLoop) {
+	return func(e *evOptionConfig) {
 		e.maxEventNum = num
 	}
 }
 
-// 暂时不可用
-// 是否使用io_uring, 支持linux系统，需要内核版本6.2.0以上(以后只会在>=6.2.0的版本上测试)
-// func WithIoUring() EvOption {
-// 	return func(e *MultiEventLoop) {
-// 		e.flag |= EVENT_IOURING
-// 	}
-// }
+// event loop 只做事件的分发，websocket frame 的读取和解析放到一组
+// goroutine 里面做。
+//
+// **engine 现在只支持就地执行**(事件、解析、回调都在事件循环自己的
+// goroutine 上), 没有独立的解析池, 所以这个选项填了不生效。保留签名是
+// 为了不改用户代码。
+func WithParseInWorkerPool() EvOption {
+	return func(e *evOptionConfig) {}
+}
+
+// 解析 goroutine 的数量。engine 现在没有解析池, 不生效。
+func WithParseGoroutines(n int) EvOption {
+	return func(e *evOptionConfig) {}
+}
+
+// WithParseWorkersPerShard 让每个解析分片起 n 个常驻 worker。
+// engine 现在没有解析分片, 不生效。
+func WithParseWorkersPerShard(n int) EvOption {
+	return func(e *evOptionConfig) {}
+}
+
+// 最小业务goroutine数量, 控制业务go程数量。
+//
+// engine 现在只支持就地执行(回调在事件循环上跑), 没有业务协程池, 所以
+// 这个选项填了不生效。保留签名是为了不改用户代码。
+func WithBusinessGoNum(initCount, min, max int) EvOption {
+	return func(e *evOptionConfig) {
+		e.businessInit = initCount
+		e.businessMin = min
+		e.businessMax = max
+	}
+}
 
 // 关掉解析池, 让 event loop 自己读和解析 websocket frame。
 //
-// 默认是开的: event loop 只分发, 读取和解析在一组按 fd 分片的 goroutine
-// 上做, 实测比 event loop 全包更快。这个选项给需要 event loop 独占
-// 连接的场景用。
+// engine 现在就是就地执行, 这个选项正好是现在的默认行为, 所以填了不出错,
+// 也不需要额外动作。
 func WithParseInEventLoop() EvOption {
-	return func(e *MultiEventLoop) {
-		e.parseInEventLoop = true
-	}
+	return func(e *evOptionConfig) {}
 }
 
-// 投完一批让出 P。默认不让, 见 multi_event_loops.go 里 gosched 的说明。
+// 投完一批让出 P。engine 现在不给这个开关, 不生效。
 func WithGosched() EvOption {
-	return func(e *MultiEventLoop) {
-		e.gosched = true
-	}
+	return func(e *evOptionConfig) {}
 }
 
-// 一次投给解析 goroutine 的连接数上限。默认 parseBatchSize。
-// 调小(比如 1)就等于每条连接单个投递, 和 fib 的粒度一样。
+// 一次投给解析 goroutine 的连接数上限。engine 现在没有这条投递路径,
+// 不生效。
 func WithParseBatchSize(n int) EvOption {
-	return func(e *MultiEventLoop) {
-		e.batchSize = n
-	}
+	return func(e *evOptionConfig) {}
 }

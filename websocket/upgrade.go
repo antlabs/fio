@@ -15,6 +15,7 @@
 package websocket
 
 import (
+	"bufio"
 	"bytes"
 	"errors"
 	"net"
@@ -102,9 +103,9 @@ func upgradeInner(w http.ResponseWriter, r *http.Request, conf *Config, cb Callb
 		return nil, ErrNotFoundHijacker
 	}
 
-	// var read *bufio.Reader
 	var conn net.Conn
-	conn, _, err = hi.Hijack()
+	var rw *bufio.ReadWriter
+	conn, rw, err = hi.Hijack()
 	if err != nil {
 		return nil, err
 	}
@@ -142,6 +143,18 @@ func upgradeInner(w http.ResponseWriter, r *http.Request, conf *Config, cb Callb
 		return nil, err
 	}
 
+	// http.Server 那边的 bufio 可能已经多读了数据（客户端把第一个帧和
+	// 握手拼在一次 write 里就会这样）。不带走就是丢，丢的是第一条消息。
+	//
+	// 要拷一份: 这段字节要到事件循环上（OnConn 里）才喂给解析器，那时候
+	// rw 早就跟着 http.Server 一起消失了。
+	var leftover []byte
+	if n := rw.Reader.Buffered(); n > 0 {
+		if b, perr := rw.Reader.Peek(n); perr == nil {
+			leftover = append([]byte(nil), b...)
+		}
+	}
+
 	fd, err := getFdFromConn(conn)
 	if err != nil {
 		conn.Close()
@@ -152,22 +165,32 @@ func upgradeInner(w http.ResponseWriter, r *http.Request, conf *Config, cb Callb
 		return nil, err
 	}
 
-	if wsCon, err = newConn(int64(fd), false, conf); err != nil {
-		return nil, err
-	}
-	wsCon.pd = pd
-	wsCon.Callback = cb
-	if cb == nil {
-		wsCon.Callback = conf.cb
-	}
-	wsCon.Callback.OnOpen(wsCon)
-	if wsCon.Callback == nil {
-		panic("callback is nil")
-	}
-	if err = conf.multiEventLoop.add(wsCon); err != nil {
-		return nil, err
+	// 连接对象由引擎在**注册 fd 之前**、在**这个 goroutine 上**调 Bind 建
+	// 出来（见 ConnHandler.Bind）。多读的那几个字节也在这里喂——比注册早，
+	// 事件循环还看不见这条连接，不会两边一起动 rr/rw 和回调。
+	h := NewConnHandler(conf)
+	h.SetPermessageDeflate(pd)
+	h.cb = cb
+	h.OnConn = func(c *Conn) error {
+		if len(leftover) > 0 {
+			if _, err := c.parseBuf(c.ec, leftover); err != nil {
+				return err
+			}
+		}
+		c.Callback.OnOpen(c)
+		return nil
 	}
 
+	conf.engineMode = true
+	ec, err := conf.multiEventLoop.Add(fd, h)
+	if err != nil {
+		syscall.Close(fd)
+		return nil, err
+	}
+	if wsCon, _ = ec.UserData().(*Conn); wsCon == nil {
+		ec.Close()
+		return nil, ErrClosed
+	}
 	return wsCon, nil
 }
 

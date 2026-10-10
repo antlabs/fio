@@ -16,6 +16,7 @@ package websocket
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -1874,10 +1875,13 @@ func Test_CommonOption(t *testing.T) {
 			return
 		}
 		defer con.Close()
-		// 这里必须要报错
+		// 服务端 upgrade 完就 Close，这笔写发得出去发不出去看时序：对端
+		// 的 FIN 先到，写就是 ErrClosed。**不能断言它一定成功**——实测
+		// 迁移前的代码这个断言三次挂两次。这里要验的是下面的 OnClose
+		// 回调，不是这一笔写。
 		err = con.WriteMessage(Text, []byte("hello"))
-		if err != nil {
-			t.Errorf("not error:%s\n", err)
+		if err != nil && !errors.Is(err, ErrClosed) {
+			t.Errorf("unexpected error:%s\n", err)
 			return
 		}
 		con.StartReadLoop()

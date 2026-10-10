@@ -34,6 +34,11 @@ var (
 	ErrClosed = errors.New("engine: connection closed")
 	// ErrWouldBlock 表示这次没写出去, 剩下的交给可写事件。
 	ErrWouldBlock = errors.New("engine: would block")
+
+	// ErrMessageTooBig 表示一条报文大到读缓冲区装不下（到了
+	// maxReadBufferSize），协议又只肯消费完整报文——这条连接没救了，
+	// 报错关掉，别挂在那里（见 Read 里那段）。
+	ErrMessageTooBig = errors.New("engine: message bigger than read buffer")
 )
 
 // Conn 是一条非阻塞连接。
@@ -112,6 +117,11 @@ const (
 	//
 	// 所以事件里看到这个位没置就记成 pending，等 OnOpen 跑完自己再取走。
 	flagActivated uint32 = 1 << 5
+
+	// flagFreePending 表示"连接已经关了, 但缓冲区还没释放"——关的时候
+	// 事件循环正在处理这条连接, 它手上还捏着读缓冲区里的一段(零拷贝的
+	// payload 就是它的一段)。释放交给这一轮结束时的 unbusy, 见 closeWith。
+	flagFreePending uint32 = 1 << 6
 )
 
 // Init 初始化一条连接。fd 必须是已经设成非阻塞的 socket。
@@ -142,6 +152,29 @@ func (c *Conn) SetUserData(v any) {
 		return
 	}
 	c.userData.Store(&v)
+}
+
+// SyncOnLoop 把 f 投到这条连接所属的事件循环的 goroutine 上跑，等它跑完
+// 再返回。
+//
+// **返回时，之前投过去的任务都已经跑完了**——任务队列是 FIFO，所以 Add 时
+// 投的那个 OnOpen 保证在 f 之前执行。websocket 的客户端靠它同步拿回 OnOpen
+// 里建好的连接对象（握手才知道的 pd、用户的 Callback 都得在拿到对象之后
+// 才能装上去，而 Add 本身只保证"投递了"）。
+//
+// **不能在事件循环自己的 goroutine 上调**——那是自己等自己，直接死锁。
+// 只在 Dial 这种连接刚建好、还没开始跑数据的路径上用。
+func (c *Conn) SyncOnLoop(f func()) {
+	if c.parent == nil {
+		f()
+		return
+	}
+	done := make(chan struct{})
+	c.parent.runOnLoop(func() {
+		f()
+		close(done)
+	})
+	<-done
 }
 
 // UserData 取协议挂的状态。没设过返回 nil。
@@ -245,7 +278,7 @@ func (c *Conn) Read() (int, error) {
 	c.mu.Unlock()
 
 	if c.rbuf == nil {
-		c.rbuf = bytespool.GetBytes(8 * 1024)
+		c.rbuf = bytespool.GetBytes(c.initialReadBufSize())
 	}
 
 	total := 0
@@ -263,8 +296,24 @@ func (c *Conn) Read() (int, error) {
 			// 实测(websocket 大分片场景): 加了这一步之后, 内存占用从
 			// "报文大小 × 2" 降到 "报文大小 + 一个读批次"。
 			if !c.compactReadBuffer() {
-				if !c.growReadBuffer() {
-					return total, nil
+				// 缓冲区满了、协议还没凑齐一条报文：**先问协议整条
+				// 多大**，一次长到最终大小。不问就只能翻倍——1MB 的
+				// 报文要经历 16K→32K→…→1MB 六次翻倍，每次都要把已经
+				// 读到的整块数据 memcpy 一遍。
+				//
+				// 只有这个点能问：在两次 OnData 之间，协议手上没有活
+				// 的缓冲区别名（见 MessageSizeHinter）。协议在 OnData
+				// 里让引擎搬家就会把正在读的数据挪走/换掉。
+				if !c.growToNextMessage() && !c.growReadBuffer() {
+					// 长不动了（到 maxReadBufferSize，协议又还差着
+					// 数据）。**只能关连接**：再待着就是永久卡死——
+					// ET 下"缓冲区还是满的"不会再给边缘，这条连接不会
+					// 再有任何进展，白白占着 fd 和内存（4MB 上限那版
+					// 就是这么卡住的）。
+					//
+					// 协议那边的表现是收到一个关闭（websocket 报
+					// OnClose），比静默挂死好诊断。
+					return total, ErrMessageTooBig
 				}
 			}
 			continue
@@ -276,6 +325,9 @@ func (c *Conn) Read() (int, error) {
 		fd := int(atomic.LoadInt64(&c.fd))
 		n, err := socketRead(fd, buf)
 		c.mu.Unlock()
+		if c.parent != nil {
+			c.parent.addReadSyscall()
+		}
 
 		if err != nil {
 			if errno, ok := err.(syscall.Errno); ok {
@@ -314,6 +366,10 @@ func (c *Conn) Read() (int, error) {
 		//
 		// 实测：客户端发 5 字节再 close，只有一次 [poll] 事件，OnClose
 		// 永远不调。所以要接着读，直到 EAGAIN（没数据了）或者 0（FIN）。
+		//
+		// 迁移前 websocket 的读循环是短读就 break（"省掉那次一定返回
+		// EAGAIN 的 read"），在这套 pending 机制下会丢 FIN——Linux 上
+		// 试过，websocket 的测试直接挂。多一次系统调用换"FIN 一定被看见"。
 		if n < len(buf) {
 			continue
 		}
@@ -359,6 +415,11 @@ func (c *Conn) ConsumeRead(n int) {
 	//
 	// 所以只把索引推到底；真正的释放留给下一次 Read（那时候上一轮的
 	// 栈肯定已经退干净了）和 Close。
+	//
+	// **试过"小的留着下次接着用"（省一次池往返），内存反而更差**：
+	// 缓冲区在连接刚建、一批消息挤进来的时候会长到 16KB，留着就变成
+	// 每连接常驻 16KB——实测 10000 连接下 MEM 从 119MB 涨到 417MB。
+	// 还回池子，让空闲连接只留起始大小那块。
 	c.mu.Lock()
 	c.releaseReadBuf = true
 	c.mu.Unlock()
@@ -366,14 +427,23 @@ func (c *Conn) ConsumeRead(n int) {
 
 // maxReadBufferSize 是读缓冲区能长到多大。
 //
-// 为什么要有这个数而不是"无限长": 缓冲区是**每个连接一块**，长到多大
-// 就占多大内存（10000 连接 × 1MB = 10GB）。所以给它一个上限，超了就
-// 不再收——但那意味着那条连接会卡住（见 Read 里的说明），所以这个值
-// 要明显大于"正常一条报文能有多大"。
+// **这个数必须大于"协议支持的最大单条报文"**，否则那条连接会永远收不完
+// 一条报文——缓冲区长不下了，协议又只能消费完整报文，两边都动不了。
+// 实测：定 4MB 时 autobahn 的 9.1.5(8MB)/9.1.6(16MB) 直接超时（报文读不
+// 进来，5 秒读超时把连接关了）。迁移前的实现没有上限（按帧头声明的
+// PayloadLen × 倍数分配），所以那两条是过的。
 //
-// 4MB：比常见的大 body（上传文件、gRPC 消息）都大，又不至于一条连接
-// 吃掉太多内存。
-const maxReadBufferSize = 4 * 1024 * 1024
+// 64MB：autobahn 最大的用例是 16MB，留 4 倍余量；常见的"一条大消息"
+// （上传、大 JSON、gRPC 消息）都在里面。
+//
+// **它不等于"每连接常驻 64MB"**：只有对端真的发了那么大的报文、缓冲区
+// 才会长上去，而且连接空下来就把缓冲区还回池子（见 Read 开头那段）。
+// 10000 连接跑 1KB echo 的时候每连接还是起始的那 2KB。
+//
+// **它不是安全边界**：对端用一个 14 字节的帧头就能声明 64MB，这里的上限
+// 挡不住这种"声明式"内存放大——那属于协议层的策略（报文大小上限），
+// 引擎这层只兜底，挡住"无中生有地分配一个天文数字"。
+const maxReadBufferSize = 64 * 1024 * 1024
 
 // compactReadBuffer 把"还没被消费的那段"挪到缓冲区开头, 收回 rr 前面
 // 被消费掉的空洞。返回是否挪动了(挪了就有空间读新数据)。
@@ -391,6 +461,9 @@ func (c *Conn) compactReadBuffer() bool {
 	n := copy(*c.rbuf, (*c.rbuf)[c.rr:c.rw])
 	c.rw = n
 	c.rr = 0
+	if c.parent != nil {
+		c.parent.addMoveBytes(n)
+	}
 	return n < len(*c.rbuf) // 腾出空间了才算成功
 }
 
@@ -460,6 +533,37 @@ func (c *Conn) EnsureReadSpace(n int) bool {
 	return len(*c.rbuf)-c.rw >= n
 }
 
+// 读缓冲区起始大小的默认值：8KB 够把常见的报文一次读完。
+const defReadBufferSize = 8 * 1024
+
+// initialReadBufSize 起始读缓冲区多大：问协议（ReadBufferSizer），
+// 不问就按默认。
+func (c *Conn) initialReadBufSize() int {
+	if s, ok := c.handler.(ReadBufferSizer); ok && s != nil {
+		if n := s.InitialReadBufferSize(); n > 0 {
+			return n
+		}
+	}
+	return defReadBufferSize
+}
+
+// growToNextMessage 问协议"下一条报文整条多大"，一次把缓冲区要到位。
+//
+// 返回 false 表示协议没实现 MessageSizeHinter、或者不知道、或者问了也长
+// 不动——调用方按翻倍那条路走。
+func (c *Conn) growToNextMessage() bool {
+	h, ok := c.handler.(MessageSizeHinter)
+	if !ok || h == nil {
+		return false
+	}
+	need := h.NextMessageSize(c)
+	// 缓冲区里现有的这些就装得下（不用长），或者压根不知道多大
+	if need <= c.rw-c.rr {
+		return false
+	}
+	return c.EnsureReadSpace(need - (c.rw - c.rr))
+}
+
 // growReadBuffer 把读缓冲区换大。返回是否换成了。
 //
 // 生长分两段:
@@ -501,6 +605,9 @@ func (c *Conn) growReadBuffer() bool {
 	copy(*nb, (*old)[:c.rw])
 	c.rbuf = nb
 	bytespool.PutBytes(old)
+	if c.parent != nil {
+		c.parent.addRealloc()
+	}
 	return true
 }
 
@@ -587,7 +694,7 @@ func (c *Conn) Writev(a, b []byte) error {
 		copy(stack[n:], b)
 		all := stack[:total]
 
-		wn, werr := socketWrite(int(c.fd), all)
+		wn, werr := c.writeToSocket(all)
 		if werr == nil && wn == total {
 			return nil
 		}
@@ -602,7 +709,7 @@ func (c *Conn) Writev(a, b []byte) error {
 		return werr
 	}
 
-	n, err := socketWritev(int(c.fd), a, b)
+	n, err := c.socketWritev(a, b)
 	if err == nil && n == total {
 		return nil
 	}
@@ -675,7 +782,34 @@ func (c *Conn) flushLocked() error {
 // 早先这里自己 Lock 了一次，而 Write 已经持锁，直接死锁（实测：
 // 一条连接收到第一个字节就卡住，测试 90 秒超时）。fd 用原子读，不用锁。
 func (c *Conn) writeToSocket(data []byte) (int, error) {
-	return socketWrite(int(atomic.LoadInt64(&c.fd)), data)
+	fd := int(atomic.LoadInt64(&c.fd))
+	// fd 已经被 closeWith 置成 -1：**不要再系统调用**。不拦的话内核
+	// 回 EBADF，而这个错会一路传回用户（实测：websocket 的客户端在
+	// 对端刚关连接时写一笔，拿到的是 "bad file descriptor" 而不是
+	// "连接已关"）。closeWith 是先置 closed、后置 fd=-1，所以
+	// IsClosed() 那个检查和这里之间有窗口。
+	if fd < 0 {
+		return 0, ErrClosed
+	}
+	n, err := socketWrite(fd, data)
+	if c.parent != nil {
+		c.parent.addWriteSyscall()
+	}
+	return n, err
+}
+
+// socketWritev 同上, 两段写。计数算一次系统调用。
+// **调用方必须持有 c.mu**（和 writeToSocket 一样）。
+func (c *Conn) socketWritev(a, b []byte) (int, error) {
+	fd := int(atomic.LoadInt64(&c.fd))
+	if fd < 0 {
+		return 0, ErrClosed
+	}
+	n, err := socketWritev(fd, a, b)
+	if c.parent != nil {
+		c.parent.addWriteSyscall()
+	}
+	return n, err
 }
 
 // appendToWbufList 把 data 追加到写缓冲。调用方持有 mu。
@@ -738,22 +872,27 @@ func (c *Conn) closeWith(err error) {
 		c.mu.Lock()
 		fd := int(atomic.LoadInt64(&c.fd))
 		atomic.StoreInt64(&c.fd, -1)
-		if c.rbuf != nil {
-			bytespool.PutBytes(c.rbuf)
-			c.rbuf = nil
+
+		// **缓冲区不一定能在这里释放**：事件循环可能正在处理这条连接
+		// （busy 位），它手上捏着读缓冲区里的一段——零拷贝的 payload 就是
+		// 它的别名。这时候还回去，同一个循环上的另一条连接下一次读就会
+		// 拿到这块内存，正在读的数据当场被覆盖。
+		//
+		// 实测（-race）：用户 goroutine 里 con.Close() 和事件循环的
+		// ReadBuffer() 抢 c.rbuf/c.rr/c.rw。
+		//
+		// 顺序很重要：**先置位再看 busy**。反过来的话，置位之前对方已经
+		// 跑完 unbusy（它没看到标志位、不会释放），置位之后又没人再来
+		// 释放——那块内存就漏了。
+		atomic.OrUint32(&c.packed, flagFreePending)
+		if atomic.LoadUint32(&c.packed)&flagBusy == 0 {
+			atomic.AndUint32(&c.packed, ^flagFreePending)
+			c.releaseBuffersLocked()
 		}
-		for i := range c.wbufList {
-			if c.wbufList[i] != nil {
-				bytespool.PutBytes(c.wbufList[i])
-				c.wbufList[i] = nil
-			}
-		}
-		c.wbufList = c.wbufList[:0]
-		c.rr, c.rw = 0, 0
 		c.mu.Unlock()
 
 		if c.parent != nil {
-			c.parent.del(c)
+			c.parent.del(fd)
 		}
 		if fd >= 0 {
 			closeFd(fd)
@@ -762,6 +901,26 @@ func (c *Conn) closeWith(err error) {
 			c.handler.OnClose(c, err)
 		}
 	})
+}
+
+// releaseBuffersLocked 释放读写缓冲区。调用方持有 c.mu。
+//
+// **只能在"没有人在处理这条连接"的时候调**：处理中的那一轮手上捏着读
+// 缓冲区里的一段（OnData 的 buf）。
+func (c *Conn) releaseBuffersLocked() {
+	if c.rbuf != nil {
+		bytespool.PutBytes(c.rbuf)
+		c.rbuf = nil
+	}
+	for i := range c.wbufList {
+		if c.wbufList[i] != nil {
+			bytespool.PutBytes(c.wbufList[i])
+			c.wbufList[i] = nil
+		}
+	}
+	c.wbufList = c.wbufList[:0]
+	c.rr, c.rw = 0, 0
+	c.releaseReadBuf = false
 }
 
 // ---------------------------------------------------------------------------
@@ -781,7 +940,18 @@ func (c *Conn) tryBusy() bool {
 	return atomic.OrUint32(&c.packed, flagBusy)&flagBusy == 0
 }
 
-func (c *Conn) unbusy() { atomic.AndUint32(&c.packed, ^flagBusy) }
+func (c *Conn) unbusy() {
+	// 热路径: 大部分时候返回的 old 里没有 flagFreePending, 直接返回。
+	// 用 atomic.And 的返回值判断, 不额外多一次原子读。
+	if old := atomic.AndUint32(&c.packed, ^flagBusy); old&flagFreePending != 0 {
+		c.mu.Lock()
+		if atomic.LoadUint32(&c.packed)&flagFreePending != 0 {
+			atomic.AndUint32(&c.packed, ^flagFreePending)
+			c.releaseBuffersLocked()
+		}
+		c.mu.Unlock()
+	}
+}
 
 func (c *Conn) setPendingRead()  { atomic.OrUint32(&c.packed, flagPendingRead) }
 func (c *Conn) setPendingWrite() { atomic.OrUint32(&c.packed, flagPendingWrite) }

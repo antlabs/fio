@@ -25,6 +25,21 @@ var (
 	testBinaryMessage10   = bytes.Repeat([]byte("1"), 10)
 )
 
+// testConnWriter 把帧直接写进连接（绕过 WriteMessage），用来构造
+// 不合法的帧测错误路径。以前是 connToNewConn 那层 unsafe 转换，
+// 现在 IO 归 engine，直接走 ec.Write。
+type testConnWriter struct{ c *Conn }
+
+func (w *testConnWriter) Write(p []byte) (int, error) {
+	if w.c.ec == nil {
+		return 0, ErrClosed
+	}
+	if err := w.c.ec.Write(p); err != nil {
+		return 0, err
+	}
+	return len(p), nil
+}
+
 func Test_Conn(t *testing.T) {
 	t.Run("conn size", func(t *testing.T) {
 		// 在未加入tls功能时，Conn的大小为160字节够用了。
@@ -32,7 +47,7 @@ func Test_Conn(t *testing.T) {
 		// conn大小改变历史
 		// 新增上下文接管，从 小于160到184
 		// 把Callback移到Conn, 从184到200
-		fmt.Printf("conn.size = %d, Conn.Size = %d\n", unsafe.Sizeof(conn{}), unsafe.Sizeof(Conn{}))
+		fmt.Printf("conn.size = %d\n", unsafe.Sizeof(Conn{}))
 		if unsafe.Sizeof(Conn{}) > 216 {
 			t.Errorf("Conn size:%d is too large", unsafe.Sizeof(Conn{}))
 		}
@@ -255,7 +270,7 @@ func Test_ReadMessage(t *testing.T) {
 		// err = con.WriteMessage(Binary, []byte("hello"))
 		maskValue := rand.Uint32()
 		var fw fixedwriter.FixedWriter
-		err = frame.WriteFrame(&fw, connToNewConn(con), []byte("hello"), true, true, con.isClient(), Binary, maskValue)
+		err = frame.WriteFrame(&fw, &testConnWriter{con}, []byte("hello"), true, true, con.isClient(), Binary, maskValue)
 		if err != nil {
 			t.Error(err)
 		}
@@ -316,7 +331,7 @@ func Test_ReadMessage(t *testing.T) {
 		// err = con.WriteMessage(Binary, []byte("hello"))
 		maskValue := rand.Uint32()
 		var fw fixedwriter.FixedWriter
-		err = frame.WriteFrame(&fw, connToNewConn(con), []byte("hello"), true, true, con.isClient(), Ping, maskValue)
+		err = frame.WriteFrame(&fw, &testConnWriter{con}, []byte("hello"), true, true, con.isClient(), Ping, maskValue)
 		if err != nil {
 			t.Error(err)
 		}
@@ -463,12 +478,12 @@ func TestFragmentFrame(t *testing.T) {
 
 		maskValue := rand.Uint32()
 		var fw fixedwriter.FixedWriter
-		err = frame.WriteFrame(&fw, connToNewConn(con), []byte("h"), false, false, con.isClient(), Text, maskValue)
+		err = frame.WriteFrame(&fw, &testConnWriter{con}, []byte("h"), false, false, con.isClient(), Text, maskValue)
 		if err != nil {
 			t.Error(err)
 		}
 		maskValue = rand.Uint32()
-		err = frame.WriteFrame(&fw, connToNewConn(con), []byte{}, true, false, con.isClient(), Text, maskValue)
+		err = frame.WriteFrame(&fw, &testConnWriter{con}, []byte{}, true, false, con.isClient(), Text, maskValue)
 		if err != nil {
 			t.Error(err)
 		}
