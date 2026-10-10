@@ -51,6 +51,19 @@ type ConnHandler struct {
 	sm *StateMachine
 	// handshakeDone 握手完成过一次（之后就纯转发）
 	handshakeDone bool
+
+	// innerPending 是内层没有消费完的明文，留到下一次拼在新解出来的前面。
+	//
+	// **两个边界不对齐**：TLS 记录是 16KB 一条（RFC 8446 5.1），HTTP/2 帧
+	// 是 16KB 一帧（默认 SETTINGS_MAX_FRAME_SIZE），两者毫无关系。一次
+	// OnData 解出来的明文里，最后一个帧往往是半截的——内层 Feed 解到那里
+	// 就停，返回值小于传入长度。
+	//
+	// 早先这里把那个返回值丢掉了（`_, innerErr :=`），半截帧的字节就没了：
+	// 症状是 h2 over TLS 在请求体 32KB 以上必断（客户端报 broken pipe），
+	// 16KB 以下看着正常——因为小到不用跨记录边界。明文直接传（不走 TLS）
+	// 时没有这个问题，所以只在 TLS 上现形。
+	innerPending []byte
 }
 
 // NewConnHandler 建一个服务端的 TLS engine.Handler。
@@ -135,7 +148,25 @@ func (ch *ConnHandler) OnData(c *engine.Conn, buf []byte) (int, error) {
 
 	// 4. 明文交给内层协议
 	if plain := ch.sm.ReadPlaintext(); len(plain) > 0 && ch.inner != nil {
-		_, innerErr := ch.inner.OnData(c, plain)
+		// 上一轮内层没吃完的接在前面：记录边界和帧边界对不上，半截帧
+		// 留着下次补齐（见 innerPending 的注释）。
+		if len(ch.innerPending) > 0 {
+			ch.innerPending = append(ch.innerPending, plain...)
+			plain = ch.innerPending
+		}
+
+		n, innerErr := ch.inner.OnData(c, plain)
+
+		// 内层没吃完的存下来。**这一步不能省**：丢掉的话那个半截帧的
+		// 字节就永远没了，连接从那里开始错位。
+		if n < 0 {
+			n = 0
+		}
+		if n < len(plain) {
+			ch.innerPending = append(ch.innerPending[:0], plain[n:]...)
+		} else {
+			ch.innerPending = ch.innerPending[:0]
+		}
 
 		// **内层吐出来的东西一定要发出去，出错时更要发**。
 		//
@@ -163,6 +194,7 @@ func (ch *ConnHandler) OnClose(c *engine.Conn, err error) {
 		ch.inner.OnClose(c, err)
 	}
 	ch.sm = nil
+	ch.innerPending = ch.innerPending[:0]
 }
 
 // State 返回 TLS 状态机的状态（测试和调试用）。
