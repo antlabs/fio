@@ -252,10 +252,20 @@ func (c *Conn) Read() (int, error) {
 	for {
 		buf := (*c.rbuf)[c.rw:]
 		if len(buf) == 0 {
-			// 缓冲区满了。协议还没消费完, 先把缓冲区加大——不能在这里
-			// 丢掉没消费的数据。
-			if !c.growReadBuffer() {
-				return total, nil
+			// 缓冲区满了, 协议还没消费完。**先试着把前面消费掉的那段
+			// 收回来**(compact), 收不动再扩容。
+			//
+			// 为什么先 compact: 协议处理半个大报文时(比如 1MB 的分片),
+			// rr 停在报文开头、rw 一路往后推。不回收 rr 前面那段的话,
+			// 缓冲区每次填满就翻倍, 最后为一条报文吃到 4MB(上限)——
+			// 而实际上"还没解析的数据"可能只有几十 KB。
+			//
+			// 实测(websocket 大分片场景): 加了这一步之后, 内存占用从
+			// "报文大小 × 2" 降到 "报文大小 + 一个读批次"。
+			if !c.compactReadBuffer() {
+				if !c.growReadBuffer() {
+					return total, nil
+				}
 			}
 			continue
 		}
@@ -364,6 +374,91 @@ func (c *Conn) ConsumeRead(n int) {
 // 4MB：比常见的大 body（上传文件、gRPC 消息）都大，又不至于一条连接
 // 吃掉太多内存。
 const maxReadBufferSize = 4 * 1024 * 1024
+
+// compactReadBuffer 把"还没被消费的那段"挪到缓冲区开头, 收回 rr 前面
+// 被消费掉的空洞。返回是否挪动了(挪了就有空间读新数据)。
+//
+// 只在 Read 里调, 而且只在"缓冲区写满了"那一刻——那时候协议刚处理完
+// 上一批数据, 没有任何 payload 别名还指着这块内存(零拷贝的 payload 只在
+// OnData 调用期间有效, 这是引擎和协议的约定)。
+func (c *Conn) compactReadBuffer() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.rbuf == nil || c.rr == 0 {
+		return false
+	}
+	// 把 [rr:rw] 挪到开头
+	n := copy(*c.rbuf, (*c.rbuf)[c.rr:c.rw])
+	c.rw = n
+	c.rr = 0
+	return n < len(*c.rbuf) // 腾出空间了才算成功
+}
+
+// EnsureReadSpace 确保读缓冲区尾部至少有 n 字节的空闲空间。
+//
+// **给"读完帧头就知道整条报文多大"的协议用**：WebSocket 读到帧头就知道
+// payload 长度，HTTP/2 读到帧头就知道帧长，gRPC 读到消息头就知道消息多长。
+// 提前把空间要到位的收益是**省掉连续翻倍带来的多次拷贝**——不预留下来的
+// 话，1MB 的报文要经历 16K→32K→…→1MB 七次 memcpy，而每次都是把整块已读
+// 数据搬一遍。
+//
+// 返回值表示"空间够了"（false 表示到上限了也腾不出来，调用方按"暂时放
+// 不下"处理：报文留在缓冲区里，等下一轮读事件——但注意 ET 下不会有新的
+// 边缘，所以正常情况下这个 false 不该出现）。
+//
+// 空闲空间只在**尾部**：会先 compact 把已消费的前缀收回来，再考虑扩容。
+func (c *Conn) EnsureReadSpace(n int) bool {
+	if n <= 0 {
+		return true
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.rbuf == nil {
+		// 还没开始读：按需要的大小起一块（下限 8KB，避免小报文反复申请）
+		want := n
+		if want < 8*1024 {
+			want = 8 * 1024
+		}
+		if want > maxReadBufferSize {
+			want = maxReadBufferSize
+		}
+		c.rbuf = bytespool.GetBytes(want)
+		return cap(*c.rbuf)-c.rw >= n
+	}
+
+	// 尾部空间够就直接返回
+	if len(*c.rbuf)-c.rw >= n {
+		return true
+	}
+
+	// 先 compact：把 [rr:rw] 挪到开头，前面那段空洞就收回来了
+	if c.rr > 0 {
+		used := copy(*c.rbuf, (*c.rbuf)[c.rr:c.rw])
+		c.rw = used
+		c.rr = 0
+		if len(*c.rbuf)-c.rw >= n {
+			return true
+		}
+	}
+
+	// 还不够就扩容：一次到位（不翻倍，直接按"已读 + 需要"要）
+	need := c.rw + n
+	if need <= len(*c.rbuf) {
+		return true
+	}
+	if need > maxReadBufferSize {
+		need = maxReadBufferSize
+	}
+	if need <= len(*c.rbuf) {
+		return false // 已经在上限了
+	}
+	old := c.rbuf
+	nb := bytespool.GetBytes(need)
+	copy(*nb, (*old)[:c.rw])
+	c.rbuf = nb
+	bytespool.PutBytes(old)
+	return len(*c.rbuf)-c.rw >= n
+}
 
 // growReadBuffer 把读缓冲区换大。返回是否换成了。
 //
@@ -475,8 +570,39 @@ func (c *Conn) Writev(a, b []byte) error {
 		return nil
 	}
 
-	n, err := socketWritev(int(c.fd), a, b)
 	total := len(a) + len(b)
+
+	// **小消息(≤4KB)拼到栈上一次 sendto**。
+	//
+	// sendmsg 要读 iovec 数组、sendto 只要一个指针, 小消息下后者更便宜;
+	// 大消息才值得用 iovec 省那次拷贝。之前无线程池的 websocket 在小消息
+	// 上也用 sendmsg, 测下来多花 CPU。
+	//
+	// 4KB 是这么定的: maxCopiedPayload, 和 fnet 的一致——超过这个长度,
+	// 拼一次的 memcpy 就比多一个 iovec 贵了。
+	const maxStackWrite = 4096
+	if total <= maxStackWrite {
+		var stack [maxStackWrite]byte
+		n := copy(stack[:], a)
+		copy(stack[n:], b)
+		all := stack[:total]
+
+		wn, werr := socketWrite(int(c.fd), all)
+		if werr == nil && wn == total {
+			return nil
+		}
+		if werr == nil || werr == syscall.EAGAIN || werr == syscall.EINTR {
+			if wn < 0 {
+				wn = 0
+			}
+			c.appendToWbufList(all[wn:], total-wn)
+			c.parent.addWrite(c)
+			return nil
+		}
+		return werr
+	}
+
+	n, err := socketWritev(int(c.fd), a, b)
 	if err == nil && n == total {
 		return nil
 	}
@@ -678,12 +804,4 @@ func (c *Conn) setActivated() (pendingRead, pendingWrite bool) {
 	return old&flagPendingRead != 0, old&flagPendingWrite != 0
 }
 
-func (c *Conn) isCorking() bool { return atomic.LoadUint32(&c.packed)&flagCorking != 0 }
-
-func (c *Conn) setCorking(v bool) {
-	if v {
-		atomic.OrUint32(&c.packed, flagCorking)
-	} else {
-		atomic.AndUint32(&c.packed, ^flagCorking)
-	}
-}
+// cork 相关的 isCorking/setCorking 在 cork.go 里（那边有完整说明）。
