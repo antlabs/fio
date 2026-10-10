@@ -87,6 +87,14 @@ type Conn struct {
 	handler Handler
 	// parent 是它挂在哪个事件循环上
 	parent *EventLoop
+	// initRbSize 是起始读缓冲区大小（Init 时问了一次 ReadBufferSizer）。
+	// 不实现 ReadBufferSizer 的协议是 0。
+	initRbSize int
+
+	// keepReadBuf 表示当前这块 rbuf 是"起始大小那一档"，全消费完可以留着
+	// 下轮接着用（省一次池往返）。一旦长过（growReadBuffer/growToNextMessage
+	// 换了更大的块）就清掉——长过的留着会变成每连接常驻，见 ConsumeRead。
+	keepReadBuf bool
 
 	// mu 保护 rbuf/wbufList: Close 可能从任意 goroutine 来, 它要在锁里
 	// 释放这两块内存。
@@ -134,6 +142,13 @@ func (c *Conn) Init(fd int, h Handler, parent *EventLoop) {
 	c.rbuf = nil
 	c.rr, c.rw = 0, 0
 	c.wbufList = c.wbufList[:0]
+	c.keepReadBuf = false
+	// 起始读缓冲区大小问一次协议就够，之后不再变——热路径上（ConsumeRead）
+	// 要拿它判断"这块是不是起始大小那块、能不能留"，每消息一次接口断言不划算。
+	c.initRbSize = 0
+	if s, ok := h.(ReadBufferSizer); ok && s != nil {
+		c.initRbSize = s.InitialReadBufferSize()
+	}
 	// userData 是 atomic.Value，清成"没设过"（存一个 nil 指针）
 	c.userData.Store((*any)(nil))
 }
@@ -275,10 +290,20 @@ func (c *Conn) Read() (int, error) {
 		c.rr, c.rw = 0, 0
 	}
 	c.releaseReadBuf = false
+	// 上一轮全消费完、缓冲区又留着复用（ConsumeRead 里没还的那种）：
+	// 把索引复位到开头，这块就接着用。不复位的话 buf := (*rbuf)[rw:] 是
+	// 空的，会走"缓冲区满"那条路去 compact——白绕一圈。
+	if c.rbuf != nil && c.rr == c.rw && c.rr > 0 {
+		c.rr, c.rw = 0, 0
+	}
 	c.mu.Unlock()
 
 	if c.rbuf == nil {
+		// 起始那块用完之后可以留着复用（见 ConsumeRead）。池按档位给，
+		// 拿到的比请求的大一点，所以记的是"这块就是起始档"这个事实，
+		// 不是长度本身。
 		c.rbuf = bytespool.GetBytes(c.initialReadBufSize())
+		c.keepReadBuf = true
 	}
 
 	total := 0
@@ -359,19 +384,18 @@ func (c *Conn) Read() (int, error) {
 			c.growReadBuffer()
 		}
 
-		// 短读**不能**直接返回。ET 模式下"数据读完"和"对端关了(FIN)"
-		// 是两个独立的状态变化，而边缘只在后者到来时给一次——如果这次
-		// 只读到数据就返回，FIN 那个边缘会因为"这个 fd 已经在处理中"
-		// 被并进 pending，而 pending 的处理不会再产生新的读……
+		// **短读就返回**：这次已经把可读的读干了，再读一次必然 EAGAIN。
+		// 省掉的正是"每消息多一次系统调用"——strace 实测 recvfrom 从
+		// 2.02 次/消息降到 1.02 次/消息（基线 1.0 次），CPU 跟着降。
 		//
-		// 实测：客户端发 5 字节再 close，只有一次 [poll] 事件，OnClose
-		// 永远不调。所以要接着读，直到 EAGAIN（没数据了）或者 0（FIN）。
+		// **FIN 不会因此丢**：pulse 注册的 epoll 事件带 EPOLLRDHUP，对端
+		// 关闭会单独回调一次（api_epoll.go 里 rev&(EPOLLHUP|EPOLLRDHUP) 时
+		// 直接 cb(fd, READ|WRITE, io.EOF)），不靠"读到 0"来发现。拿"发几个
+		// 字节立刻 close"的用例在 Linux 上反复验过（50 轮）。
 		//
-		// 迁移前 websocket 的读循环是短读就 break（"省掉那次一定返回
-		// EAGAIN 的 read"），在这套 pending 机制下会丢 FIN——Linux 上
-		// 试过，websocket 的测试直接挂。多一次系统调用换"FIN 一定被看见"。
+		// 只有"刚好读满一整块、后面可能还有"才接着循环（上面会先把块换大）。
 		if n < len(buf) {
-			continue
+			return total, nil
 		}
 	}
 }
@@ -416,13 +440,22 @@ func (c *Conn) ConsumeRead(n int) {
 	// 所以只把索引推到底；真正的释放留给下一次 Read（那时候上一轮的
 	// 栈肯定已经退干净了）和 Close。
 	//
-	// **试过"小的留着下次接着用"（省一次池往返），内存反而更差**：
-	// 缓冲区在连接刚建、一批消息挤进来的时候会长到 16KB，留着就变成
-	// 每连接常驻 16KB——实测 10000 连接下 MEM 从 119MB 涨到 417MB。
-	// 还回池子，让空闲连接只留起始大小那块。
-	c.mu.Lock()
+	// **没长过一批大小的那块留着下次接着用**（keepReadBuf，见 Read）：
+	// 每条消息都"还回池子再取一块新的"是三笔开销——一次 PutBytes、
+	// 一次 GetBytes、以及池子每处理一次消息就多攒一块驻留内存（sync.Pool
+	// 按 P 缓存，实测 10000 连接下多留 29MB，而它们本该是每连接常驻的
+	// 那几 KB）。基线（迁移前）本来就是每连接持有一块不再还的，这里对齐。
+	//
+	// **长过一批大小（> batchReadBufferSize）的必须还**：那种是"协议还在
+	// 等半条大报文、缓冲区一路翻倍长上去"的，留着就变成每连接常驻一块
+	// 大的——实测无上限地留，10000 连接下 MEM 从 119MB 涨到 417MB。
+	// 所以留的口子限在 batchReadBufferSize（一批消息装得下就够）。
+	if c.rbuf != nil && c.keepReadBuf {
+		c.releaseReadBuf = false
+		return
+	}
+
 	c.releaseReadBuf = true
-	c.mu.Unlock()
 }
 
 // maxReadBufferSize 是读缓冲区能长到多大。
@@ -496,6 +529,9 @@ func (c *Conn) EnsureReadSpace(n int) bool {
 			want = maxReadBufferSize
 		}
 		c.rbuf = bytespool.GetBytes(want)
+		// 这是"按报文大小要到的一块"，比起始档可能大很多——不算可复用的
+		// 起始块，消费完要还（见 ConsumeRead）。
+		c.keepReadBuf = false
 		return cap(*c.rbuf)-c.rw >= n
 	}
 
@@ -529,6 +565,7 @@ func (c *Conn) EnsureReadSpace(n int) bool {
 	nb := bytespool.GetBytes(need)
 	copy(*nb, (*old)[:c.rw])
 	c.rbuf = nb
+	c.keepReadBuf = false
 	bytespool.PutBytes(old)
 	return len(*c.rbuf)-c.rw >= n
 }
@@ -536,13 +573,11 @@ func (c *Conn) EnsureReadSpace(n int) bool {
 // 读缓冲区起始大小的默认值：8KB 够把常见的报文一次读完。
 const defReadBufferSize = 8 * 1024
 
-// initialReadBufSize 起始读缓冲区多大：问协议（ReadBufferSizer），
-// 不问就按默认。
+// initialReadBufSize 起始读缓冲区多大：Init 时问过一次，缓存起来了
+// （见 Conn.initRbSize）。
 func (c *Conn) initialReadBufSize() int {
-	if s, ok := c.handler.(ReadBufferSizer); ok && s != nil {
-		if n := s.InitialReadBufferSize(); n > 0 {
-			return n
-		}
+	if c.initRbSize > 0 {
+		return c.initRbSize
 	}
 	return defReadBufferSize
 }
@@ -604,6 +639,14 @@ func (c *Conn) growReadBuffer() bool {
 	nb := bytespool.GetBytes(want)
 	copy(*nb, (*old)[:c.rw])
 	c.rbuf = nb
+	// 长到"一批装得下"为止都算可复用（keepReadBuf）：一批消息挤满起始那块
+	// 是很常见的（一次 write 带 3~10 条），这时长到 16KB 是个稳定的落点，
+	// 留着复用省掉每消息的池往返。再往上（半条大报文那种翻倍）就不是
+	// "稳定的落点"了，留着会每连接常驻一块大的，必须还（见 ConsumeRead）。
+	// 注意用 want 而不是 len(*nb) 比：bytespool 按档位给，要 16KB 拿回来
+	// 是 16398（多加了一个帧头），拿实际长度去比会把"刚好一批大小"判成
+	// 太大。
+	c.keepReadBuf = want <= batchReadBufferSize
 	bytespool.PutBytes(old)
 	if c.parent != nil {
 		c.parent.addRealloc()
@@ -738,6 +781,25 @@ func (c *Conn) Flush() error {
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	return c.flushLocked()
+}
+
+// FlushIfNeeded 写缓冲里非空才 flush，**只拿一次锁**。
+//
+// 可写事件那条路（processConn）本来是 NeedFlush() 拿一次锁 + Flush()
+// 再拿一次，两次加锁都是为了问同一个问题（wbufList 空不空）。合并成一次。
+//
+// 这里有写缓冲的概率很低（echo 的写都是当场写完的），所以热路径基本就是
+// "拿锁 -> 看一眼是空的 -> 放锁"，比两次少一半。
+func (c *Conn) FlushIfNeeded() error {
+	if c.IsClosed() {
+		return nil
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if len(c.wbufList) == 0 {
+		return nil
+	}
 	return c.flushLocked()
 }
 
@@ -921,6 +983,7 @@ func (c *Conn) releaseBuffersLocked() {
 	c.wbufList = c.wbufList[:0]
 	c.rr, c.rw = 0, 0
 	c.releaseReadBuf = false
+	c.keepReadBuf = false
 }
 
 // ---------------------------------------------------------------------------
@@ -936,12 +999,24 @@ func (c *Conn) setClient(v bool) {
 
 func (c *Conn) isClient() bool { return atomic.LoadUint32(&c.packed)&flagClient != 0 }
 
+// tryBusy 抢 busy 位（"这条连接归我处理了"）。
+//
+// **先做一次普通读再决定要不要写**：x86 上 OrUint32 是 lock 前缀的读改写，
+// 比一次普通 load 贵一个数量级，而它在每条消息的事件路径上。绝大部分时候
+// busy 位是 0（同一条连接的调用者都在同一个事件循环 goroutine 上，串行），
+// 那次 lock 前缀纯属白花——先 load 看一眼就能跳过。
+//
+// 读到的 0 一定是真的（没人持有）；读到 1 也许对方刚放掉，那就走下面那条
+// 慢路径老实抢。
 func (c *Conn) tryBusy() bool {
+	if atomic.LoadUint32(&c.packed)&flagBusy != 0 {
+		return false
+	}
 	return atomic.OrUint32(&c.packed, flagBusy)&flagBusy == 0
 }
 
 func (c *Conn) unbusy() {
-	// 热路径: 大部分时候返回的 old 里没有 flagFreePending, 直接返回。
+	// 热路径: 大部分时候没有 flagFreePending, 清掉 busy 就完事。
 	// 用 atomic.And 的返回值判断, 不额外多一次原子读。
 	if old := atomic.AndUint32(&c.packed, ^flagBusy); old&flagFreePending != 0 {
 		c.mu.Lock()

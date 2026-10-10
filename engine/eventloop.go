@@ -202,11 +202,10 @@ func (el *EventLoop) processConn(c *Conn, isRead, isWrite bool) {
 		}
 		if isWrite {
 			el.addWriteEvNum()
-			if c.NeedFlush() {
-				if err := c.Flush(); err != nil {
-					c.closeWith(err)
-					return
-				}
+			// 一次拿锁搞定"看有没有积压 + 有就 flush"，见 FlushIfNeeded。
+			if err := c.FlushIfNeeded(); err != nil {
+				c.closeWith(err)
+				return
 			}
 		}
 		if isRead {
