@@ -43,8 +43,19 @@ type ResponseWriter struct {
 	// buf 是拼响应用的缓冲区（连接级复用）
 	buf *[]byte
 
-	// keepAlive 这个响应之后连接要不要留着
-	keepAlive bool
+	// proto 是当前请求的版本（"HTTP/1.1"、"HTTP/1.0"）。
+	//
+	// 响应的版本行要按它来写：RFC 9112 2.3 要求服务端回的版本"不高于"
+	// 请求的版本。对 1.0 请求回 "HTTP/1.1" 的话，严格的老客户端会当成
+	// 跟自己无关的东西——而且 1.0 的客户端不认 chunked，回 1.1 却只给
+	// chunked 是自相矛盾的（见 flushHeader 里的分叉）。
+	proto string
+
+	// closeAfterWrite 这次响应写完就关连接。
+	//
+	// 用在"HTTP/1.0 且调用方没给 Content-Length"上：1.0 没有 chunked，
+	// 唯一能给客户端划出体边界的办法就是关连接。
+	closeAfterWrite bool
 
 	// chunked 这个响应用 chunked（调用方没设 Content-Length）
 	chunked bool
@@ -138,7 +149,12 @@ func (w *ResponseWriter) flushHeader() error {
 	}
 	buf := (*w.buf)[:0]
 
-	buf = append(buf, "HTTP/1.1 "...)
+	// 版本行按**请求**的版本回（RFC 9112 2.3：不高于请求的版本）。
+	if w.proto == "HTTP/1.0" {
+		buf = append(buf, "HTTP/1.0 "...)
+	} else {
+		buf = append(buf, "HTTP/1.1 "...)
+	}
 	buf = strconv.AppendInt(buf, int64(w.statusCode), 10)
 	buf = append(buf, ' ')
 	buf = append(buf, StatusText(w.statusCode)...)
@@ -156,8 +172,15 @@ func (w *ResponseWriter) flushHeader() error {
 	// 状态码 204/304 和 HEAD 响应是例外：它们按定义没有体，不需要
 	// 任何长度标记（也不需要 chunked）。
 	if !hasContentLength(w.header) && !bodylessStatus(w.statusCode) {
-		w.chunked = true
-		buf = append(buf, "Transfer-Encoding: chunked\r\n"...)
+		// HTTP/1.0 不认 chunked（RFC 9112 6.1：没看到请求是 1.1 就不能发
+		// Transfer-Encoding 的响应）。对 1.0 的客户端，体只能靠"写完关
+		// 连接"来界定。
+		if w.proto == "HTTP/1.0" {
+			w.closeAfterWrite = true
+		} else {
+			w.chunked = true
+			buf = append(buf, "Transfer-Encoding: chunked\r\n"...)
+		}
 	}
 
 	for name, values := range w.header {
@@ -323,7 +346,7 @@ func (ch *ConnHandler) OnData(c *engine.Conn, buf []byte) (int, error) {
 		if st.w == nil {
 			st.w = &ResponseWriter{}
 		}
-		st.w.reset(c)
+		st.w.reset(c, req.Proto)
 		ch.handler.ServeHTTP(st.w, req)
 
 		// 响应收尾。
@@ -348,7 +371,9 @@ func (ch *ConnHandler) OnData(c *engine.Conn, buf []byte) (int, error) {
 		// （或者版本是 1.0 且没说 keep-alive）。这一条不实现的话，客户端
 		// 会一直等"响应之后服务端关连接"（很多客户端靠这个判断响应结束），
 		// 等到超时。
-		if wantClose(req) {
+		// closeAfterWrite 是"HTTP/1.0 且没给 Content-Length"那种——
+		// 体的边界只能靠关连接划出来（见 flushHeader）。
+		if wantClose(req) || st.w.closeAfterWrite {
 			c.Close()
 			return len(buf), nil // 连接要关了，剩下的不用管
 		}
@@ -412,7 +437,9 @@ func (ch *ConnHandler) writeError(c *engine.Conn, st *connState, code int, err e
 	if st.w == nil {
 		st.w = &ResponseWriter{}
 	}
-	st.w.reset(c)
+	// 报文坏了，版本不一定解得出来；错误响应统一用 1.1 的格式（WriteRaw
+	// 直接写死版本，不走 flushHeader，所以这里的 proto 只影响字段状态）。
+	st.w.reset(c, "HTTP/1.1")
 	st.w.WriteHeader(code)
 	st.w.WriteRaw([]byte("HTTP/1.1 " + strconv.Itoa(code) + " " + StatusText(code) + "\r\n" +
 		"Content-Length: 0\r\nConnection: close\r\n\r\n"))
@@ -428,14 +455,17 @@ type connState struct {
 }
 
 // reset 把 ResponseWriter 复位到"新一个响应"的状态。
-func (w *ResponseWriter) reset(c *engine.Conn) {
+//
+// proto 是这一条请求的版本，响应行和对 1.0 的分叉都看它。
+func (w *ResponseWriter) reset(c *engine.Conn, proto string) {
 	w.conn = c
+	w.proto = proto
 	w.statusCode = 0
 	w.wroteHeader = false
 	w.headerSent = false
 	w.chunked = false
 	w.finished = false
-	w.keepAlive = true // HTTP/1.1 默认 keep-alive
+	w.closeAfterWrite = false
 	for k := range w.header {
 		delete(w.header, k)
 	}
