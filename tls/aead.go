@@ -59,6 +59,17 @@ type recordProtector struct {
 	iv   []byte
 	// seq 是这条连接在这个方向上发/收的第几条记录
 	seq uint64
+
+	// nonceBuf / scratch 是复用的缓冲。
+	//
+	// 两者都是**每次调用都重新分配**的典型：nonce 12 字节、scratch 一条
+	// 记录的密文（最多 16KB+），而一条连接上记录的条数是响应大小除以 16KB
+	// ——300KB 的响应就是 19 遍。nonce 和 scratch 都只在函数体里用掉就丢
+	// （GCM 同步读 nonce，密文由调用方当场 append 进输出），所以复用是安全的。
+	nonceBuf []byte
+	scratch  []byte
+	// adBuf 是 additionalData 的复用缓冲（5 字节的记录头）。
+	adBuf [5]byte
 }
 
 // newRecordProtector 用派生出来的 key/iv 建一个保护器。
@@ -75,8 +86,14 @@ func newRecordProtector(keys trafficKeys) (*recordProtector, error) {
 }
 
 // nonce 算这条记录的 nonce：iv 和序号异或（序号在最后 8 字节）。
+//
+// 返回的切片归保护器所有，只在下一次 nonce 之前有效（GCM 是同步读它的，
+// 不保留）。
 func (p *recordProtector) nonce() []byte {
-	n := make([]byte, len(p.iv))
+	if p.nonceBuf == nil {
+		p.nonceBuf = make([]byte, len(p.iv))
+	}
+	n := p.nonceBuf
 	copy(n, p.iv)
 	var seq [8]byte
 	binary.BigEndian.PutUint64(seq[:], p.seq)
@@ -90,14 +107,17 @@ func (p *recordProtector) nonce() []byte {
 
 // additionalData 是 AEAD 的关联数据：记录头（但不含真实类型，那个被
 // 藏进密文了）。它的作用是绑住"这条记录属于哪个版本、有多长"。
-func additionalData(version uint16, ciphertextLen int) []byte {
-	ad := make([]byte, 5)
-	ad[0] = recordApplicationData // 外层永远是 application_data
-	ad[1] = byte(version >> 8)
-	ad[2] = byte(version)
-	ad[3] = byte(ciphertextLen >> 8)
-	ad[4] = byte(ciphertextLen)
-	return ad
+//
+// 写进保护器自己的 adBuf 而不是自己 make：5 个字节不大，但这是**每条记录
+// 每个方向各一次**的小分配，而记录数随响应大小线性增长——300KB 的响应是
+// 19 条记录。返回的切片同样只在下一次调用前有效。
+func (p *recordProtector) additionalData(version uint16, ciphertextLen int) []byte {
+	p.adBuf[0] = recordApplicationData // 外层永远是 application_data
+	p.adBuf[1] = byte(version >> 8)
+	p.adBuf[2] = byte(version)
+	p.adBuf[3] = byte(ciphertextLen >> 8)
+	p.adBuf[4] = byte(ciphertextLen)
+	return p.adBuf[:]
 }
 
 // seal 加密一段内层明文，返回可以直接写出去的密文（含认证标签）。
@@ -122,15 +142,24 @@ func (p *recordProtector) seal(innerType uint8, plaintext []byte) ([]byte, error
 	// crypto/cipher 明确支持原地加密（Seal 的文档："To reuse plaintext's
 	// storage for the encrypted output, use plaintext[:0] as dst"），
 	// 所以一次分配到位（多留一个认证标签的位置），然后把 buf[:0] 当 dst。
-	buf := make([]byte, 0, len(plaintext)+1+p.aead.Overhead())
-	buf = append(buf, plaintext...)
+	//
+	// 更进一步：这块缓冲本身也复用（p.scratch）。产物调用方都是当场就用掉
+	// 的——两条调用路径（StateMachine.Write 和 sendHandshake）都是
+	// AppendRecord(out, ..., ct)，那是往输出缓冲里拷一份，拷完 ct 就没人
+	// 要了。所以**返回的切片只在下一次 seal 之前有效**。
+	need := len(plaintext) + 1 + p.aead.Overhead()
+	if cap(p.scratch) < need {
+		p.scratch = make([]byte, 0, need)
+	}
+	buf := append(p.scratch[:0], plaintext...)
 	buf = append(buf, innerType)
 
 	nonce := p.nonce()
 	// 外层长度 = 内层长度 + 认证标签
-	ad := additionalData(0x0303, len(buf)+p.aead.Overhead())
+	ad := p.additionalData(0x0303, len(buf)+p.aead.Overhead())
 
 	out := p.aead.Seal(buf[:0], nonce, buf, ad)
+	p.scratch = out
 	p.seq++
 	return out, nil
 }
@@ -145,7 +174,7 @@ func (p *recordProtector) open(ciphertext []byte) ([]byte, uint8, error) {
 	}
 
 	nonce := p.nonce()
-	ad := additionalData(0x0303, len(ciphertext))
+	ad := p.additionalData(0x0303, len(ciphertext))
 
 	inner, err := p.aead.Open(nil, nonce, ciphertext, ad)
 	if err != nil {

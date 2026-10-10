@@ -107,6 +107,11 @@ type StateMachine struct {
 	// --- 应用数据 ---
 	// plaintext 是解出来的应用数据
 	plaintext []byte
+	// writeBuf 是 Write 的输出缓冲，连接级复用。
+	//
+	// 这块的大小就是响应的密文大小——300KB 的响应每次分配 300KB、拷一遍，
+	// 而它的生命周期只有一个 WriteRaw 那么长（见 Write 的说明）。
+	writeBuf []byte
 
 	// --- 握手状态 ---
 	// clientHello 是收到的 ClientHello（服务端用）
@@ -765,8 +770,17 @@ func (sm *StateMachine) Write(plain []byte) ([]byte, error) {
 	// 明文 + 1(内层类型) + 16(AEAD 标签)，外面再套 5 字节记录头。一次
 	// 分配到位，省掉的是 16K→32K→64K→128K 那几次重分配和随之而来的
 	// memmove——100KB 的响应走这条路时，这一处占全部堆分配的一大块。
+	// 这块输出缓冲连接级复用（sm.writeBuf）。**返回的切片在下一次 Write
+	// 之前有效**——两条调用路径（tls.ConnHandler 的写钩子和 WritePlain）
+	// 都是拿到就 c.WriteRaw(ct)，WriteRaw 把字节拷进写缓冲或内核，拷完就
+	// 不要了。300KB 的响应就是每响应一次 300KB 的分配，是这里仅剩的两处
+	// 分配之一（另一处是 seal 里那条记录，见 aead.go）。
 	nrec := (len(plain) + maxRecordPayload - 1) / maxRecordPayload
-	out := make([]byte, 0, len(plain)+nrec*(recordHeaderLen+1+sm.writeKeys.aead.Overhead()))
+	need := len(plain) + nrec*(recordHeaderLen+1+sm.writeKeys.aead.Overhead())
+	if cap(sm.writeBuf) < need {
+		sm.writeBuf = make([]byte, 0, need)
+	}
+	out := sm.writeBuf[:0]
 	for len(plain) > 0 {
 		n := len(plain)
 		if n > maxRecordPayload {
@@ -779,6 +793,7 @@ func (sm *StateMachine) Write(plain []byte) ([]byte, error) {
 		out = AppendRecord(out, recordApplicationData, 0x0303, ct)
 		plain = plain[n:]
 	}
+	sm.writeBuf = out
 	return out, nil
 }
 
