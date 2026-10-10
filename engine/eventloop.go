@@ -64,14 +64,21 @@ func (el *EventLoop) Loop() {
 		// 放在 Poll **之前**：OnOpen 要在该连接的任何数据之前跑（协议
 		// 靠它初始化状态）。投递方（Add）保证任务先入队，这里保证它先
 		// 于 Poll 返回的事件被处理。
-		for {
-			select {
-			case f := <-el.tasks:
-				f()
-				continue
-			default:
+		//
+		// 先 len() 看一眼：绝大多数轮次队列是空的（新连接才走这条路），
+		// 空队列时那次 select+default 也要过一次 runtime 的 chanrecv 快
+		// 路径，而这是每轮都要跑的。投递方入队后会 wake 一次，就算这里
+		// 漏看一轮也马上会回来。
+		if len(el.tasks) > 0 {
+			for {
+				select {
+				case f := <-el.tasks:
+					f()
+					continue
+				default:
+				}
+				break
 			}
-			break
 		}
 		// **超时必须是"永久等"（-1），不能是 100ms 这种小超时**。
 		//

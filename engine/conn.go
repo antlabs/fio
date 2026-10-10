@@ -135,6 +135,18 @@ const (
 	// 事件循环正在处理这条连接, 它手上还捏着读缓冲区里的一段(零拷贝的
 	// payload 就是它的一段)。释放交给这一轮结束时的 unbusy, 见 closeWith。
 	flagFreePending uint32 = 1 << 6
+
+	// flagHasWbuf 表示写缓冲里有积压（wbufList 非空）。
+	//
+	// 给 FlushIfNeeded 做无锁门槛用：可写事件每条消息都可能有（ET 下
+	// EPOLLOUT 常和 EPOLLIN 一起报上来），而绝大多数时候写缓冲是空的——
+	// 没有这个位就得为了"看一眼空不空"拿一次锁（实测 1KB echo 里占
+	// 0.5% CPU）。
+	//
+	// **设置和清除都在 c.mu 里**（和 wbufList 一起改），读的不加锁：
+	// 读到过期的 1 最多白拿一次锁（锁里再查一遍），而列表非空时这个位
+	// 一定是 1——不会漏掉该做的 flush。
+	flagHasWbuf uint32 = 1 << 7
 )
 
 // Init 初始化一条连接。fd 必须是已经设成非阻塞的 socket。
@@ -823,6 +835,11 @@ func (c *Conn) Flush() error {
 // 这里有写缓冲的概率很低（echo 的写都是当场写完的），所以热路径基本就是
 // "拿锁 -> 看一眼是空的 -> 放锁"，比两次少一半。
 func (c *Conn) FlushIfNeeded() error {
+	// 无锁看一眼：没有积压就直接走（绝大多数可写事件都是这种，白拿一次
+	// 锁不值）。这个位可能过期成 1，锁里还会再查一遍，不影响正确性。
+	if atomic.LoadUint32(&c.packed)&flagHasWbuf == 0 {
+		return nil
+	}
 	if c.IsClosed() {
 		return nil
 	}
@@ -866,6 +883,8 @@ func (c *Conn) flushLocked() error {
 		return err
 	}
 	c.wbufList = c.wbufList[:0]
+	// 空了，清掉"有积压"那个位（见 flagHasWbuf）
+	atomic.AndUint32(&c.packed, ^flagHasWbuf)
 	return nil
 }
 
@@ -910,6 +929,7 @@ func (c *Conn) appendToWbufList(data []byte, oldLen int) {
 	if len(data) == 0 {
 		return
 	}
+	atomic.OrUint32(&c.packed, flagHasWbuf)
 	if len(c.wbufList) == 0 {
 		nb := bytespool.GetBytes(len(data) + oldLen)
 		copy(*nb, data)
@@ -1012,6 +1032,7 @@ func (c *Conn) releaseBuffersLocked() {
 		}
 	}
 	c.wbufList = c.wbufList[:0]
+	atomic.AndUint32(&c.packed, ^flagHasWbuf)
 	c.rr, c.rw = 0, 0
 	c.releaseReadBuf = false
 }

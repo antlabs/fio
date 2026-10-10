@@ -108,6 +108,8 @@ func (c *Conn) corkStartLocked(capHint int) {
 	b := bytespool.GetBytes(capHint)
 	*b = (*b)[:0]
 	c.wbufList = append(c.wbufList[:0], b)
+	// 列表从空变成非空，同步 flagHasWbuf（见 conn.go 里那个位的说明）
+	atomic.OrUint32(&c.packed, flagHasWbuf)
 	c.setCorking(true)
 }
 
@@ -237,6 +239,7 @@ func (c *Conn) EndCork() {
 		bytespool.PutBytes(c.wbufList[0])
 		c.wbufList[0] = nil
 		c.wbufList = c.wbufList[:0]
+		atomic.AndUint32(&c.packed, ^flagHasWbuf)
 		return
 	}
 	// flush 自己负责把写完的缓冲区还回池子。别在这里再动 wbufList——
