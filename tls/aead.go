@@ -112,16 +112,25 @@ func (p *recordProtector) seal(innerType uint8, plaintext []byte) ([]byte, error
 		return nil, ErrSequenceLimit
 	}
 
-	// 内层明文 = 数据 + 真实类型
-	inner := make([]byte, 0, len(plaintext)+1)
-	inner = append(inner, plaintext...)
-	inner = append(inner, innerType)
+	// 内层明文 = 数据 + 真实类型，**拼完就地加密**。
+	//
+	// 原来是两次分配：一次给内层明文（整段拷贝一遍），一次给密文。
+	// 一替一算下来，一条 16KB 的记录要分配 32KB、拷两遍；300KB 的响应
+	// 按记录切就是 19 遍，光这两处 600KB 的分配——量出来的话，300KB
+	// 静态文件过 TLS 这个场景服务端 8 秒分配 76GB。
+	//
+	// crypto/cipher 明确支持原地加密（Seal 的文档："To reuse plaintext's
+	// storage for the encrypted output, use plaintext[:0] as dst"），
+	// 所以一次分配到位（多留一个认证标签的位置），然后把 buf[:0] 当 dst。
+	buf := make([]byte, 0, len(plaintext)+1+p.aead.Overhead())
+	buf = append(buf, plaintext...)
+	buf = append(buf, innerType)
 
 	nonce := p.nonce()
 	// 外层长度 = 内层长度 + 认证标签
-	ad := additionalData(0x0303, len(inner)+p.aead.Overhead())
+	ad := additionalData(0x0303, len(buf)+p.aead.Overhead())
 
-	out := p.aead.Seal(nil, nonce, inner, ad)
+	out := p.aead.Seal(buf[:0], nonce, buf, ad)
 	p.seq++
 	return out, nil
 }
