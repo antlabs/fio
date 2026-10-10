@@ -44,6 +44,9 @@ type EventLoop struct {
 	// maxEventNum 是一次 epoll_wait 最多拿多少事件。
 	maxEventNum int
 
+	// stats 是这个循环自己的诊断计数（每个 loop 一份，见 stats.go）。
+	stats stats
+
 	log *slog.Logger
 }
 

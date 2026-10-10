@@ -43,9 +43,6 @@ type MultiEventLoop struct {
 	started int32
 	loopsWg sync.WaitGroup
 	curConn int64
-
-	// stats 是诊断计数（syscall/事件次数），见 stats.go
-	stats stats
 }
 
 // Options
