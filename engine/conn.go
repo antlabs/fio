@@ -725,16 +725,25 @@ func (c *Conn) Writev(a, b []byte) error {
 	// 两段合成一段再给，不是分两次给：拦截器按 TLS 记录分帧，分两次就会
 	// 编成两条记录（多一层 5 字节包头）。
 	if h := c.writeHook(); h != nil {
+		// 小消息拼成一段再给：钩子按 TLS 记录分帧，一段就是一条记录，
+		// 拼到栈上不分配。
 		if total := len(a) + len(b); total <= maxStackWrite {
 			var stack [maxStackWrite]byte
 			n := copy(stack[:], a)
 			copy(stack[n:], b)
 			return h(stack[:total])
 		}
-		all := make([]byte, 0, len(a)+len(b))
-		all = append(all, a...)
-		all = append(all, b...)
-		return h(all)
+		// 大消息**不拼**：拼一次等于"分配一整块 + 把 body 整个 memcpy
+		// 一遍"，而分成两段给只是多一条 TLS 记录的头（5+1+16 = 22 字节）。
+		// 实测（100KB echo over TLS）拼接这条路每次响应分配 100KB，是
+		// 全部堆分配里的一块。
+		if err := h(a); err != nil {
+			return err
+		}
+		if len(b) == 0 {
+			return nil
+		}
+		return h(b)
 	}
 
 	c.mu.Lock()

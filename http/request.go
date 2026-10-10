@@ -41,6 +41,14 @@ type Request struct {
 	ContentLength int64
 }
 
+// maxPreallocBody 是"按 Content-Length 预分配"的上限。
+//
+// Content-Length 是**对端说的**，不能拿来直接当分配依据：声明 1TB 就
+// 分配 1TB，是一句话打垮服务端的办法。这个上限之下的才预分配，之上的
+// 仍旧走 append 慢慢长（真收到那么多数据时本来也得长，但那需要真的发
+// 那么多字节过来）。1MB 覆盖了压测里所有真实场景（8gbit 是 100KB）。
+const maxPreallocBody = 1 << 20
+
 // Get 按名字取一个头，大小写无关。
 //
 // httparser 回调里给的头名是原样的，所以查的时候要逐个比。头一般不到
@@ -104,7 +112,8 @@ func newRequestBuilder(owner *Parser) *requestBuilder {
 // reset 复用 builder（keep-alive 的下一个请求）。
 func (b *requestBuilder) reset() {
 	*b.req = Request{
-		Header:        b.req.Header, // map 留着复用
+		Header:        b.req.Header,   // map 留着复用
+		Body:          b.req.Body[:0], // 容量留着，和 Header 一个道理
 		ContentLength: -1,
 	}
 	for k := range b.req.Header {
@@ -169,6 +178,16 @@ func (b *requestBuilder) setting(p *Parser) *httparser.Setting {
 			if cl, ok := b.req.Get("Content-Length"); ok {
 				if n, err := strconv.ParseInt(cl, 10, 64); err == nil {
 					b.req.ContentLength = n
+					// 体的大小这里就知道，别让它一路 append 长过去：
+					// 100KB 的请求体会把 16K→32K→64K→128K 重分配一遍，
+					// 每步都带一次整段 memcpy。一次到位。
+					//
+					// 只在比自己现在这块大的时候才动——上限也得有，
+					// Content-Length 是对端说的，一个 1TB 的声明不该
+					// 变成一次 1TB 的分配。
+					if n > int64(len(b.req.Body)) && n <= maxPreallocBody {
+						b.req.Body = make([]byte, 0, n)
+					}
 				}
 			}
 		},

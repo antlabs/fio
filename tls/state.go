@@ -759,8 +759,14 @@ func (sm *StateMachine) Write(plain []byte) ([]byte, error) {
 		return nil, ErrAEADNotReady
 	}
 
-	// 应用数据可以很长，按 maxRecordPayload 切成多条记录
-	var out []byte
+	// 应用数据可以很长，按 maxRecordPayload 切成多条记录。
+	//
+	// 输出大小是算得准的，就别让 append 翻倍长：每条记录的密文 =
+	// 明文 + 1(内层类型) + 16(AEAD 标签)，外面再套 5 字节记录头。一次
+	// 分配到位，省掉的是 16K→32K→64K→128K 那几次重分配和随之而来的
+	// memmove——100KB 的响应走这条路时，这一处占全部堆分配的一大块。
+	nrec := (len(plain) + maxRecordPayload - 1) / maxRecordPayload
+	out := make([]byte, 0, len(plain)+nrec*(recordHeaderLen+1+sm.writeKeys.aead.Overhead()))
 	for len(plain) > 0 {
 		n := len(plain)
 		if n > maxRecordPayload {
@@ -778,13 +784,20 @@ func (sm *StateMachine) Write(plain []byte) ([]byte, error) {
 
 // ReadPlaintext 取解出来的应用数据。
 //
-// 返回的切片所有权归调用方。
+// **返回的切片只在下一次 Feed/ReadPlaintext 之前有效**（底层数组是状态机
+// 自己的，下一批明文的 append 会覆盖它），要留着就自己拷一份。
+//
+// 原来是"返回之后置 nil"——所有权整个交出去，听起来干净，代价是每批明文
+// 都从零长一遍：100KB 的请求体按 16KB 一条记录进来，append 要把
+// 16K→32K→64K→128K 重分配一遍，而每条连接上的请求体大小是稳定的，这批
+// 的容量正好就是下一批需要的。调用方只有 tls.ConnHandler.OnData 一处，
+// 它在同一个函数体里把明文交给内层就返回，不会留存——所以这个契约是够的。
 func (sm *StateMachine) ReadPlaintext() []byte {
 	if len(sm.plaintext) == 0 {
 		return nil
 	}
 	out := sm.plaintext
-	sm.plaintext = nil
+	sm.plaintext = out[:0]
 	return out
 }
 
