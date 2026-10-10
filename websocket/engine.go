@@ -242,8 +242,10 @@ func (h *ConnHandler) InitialReadBufferSize() int {
 // rr/rw 只在本次调用里有效：返回之前会被回退到"最后一个完整帧之后"，
 // 引擎把 rr 之前的字节丢掉，下次 OnData 又是从 0 开始。
 func (c *Conn) parseBuf(ec *engine.Conn, buf []byte) (int, error) {
-	b := buf
-	c.rbuf = &b
+	// 头挂在连接上（c.bufView），不要用局部变量取址：局部那个每消息都会
+	// 逃逸成一次堆分配（实测 6M 消息 132MB）。见结构体里 bufView 的说明。
+	c.bufView = buf
+	c.rbuf = &c.bufView
 	c.rr = 0
 	c.rw = len(buf)
 

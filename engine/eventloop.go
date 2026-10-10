@@ -44,6 +44,9 @@ type EventLoop struct {
 	// maxEventNum 是一次 epoll_wait 最多拿多少事件。
 	maxEventNum int
 
+	// stats 是这个循环自己的诊断计数（每个 loop 一份，见 stats.go）。
+	stats stats
+
 	log *slog.Logger
 }
 
@@ -61,14 +64,21 @@ func (el *EventLoop) Loop() {
 		// 放在 Poll **之前**：OnOpen 要在该连接的任何数据之前跑（协议
 		// 靠它初始化状态）。投递方（Add）保证任务先入队，这里保证它先
 		// 于 Poll 返回的事件被处理。
-		for {
-			select {
-			case f := <-el.tasks:
-				f()
-				continue
-			default:
+		//
+		// 先 len() 看一眼：绝大多数轮次队列是空的（新连接才走这条路），
+		// 空队列时那次 select+default 也要过一次 runtime 的 chanrecv 快
+		// 路径，而这是每轮都要跑的。投递方入队后会 wake 一次，就算这里
+		// 漏看一轮也马上会回来。
+		if len(el.tasks) > 0 {
+			for {
+				select {
+				case f := <-el.tasks:
+					f()
+					continue
+				default:
+				}
+				break
 			}
-			break
 		}
 		// **超时必须是"永久等"（-1），不能是 100ms 这种小超时**。
 		//
@@ -154,6 +164,21 @@ func (el *EventLoop) Loop() {
 				return
 			}
 
+			// 开了 worker 池就把这一轮事件交给连接归属的 worker，见
+			// worker.go：fd 固定分片，同一条连接的事件还是串行的（busy
+			// 位继续兜底，撞上就记 pending）。
+			//
+			// 上面那条 EOF 路不走移交：它要读最后一段数据再关连接，
+			// 就地做完更简单，而且它本来就不在热路径上。
+			if el.parent.pool != nil {
+				el.parent.pool.nodeFor(fd).push(task{
+					c:       c,
+					isRead:  state.IsRead(),
+					isWrite: state.IsWrite(),
+				})
+				return
+			}
+
 			// 一个连接同时只有一个人在处理。处理期间又来的事件记在
 			// pending 位上，处理完的那个取走再跑一轮——ET 的边缘只来
 			// 一次，丢了就再也没有通知，连接会卡住。
@@ -196,7 +221,7 @@ func (el *EventLoop) processConn(c *Conn, isRead, isWrite bool) {
 		//
 		// 这条路径实测撞到过：Add 返回后立刻有数据的连接（客户端连上
 		// 就发）在 -race 下必报 http2.ConnHandler.conn 的竞争。
-		el.activate(c) // 幂等
+		el.activateBusy(c) // 调用方已经持有 busy，见 activateBusy
 		if c.IsClosed() {
 			return
 		}
@@ -256,6 +281,11 @@ func (el *EventLoop) readAndDispatch(c *Conn) error {
 			break
 		}
 	}
+
+	// 轮末把读缓冲区还回池子（见 ReleaseReadBuf）。不还的话连接会在
+	// "两批之间"攥着它——10000 连接的 Pipeline 负载下就是每连接 15KB
+	// 常驻（实测堆上 180MB）。
+	c.ReleaseReadBuf()
 
 	// 读出错（含对端关了）：缓冲区已经空了，可以把错误交给上层了
 	if readErr != nil {

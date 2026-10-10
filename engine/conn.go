@@ -91,10 +91,15 @@ type Conn struct {
 	// 不实现 ReadBufferSizer 的协议是 0。
 	initRbSize int
 
-	// keepReadBuf 表示当前这块 rbuf 是"起始大小那一档"，全消费完可以留着
-	// 下轮接着用（省一次池往返）。一旦长过（growReadBuffer/growToNextMessage
-	// 换了更大的块）就清掉——长过的留着会变成每连接常驻，见 ConsumeRead。
-	keepReadBuf bool
+	// grewToBatch 表示这条连接的读缓冲区因为"一次读装满"长到过
+	// batchReadBufferSize 那一档（见 growReadBuffer）。之后每轮 Read 直接
+	// 按这一档取，省掉"先取一块起始大小的、装满、再换大的"那一步：
+	// 每批少一次读系统调用、少一次 memcpy、少两次池操作。
+	//
+	// **只记这一档**。协议大报文翻倍长上去的那种块不记（它们可能很大，
+	// 记下来就成了每连接常驻一块大的）；这一档的块每轮结束就还回池子
+	// （见 ReleaseReadBuf），不常驻。
+	grewToBatch bool
 
 	// mu 保护 rbuf/wbufList: Close 可能从任意 goroutine 来, 它要在锁里
 	// 释放这两块内存。
@@ -130,6 +135,18 @@ const (
 	// 事件循环正在处理这条连接, 它手上还捏着读缓冲区里的一段(零拷贝的
 	// payload 就是它的一段)。释放交给这一轮结束时的 unbusy, 见 closeWith。
 	flagFreePending uint32 = 1 << 6
+
+	// flagHasWbuf 表示写缓冲里有积压（wbufList 非空）。
+	//
+	// 给 FlushIfNeeded 做无锁门槛用：可写事件每条消息都可能有（ET 下
+	// EPOLLOUT 常和 EPOLLIN 一起报上来），而绝大多数时候写缓冲是空的——
+	// 没有这个位就得为了"看一眼空不空"拿一次锁（实测 1KB echo 里占
+	// 0.5% CPU）。
+	//
+	// **设置和清除都在 c.mu 里**（和 wbufList 一起改），读的不加锁：
+	// 读到过期的 1 最多白拿一次锁（锁里再查一遍），而列表非空时这个位
+	// 一定是 1——不会漏掉该做的 flush。
+	flagHasWbuf uint32 = 1 << 7
 )
 
 // Init 初始化一条连接。fd 必须是已经设成非阻塞的 socket。
@@ -142,7 +159,7 @@ func (c *Conn) Init(fd int, h Handler, parent *EventLoop) {
 	c.rbuf = nil
 	c.rr, c.rw = 0, 0
 	c.wbufList = c.wbufList[:0]
-	c.keepReadBuf = false
+	c.grewToBatch = false
 	// 起始读缓冲区大小问一次协议就够，之后不再变——热路径上（ConsumeRead）
 	// 要拿它判断"这块是不是起始大小那块、能不能留"，每消息一次接口断言不划算。
 	c.initRbSize = 0
@@ -299,11 +316,14 @@ func (c *Conn) Read() (int, error) {
 	c.mu.Unlock()
 
 	if c.rbuf == nil {
-		// 起始那块用完之后可以留着复用（见 ConsumeRead）。池按档位给，
-		// 拿到的比请求的大一点，所以记的是"这块就是起始档"这个事实，
-		// 不是长度本身。
-		c.rbuf = bytespool.GetBytes(c.initialReadBufSize())
-		c.keepReadBuf = true
+		// 长到过一批大小的连接（grewToBatch）直接按那一档取：不然每批
+		// 都要"取 2KB -> 装满 -> 换 15KB"走一遍，白多一次读系统调用和
+		// 一次 memcpy。取到之后轮末还回池子（见 ReleaseReadBuf）。
+		size := c.initialReadBufSize()
+		if c.grewToBatch {
+			size = batchReadBufferSize
+		}
+		c.rbuf = bytespool.GetBytes(size)
 	}
 
 	total := 0
@@ -437,25 +457,35 @@ func (c *Conn) ConsumeRead(n int) {
 	// 卡住（h2spec 复现过：同一个用例十次里挂一两次，而明文模式
 	// 100% 通过）。
 	//
-	// 所以只把索引推到底；真正的释放留给下一次 Read（那时候上一轮的
-	// 栈肯定已经退干净了）和 Close。
-	//
-	// **起始那一档的缓冲区留着下次接着用**（keepReadBuf，见 Read）：
-	// echo 这种"一条一条"的负载，缓冲区就是起始那 ~2KB，每消息都"还回
-	// 池子再取一块新的"是三笔开销——一次 PutBytes、一次 GetBytes、以及
-	// 池子每处理一次消息就多攒一块驻留内存（sync.Pool 按 P 缓存，实测
-	// 10000 连接下多留 29MB）。基线（迁移前）本来就是每连接持有一块不再
-	// 还的，这里对齐它。
-	//
-	// **长过的（growReadBuffer/growToNextMessage 换过更大的）一律还**——
-	// 见 growReadBuffer 里那段：留着会变成每连接常驻一块大的（Pipeline
-	// 实测 176MB 留在池子里，基线只有 58MB）。
-	if c.rbuf != nil && c.keepReadBuf {
-		c.releaseReadBuf = false
+	// 所以这里只把索引推到底、记个"该还了"；真正的释放放在轮末
+	// （ReleaseReadBuf，OnData 已经返回、栈退干净了）兜底在下一次 Read。
+	c.releaseReadBuf = true
+}
+
+// ReleaseReadBuf 把读缓冲区当场还回池子。**每一轮 OnData 全部跑完之后
+// 调**（事件循环的轮末，见 readAndDispatch）。
+//
+// 为什么不留在连接上、等下一次 Read 再还：留着的话，"这一批读完"到
+// "下一批到来"之间的整段空闲里，每条连接都攥着一块。Pipeline 压测
+// （10000 连接，每 5ms 一批 10KB，缓冲区长到 15KB 那一档）实测堆上
+// **180MB** 全是这个（`Read -> growReadBuffer` 一条路径），RSS 从基线的
+// 55MB 涨到 375MB；echo 那种"每连接一块 2KB 起始块"也值 20MB 堆、约
+// 35MB RSS——每一档都不划算，统一还回池子。常驻涨上去之后 GC 目标跟着
+// 涨，连池子里那些都没人清，滚雪球。
+//
+// 时机是安全的：OnData 已经返回，协议手上没有这块内存的别名了（零拷贝
+// payload 只在 OnData 调用期间有效，这是引擎和协议的约定）。
+func (c *Conn) ReleaseReadBuf() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.rbuf == nil || c.rr != c.rw {
+		// 还没开始读，或者还有没消费的数据（半条帧），留着。
 		return
 	}
-
-	c.releaseReadBuf = true
+	bytespool.PutBytes(c.rbuf)
+	c.rbuf = nil
+	c.rr, c.rw = 0, 0
+	c.releaseReadBuf = false
 }
 
 // maxReadBufferSize 是读缓冲区能长到多大。
@@ -529,9 +559,6 @@ func (c *Conn) EnsureReadSpace(n int) bool {
 			want = maxReadBufferSize
 		}
 		c.rbuf = bytespool.GetBytes(want)
-		// 这是"按报文大小要到的一块"，比起始档可能大很多——不算可复用的
-		// 起始块，消费完要还（见 ConsumeRead）。
-		c.keepReadBuf = false
 		return cap(*c.rbuf)-c.rw >= n
 	}
 
@@ -565,7 +592,6 @@ func (c *Conn) EnsureReadSpace(n int) bool {
 	nb := bytespool.GetBytes(need)
 	copy(*nb, (*old)[:c.rw])
 	c.rbuf = nb
-	c.keepReadBuf = false
 	bytespool.PutBytes(old)
 	return len(*c.rbuf)-c.rw >= n
 }
@@ -636,18 +662,34 @@ func (c *Conn) growReadBuffer() bool {
 	}
 
 	old := c.rbuf
+	// **这块一定得比现在的大**。池按 1KB 分档给货：要 16KB 拿回来的是
+	// 15374，而 cur 可能已经就是 15374 了（上一跳从池里拿的这一档），
+	// "换了等于没换"——调用方（Read）看到长成功会再走一轮，缓冲区还是
+	// 满的，就是死循环。对端一次发来 ≥15KB、把这一档读满时 100% 复现
+	// （-rbs 16384 的压测客户端两个批次并到一起就是 20KB）。
 	nb := bytespool.GetBytes(want)
+	for len(*nb) <= cur {
+		bytespool.PutBytes(nb)
+		if want >= maxReadBufferSize {
+			return false
+		}
+		want *= 2
+		if want > maxReadBufferSize {
+			want = maxReadBufferSize
+		}
+		nb = bytespool.GetBytes(want)
+	}
+
+	if want == batchReadBufferSize {
+		// 长到的就是"一批大小"那一档：记下来，后面每轮直接按它取，
+		// 省掉"取一块小的、装满、再换大的"（见 grewToBatch）。
+		c.grewToBatch = true
+	}
 	copy(*nb, (*old)[:c.rw])
 	c.rbuf = nb
-	// **长过起始大小就不再算"可复用"**（keepReadBuf 清掉，全消费完还回
-	// 池子）。留下的只能是起始那一档——它小（~2KB），每连接一块也就
-	// 20MB 级别，和基线一样。
-	//
-	// 试过"长到一批大小(16KB)也留着"：echo 场景确实省池往返，但 Pipeline
-	// 场景每条连接都会长到 16KB 并留着，**10000 连接变成 160MB 常驻**
-	// （实测 bytespool 里 176MB），而基线是每消费完就还、稳定在 58MB。
-	// 拿一批大小的内存换那点池往返不划算。
-	c.keepReadBuf = false
+	// 长过之后的块一律不常驻：每轮结束当场还回池子，见 ReleaseReadBuf。
+	// （试过"长到一批大小(16KB)就留着"：echo 省一次池往返，但 Pipeline
+	// 每条连接都长到那一档并留着，**10000 连接 160MB 常驻**。）
 	bytespool.PutBytes(old)
 	if c.parent != nil {
 		c.parent.addRealloc()
@@ -827,6 +869,11 @@ func (c *Conn) Flush() error {
 // 这里有写缓冲的概率很低（echo 的写都是当场写完的），所以热路径基本就是
 // "拿锁 -> 看一眼是空的 -> 放锁"，比两次少一半。
 func (c *Conn) FlushIfNeeded() error {
+	// 无锁看一眼：没有积压就直接走（绝大多数可写事件都是这种，白拿一次
+	// 锁不值）。这个位可能过期成 1，锁里还会再查一遍，不影响正确性。
+	if atomic.LoadUint32(&c.packed)&flagHasWbuf == 0 {
+		return nil
+	}
 	if c.IsClosed() {
 		return nil
 	}
@@ -870,6 +917,8 @@ func (c *Conn) flushLocked() error {
 		return err
 	}
 	c.wbufList = c.wbufList[:0]
+	// 空了，清掉"有积压"那个位（见 flagHasWbuf）
+	atomic.AndUint32(&c.packed, ^flagHasWbuf)
 	return nil
 }
 
@@ -914,6 +963,7 @@ func (c *Conn) appendToWbufList(data []byte, oldLen int) {
 	if len(data) == 0 {
 		return
 	}
+	atomic.OrUint32(&c.packed, flagHasWbuf)
 	if len(c.wbufList) == 0 {
 		nb := bytespool.GetBytes(len(data) + oldLen)
 		copy(*nb, data)
@@ -1016,9 +1066,9 @@ func (c *Conn) releaseBuffersLocked() {
 		}
 	}
 	c.wbufList = c.wbufList[:0]
+	atomic.AndUint32(&c.packed, ^flagHasWbuf)
 	c.rr, c.rw = 0, 0
 	c.releaseReadBuf = false
-	c.keepReadBuf = false
 }
 
 // ---------------------------------------------------------------------------
@@ -1072,16 +1122,6 @@ func (c *Conn) takePendingRead() bool {
 
 func (c *Conn) takePendingWrite() bool {
 	return atomic.AndUint32(&c.packed, ^flagPendingWrite)&flagPendingWrite != 0
-}
-
-// isActivated OnOpen 跑过了没有。
-func (c *Conn) isActivated() bool { return atomic.LoadUint32(&c.packed)&flagActivated != 0 }
-
-// setActivated 标记 OnOpen 跑完了。返回"之前有没有待处理的事件"
-// ——有的话调用方要接着处理（见 eventloop 里 activate 的用法）。
-func (c *Conn) setActivated() (pendingRead, pendingWrite bool) {
-	old := atomic.OrUint32(&c.packed, flagActivated)
-	return old&flagPendingRead != 0, old&flagPendingWrite != 0
 }
 
 // cork 相关的 isCorking/setCorking 在 cork.go 里（那边有完整说明）。

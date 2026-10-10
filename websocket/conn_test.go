@@ -47,8 +47,10 @@ func Test_Conn(t *testing.T) {
 		// conn大小改变历史
 		// 新增上下文接管，从 小于160到184
 		// 把Callback移到Conn, 从184到200
+		// bufView/payloadView 挂到连接上（不再每消息堆分配两个切片头），
+		// 从 192 到 240：10000 连接多 480KB，换掉每消息两次堆分配
 		fmt.Printf("conn.size = %d\n", unsafe.Sizeof(Conn{}))
-		if unsafe.Sizeof(Conn{}) > 216 {
+		if unsafe.Sizeof(Conn{}) > 256 {
 			t.Errorf("Conn size:%d is too large", unsafe.Sizeof(Conn{}))
 		}
 	})

@@ -64,7 +64,28 @@ type Conn struct {
 	// rbuf/rr/rw 是**借来的视图**：OnData 进来时指向引擎给的那段缓冲区，
 	// 返回前还原。解析代码原来是按"buf + 读/写两个游标"写的，保留同样的
 	// 形状，那些代码就一行都不用改。
-	rbuf                 *[]byte            // 借来的读缓冲区（只在 OnData 期间有效）
+	//
+	// readTimeout 是配置里那个读超时，建连时抄一份到连接上（迁移前也是
+	// 建连时抄一份，语义一致）。**不能每消息从 Config 上读**：`c.readTimeout`
+	// 走的是嵌入的 *Config 指针，多一跳，profile 里这一行的加载每消息要
+	// 100ns 上下（1KB echo 实测 1.51s / 8s 窗口，占 1.9% CPU）。抄到这片
+	// 热区（和 rbuf/rr/rw 同一两行）就没了。
+	readTimeout time.Duration
+	rbuf        *[]byte // 借来的读缓冲区（只在 OnData 期间有效）
+
+	// bufView / payloadView 是给 c.rbuf 和 frame.Payload 用的切片头。
+	//
+	// **必须挂在连接上，不能让局部变量取址**：parseBuf 里原来是
+	// `b := buf; c.rbuf = &b`、readPayload 里是 `payload := ...;
+	// f.Payload = &payload`，那两个局部变量每消息都逃逸成一次堆分配
+	// （实测 1KB echo 6M 消息：parseBuf 132MB + readPayload 118MB，
+	// 全是 24 字节的切片头）。连接的处理是串行的（一条连接同一时间只有
+	// 一个 goroutine 碰它），这两个头挂在连接上不会有并发问题。
+	//
+	// payloadView 只给"零拷贝"那条路用；拷贝那条路直接用池给出来的那块
+	// 自己的头（见 readPayload）。
+	bufView              []byte
+	payloadView          []byte
 	rr                   int                // rbuf 读索引
 	rw                   int                // rbuf 写索引
 	lenAndMaskSize       int                // payload长度和掩码的长度
@@ -94,6 +115,8 @@ func newConn(ec *engine.Conn, client bool, conf *Config) *Conn {
 	c := &Conn{
 		ec:     ec,
 		Config: conf,
+		// 配置里那个值抄一份到连接上，热路径每消息读它（见结构体里那段）
+		readTimeout: conf.readTimeout,
 	}
 	if client {
 		c.setClient(true)
