@@ -53,9 +53,13 @@ func defEventWorkers() int {
 
 // taskRingSize 是每个 worker 的队列长度。
 //
-// 装单个任务，所以这个值就是"能积压多少个连接"。取 8192：够吸收几轮
-// epoll 的突发（maxEventNum 是 1000），又不至于让环本身太大。
-const taskRingSize = 8192
+// 装单个任务，所以这个值就是"能积压多少个连接"。1024 倍于一次
+// epoll_wait 能拿的事件数（maxEventNum 是 256），够吸收突发。
+//
+// **不能开大**：环是 make 出来的，一格 32 字节（seq + 任务），
+// 20 个 worker 每个 8192 格就是 5MB 常驻（实测 echo 内存 56M -> 61M，
+// 比不开池子还高）。1024 格 -> 640KB。
+const taskRingSize = 1024
 
 // task 是"某条连接有一轮事件要处理"。
 type task struct {
