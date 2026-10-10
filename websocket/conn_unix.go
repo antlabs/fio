@@ -71,13 +71,13 @@ type Conn struct {
 	rh                   frame.FrameHeader  // frame头部
 	fragmentFramePayload *[]byte            // 存放分片帧的缓冲区
 	fragmentFrameHeader  *frame.FrameHeader // 存放分段帧的头部
-	// curState / client 压进一个 uint32:
-	//
-	//	bit 0-1  curState（帧头解析的状态机）
-	//	bit 2    client
-	//
-	// busy / pendingRead / pendingWrite / corking 以前也在这几个位里，
-	// 现在归 engine 管——那些是"这条连接正被谁处理"的调度状态，和协议无关。
+	// curState 是帧头解析状态机（普通字段，只在事件循环 goroutine 上碰，
+	// 见 conn_core.go 里 getCurState/setCurState 的说明）。
+	curState frameState
+
+	// packed 只剩 client 一位（bit 0）。busy / pendingRead / pendingWrite /
+	// corking 以前也在这几个位里，现在归 engine 管——那些是"这条连接正被
+	// 谁处理"的调度状态，和协议无关。
 	packed uint32
 
 	// mu2 由 onCloseOnce 使用, 用新锁只是为了简化维护的难度
