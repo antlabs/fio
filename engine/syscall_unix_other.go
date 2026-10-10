@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//go:build darwin || netbsd || freebsd || openbsd || dragonfly
+//go:build netbsd || freebsd || openbsd || dragonfly
 
 package engine
 
@@ -27,6 +27,9 @@ import "golang.org/x/sys/unix"
 //
 // 这里不受 fio_recvsend 标签影响: 该标签只用来在 Linux 上切换
 // 两套实现, 这些平台上两套本来就是同一套。
+//
+// **darwin 已经从这个文件里分出去了**（见 syscall_darwin.go）：它的
+// socketWritev 换成了真的 writev，所以要多一份只在那个平台上编译的实现。
 
 func socketRead(fd int, p []byte) (int, error) {
 	return unix.Read(fd, p)
