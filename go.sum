@@ -1,5 +1,3 @@
-github.com/antlabs/httparser v0.0.11 h1:aV8KDf4PIKfAfiOM474bdrctiZlaFD+9vgMDJmfdTfk=
-github.com/antlabs/httparser v0.0.11/go.mod h1:6F22hxlYDhStl6HI822QGB0TUNzOfBpNX5ige0gQrL4=
 github.com/antlabs/pulse v0.0.0-20261007064121-2127031031e2 h1:u4ja6lULCPPWZudtKCHfxSyIzmc3OJs88CgtxmT0lXA=
 github.com/antlabs/pulse v0.0.0-20261007064121-2127031031e2/go.mod h1:CR7Uwu/iaQvySMEXk44joshcjkxDS6hRFW8lp8Zq8rg=
 github.com/antlabs/task v0.1.0 h1:Dw6loTr/zHv8q8z/S3CIeDEFF+pnMhOBCXcNDTPTG0k=

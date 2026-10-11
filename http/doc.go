@@ -17,20 +17,23 @@
 // 事件循环、连接 io、缓冲区、任务池复用 websocket/ 里的引擎，这个包只负责
 // "这些字节是一个 HTTP 请求/响应"。
 //
-// 报文解析用 github.com/antlabs/httparser，不自己写：
+// 报文解析是**自己写的**（见 parse.go）：
 //
-//   - 它是回调式的（Execute(setting, buf) 边解析边回调），这个形状正好对得上
-//     非阻塞 io——数据分几次到就喂几次，不用攒够一个完整报文再解
-//   - 它有 ReadyUpgradeData()，专认从 HTTP 升级到别的协议（websocket 就是
-//     这么升的），不用自己判 Upgrade 头
-//   - 它做过安全边界（MaxHeaderSize），不用重新踩一遍头无限大的坑
+//   - 增量：数据分几次到就喂几次，头块没读完时一个字节都不消费（那半个
+//     方法名不能丢），不用攒够一个完整报文再解
+//   - 解完一条就停：keep-alive 的下一个请求留在调用方的缓冲区里，等
+//     Reset 之后再喂
+//   - 直接填 Request，不走回调——回调式那套（每个 token 一次闭包调用，
+//     再在闭包里验收）在 profile 里占了一半以上
+//   - 头的上限（maxHeaderSize）自己判，ErrHeaderTooLarge / ErrBadMessage
+//     两种错误分开
+//   - Upgrade 头自己认（websocket 握手就是升到这个：Parser.Upgrade()）
 //
 // 规划中的内容：
 //
-//   - 请求解析：接 httparser 的 Setting 回调，攒出 Request
 //   - 响应写出：复用引擎的部分写和积攒（写不出去的部分交给可写事件）
 //   - keep-alive：一个连接上顺序处理多个请求
-//   - 升级：ReadyUpgradeData() 为真时把连接交给 websocket 包
+//   - 升级：Upgrade() 为真时把连接交给 websocket 包
 //
 // 还没开始。
 package http

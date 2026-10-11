@@ -14,16 +14,10 @@
 
 package http
 
-import (
-	"strconv"
-
-	"github.com/antlabs/httparser"
-)
-
 // Request 是一个解析好的 HTTP/1.1 请求。
 //
-// 字段是从 httparser 的回调里攒出来的。Method、Target、Proto 这些在
-// MessageComplete 之后就不再变，可以直接持有；Body 是攒出来的副本。
+// 字段由 Parser（见 parse.go）直接填好，不是从回调里攒的。Request 在
+// 下一次 Reset 之前一直有效；Body 是攒出来的副本。
 type Request struct {
 	Method string // "GET"、"POST" ... 原样
 	Target string // 请求目标，原样（/path?query、绝对 URI、* 都可能）
@@ -51,8 +45,8 @@ const maxPreallocBody = 1 << 20
 
 // Get 按名字取一个头，大小写无关。
 //
-// httparser 回调里给的头名是原样的，所以查的时候要逐个比。头一般不到
-// 20 个，线性扫比建一个大小写无关的 map 便宜。
+// 报文里的头名是原样的，所以查的时候要逐个比。头一般不到 20 个，线性扫
+// 比建一个大小写无关的 map 便宜。
 func (r *Request) Get(name string) (string, bool) {
 	for k, v := range r.Header {
 		if equalFold(k, name) {
@@ -89,178 +83,3 @@ const (
 	proto11 = "HTTP/1.1"
 	proto10 = "HTTP/1.0"
 )
-
-// requestBuilder 把 httparser 的回调攒成一个 Request。
-//
-// httparser 的回调是按字节流切的（URL 可能回调多次、头名和头值分开回调），
-// 所以这里要自己拼。拼的目标是一个 Request，不是把回调原样转出去——
-// 调用方拿到的应该是"一个请求"，不是"一串解析事件"。
-type requestBuilder struct {
-	req *Request
-
-	// 当前正在拼的头。HeaderField 给名字，HeaderValue 给值，中间可能
-	// 隔着多次回调。
-	curField []byte
-
-	// 解析器的状态由这里回写：MessageComplete 和 ReadyUpgradeData 是
-	// "报文结束"的信号，只有回调里才知道。
-	owner *Parser
-}
-
-func newRequestBuilder(owner *Parser) *requestBuilder {
-	return &requestBuilder{
-		req: &Request{
-			Header:        make(map[string]string, 8),
-			ContentLength: -1,
-		},
-		owner: owner,
-	}
-}
-
-// reset 复用 builder（keep-alive 的下一个请求）。
-func (b *requestBuilder) reset() {
-	*b.req = Request{
-		Header:        b.req.Header,   // map 留着复用
-		Body:          b.req.Body[:0], // 容量留着，和 Header 一个道理
-		ContentLength: -1,
-	}
-	for k := range b.req.Header {
-		delete(b.req.Header, k)
-	}
-	b.curField = b.curField[:0]
-}
-
-// setting 返回 httparser 的 Setting，闭包捕获这个 builder。
-//
-// 每个连接一个 builder，回调里不分配。
-func (b *requestBuilder) setting(p *Parser) *httparser.Setting {
-	return &httparser.Setting{
-		// 注意：**不要**在 MessageBegin 里读 p.Major/p.Minor——那时候还是
-		// 0（版本号要等请求行解完才填），写出来是 "HTTP/0.0"。踩过一次：
-		// wantClose 按版本判断 keep-alive，proto 永远是 0.0 导致每个请求
-		// 都被当成 HTTP/1.0 关连接，pipelining 的响应全丢。
-		//
-		// 版本在 HeadersComplete 里读（见下面）。
-
-		URL: func(_ *httparser.Parser, buf []byte, _ int) {
-			// URL 可能回调多次（分段到的），累加。
-			//
-			// 但第一条报文完成之后不能再累加：httparser 的 Execute 会把
-			// 整个 buf 里的报文一次解完，一个 buf 里有两个请求时，第二个
-			// 请求的 URL 回调也会来。不收的话 Target 会变成 "/a/b"
-			// （实测）。
-			if b.owner.done {
-				return
-			}
-			// **单段时别走 `+=`**：`Target` 在 reset 之后是空串，`"" + s`
-			// 和 `s` 是同一个值，但 `+=` 会让编译器按"可能拼接"处理。
-			// URL 分段到多次回调是少数（只有超长或分包时才会）。
-			if len(b.req.Target) == 0 {
-				b.req.Target = string(buf)
-				return
-			}
-			b.req.Target += string(buf)
-		},
-		HeaderField: func(_ *httparser.Parser, buf []byte, _ int) {
-			if b.owner.done {
-				return
-			}
-			// 头名可能分段，攒着
-			b.curField = append(b.curField[:0], buf...)
-		},
-		HeaderValue: func(_ *httparser.Parser, buf []byte, _ int) {
-			if b.owner.done {
-				return
-			}
-			if len(b.curField) == 0 {
-				return
-			}
-			// **不要先把 string(b.curField) 存进变量再查**：Go 对
-			// `m[string(bs)]` 这种查找有专门优化（不分配），一旦赋给变量
-			// 就退化成"先分配一个 string 再查"。头名在一条连接上是重复的
-			// （keep-alive 每个请求都是那几行），所以这里每次都命中、每次
-			// 都白分配一个。
-			//
-			// 实测（baseline）：这个回调占 2.32%，是和 fib 差距（5.8%）里
-			// 最大的一块。
-			if last, ok := b.req.Header[string(b.curField)]; ok {
-				// 同名头重复出现，用逗号合并（RFC 9110 的规矩）
-				b.req.Header[string(b.curField)] = last + ", " + string(buf)
-				return
-			}
-			b.req.Header[string(b.curField)] = string(buf)
-		},
-		HeadersComplete: func(p *httparser.Parser, _ int) {
-			if b.owner.done {
-				return
-			}
-			// 版本到这儿才准（请求行解完才有）。
-			//
-			// **别每次拼字符串**：原来是
-			// `"HTTP/" + strconv.Itoa(Major) + "." + strconv.Itoa(Minor)`——
-			// 两次 Itoa 加一次拼接，**每个请求三个堆分配**。1.0/1.1 之外
-			// 的版本在这条路上几乎不存在，直接查表；真遇到了才拼。
-			//
-			// 实测（baseline，gcannon 混合 GET/POST）：这个回调占 1.86%，
-			// 而和 fib 的差距总共才 7.3%。
-			switch {
-			case p.Major == 1 && p.Minor == 1:
-				b.req.Proto = proto11
-			case p.Major == 1 && p.Minor == 0:
-				b.req.Proto = proto10
-			default:
-				b.req.Proto = "HTTP/" + strconv.Itoa(int(p.Major)) + "." + strconv.Itoa(int(p.Minor))
-			}
-			b.req.Method = p.Method.String()
-			if cl, ok := b.req.Get("Content-Length"); ok {
-				if n, err := strconv.ParseInt(cl, 10, 64); err == nil {
-					b.req.ContentLength = n
-					// 体的大小这里就知道，别让它一路 append 长过去：
-					// 100KB 的请求体会把 16K→32K→64K→128K 重分配一遍，
-					// 每步都带一次整段 memcpy。一次到位。
-					//
-					// 只在比现在这块**容量**小的时候才不动——上限也得有，
-					// Content-Length 是对端说的，一个 1TB 的声明不该
-					// 变成一次 1TB 的分配。
-					//
-					// **看的是 cap 不是 len**。原来写的是 len，而 reset()
-					// 刚把 Body 截成 [:0]，所以这里永远是 0、条件恒真——
-					// 每来一个带 body 的请求就把上一块热缓冲丢掉、重新分配
-					// 一块 Content-Length 大小的，等于每请求一次大分配。
-					//
-					// 实测（8gbit，10KB body，50K req/s）：这一处占**全部
-					// 堆分配的 96%**（2 秒 932MB 的分配量），而整个请求才
-					// ~19µs——省下来的是 GC 的扫描和清零，约占 21%。
-					if n > int64(cap(b.req.Body)) && n <= maxPreallocBody {
-						b.req.Body = make([]byte, 0, n)
-					}
-				}
-			}
-		},
-		Body: func(_ *httparser.Parser, buf []byte, _ int) {
-			if b.owner.done {
-				return
-			}
-			b.req.Body = append(b.req.Body, buf...)
-		},
-		MessageComplete: func(hp *httparser.Parser, offset int) {
-			// 报文结束。Upgrade 的报文(websocket 握手)是"请求结束之后
-			// 连接上还有别的协议的数据", 所以 upgrade 和 done 分开记。
-			//
-			// offset 是报文在 buf 里的结束位置——keep-alive 的一个 buf
-			// 里可能有多个请求, Execute 会把它们全解完, 所以这个边界
-			// 才是调用方要的消化量, 见 Parser.endOffset。
-			//
-			// 只在第一条上记: 后面那些报文的 offset 会把它覆盖掉, 那样
-			// 返回的消化量就成了"整个 buf 解完的位置"。
-			if b.owner.done {
-				return
-			}
-			b.owner.done = true
-			b.owner.endOffset = offset
-			if hp.Upgrade {
-				b.owner.upgrade = true
-			}
-		},
-	}
-}
