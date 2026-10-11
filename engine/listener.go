@@ -120,7 +120,7 @@ func (l *Listener) Serve() {
 	go func() {
 		defer close(l.done)
 		for {
-			nfd, _, err := unix.Accept(l.lfd)
+			nfd, err := acceptNonblock(l.lfd)
 			if err != nil {
 				select {
 				case <-l.stop:
@@ -134,10 +134,6 @@ func (l *Listener) Serve() {
 					continue
 				}
 				return
-			}
-			if err := unix.SetNonblock(nfd, true); err != nil {
-				unix.Close(nfd)
-				continue
 			}
 			h := l.newFn()
 			if _, err := l.m.Add(nfd, h); err != nil {
