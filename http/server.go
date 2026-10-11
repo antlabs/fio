@@ -256,6 +256,12 @@ func (w *ResponseWriter) buildHeader() {
 			buf = append(buf, v...)
 			buf = append(buf, '\r', '\n')
 		}
+		// 这块头值已经拼进 buf 了，没人再要——留给下一个请求复用
+		// （见 spare / putString）。回收挪到这里是为了让 reset 能用
+		// clear（那个循环里 delete 加 append 比 clear 慢得多）。
+		if len(w.spare) < maxSpareHeaderSlices {
+			w.spare = append(w.spare, values[:0])
+		}
 	}
 	buf = append(buf, '\r', '\n')
 
@@ -652,16 +658,12 @@ func (w *ResponseWriter) reset(c *engine.Conn, proto string) {
 	w.finished = false
 	w.closeAfterWrite = false
 	w.deferred = false
-	// **不 delete 完就算**：把上一个请求用过的头值切片留下来给下一个请求
-	// 复用（见 spare / putString）。语义没变——下一个请求开始时 map 是空的，
-	// 只是那些单元素数组不还回去。
-	w.spare = w.spare[:0]
-	for k, v := range w.header {
-		delete(w.header, k)
-		if len(w.spare) < maxSpareHeaderSlices {
-			w.spare = append(w.spare, v[:0])
-		}
-	}
+	// **用 clear 而不是逐个 delete**：clear 是 runtime 内建，小 map 上比
+	// 遍历 delete 快得多（原来那个循环还要顺便回收头值切片，见下面）。
+	// 实测（baseline，gcannon 混合 GET/POST）：reset 在 profile 里占 3.11%，
+	// 加上 map 的 Iter.Next 2.31% + memHashAES 0.9%，整块 map 操作占了 6.3%
+	// ——而和 fib 的差距只有 10.4%，也就是说这一块占了大头。
+	clear(w.header)
 }
 
 // maxSpareHeaderSlices 是留给下一个请求复用的头值切片上限。
