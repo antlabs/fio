@@ -198,12 +198,20 @@ func appendWindow(dst, a, b []byte, off, n int) []byte {
 // 为什么两条路的拷贝数不一样，是**量出来的**，不是推导出来的：
 //
 //	                static-tls   json-tls   static-h2 / baseline-h2
-//	一遍（这个函数）   -4.9%        -1.3%      **+5.0%**
+//	一遍（这个函数）   -4.9%        -1.3%      **+5.0% / +8.9%**
 //	两遍（seal）        基准         基准         基准
 //
-// h1 的 WriteTwo 走这条路（一次调用就是一条响应，输出缓冲也就是那一条响应），
-// h2 的 Write 走 seal（一次调用里装着多个流的输出，缓冲大得多）。同一件事在
-// 两条路上结论相反，**没有解释清楚**，所以各自用各自量出来更好的那个。
+// h1 的 WriteTwo 走这条路（一次调用就是一条输出缓冲，也就那一条响应），
+// h2 的 Write 走 seal（一次调用的输出缓冲里装着多个流的输出，大得多）。
+//
+// **原因（第二次重测之后想明白了）**：这一版把明文拷进 dst 再原地加密，
+// 加密得从 dst 读回来——**dst 大时读回的是冷数据**；两遍那版让明文落在
+// p.scratch（一条记录的 16KB，复用、热），密文再 append 进输出缓冲。
+// 所以"目标缓冲小 → 一遍好、大 → 两遍好"。
+//
+// 第一次的结论是在 **MTU 65536** 那个病态 regime 下量的（wrk 驱动的档会
+// 掉 20 倍），本来不足为凭；2026-10-12 在 MTU 1500 下重测，h2 仍然
+// **+8.9%**——两次一致，这次也解释得通了，就不再是"没解释清楚的分叉"。
 func (p *recordProtector) sealWindow(dst []byte, innerType uint8, a, b []byte, off, n int) ([]byte, error) {
 	if p.aead == nil {
 		return dst, ErrAEADNotReady
