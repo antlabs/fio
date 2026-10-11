@@ -397,20 +397,27 @@ func (ch *ConnHandler) OnData(c *engine.Conn, buf []byte) (int, error) {
 	}
 	consumed := 0
 
-	// **一次 read 里的多条报文，回包攒成一次写。**
+	// **一次 read 里的多条报文，回包攒成一次写**（见 Conn.StartCork）。
 	//
-	// 客户端 pipelining（一批 16 条）时，一次 read 就把它们都带进来了；
-	// 不攒包的话每条回一次 write，16 条就是 16 次系统调用。攒起来是一
-	// 次（见 Conn.StartCork 的说明和实测）。capHint 给"读缓冲区里还没解
-	// 的字节数"——回包和请求大小差不多。
+	// 但**第一条不攒**：绝大多数请求是"一次 read 一条报文"，那种情况下攒包
+	// 白搭一块缓冲加一次拷贝——实测每请求多 3.7% CPU，lab 上 4096 连接时
+	// 直接吃掉 11% 吞吐。所以等**第二条响应**要写的时候才开始攒：那时候
+	// 已经确定同一轮里还有后续报文，攒了才有意义。
 	//
-	// 攒不了的时候 StartCork 返回 false（已经在攒、写缓冲有积压、TLS
-	// 那层有写拦截器），照常走普通写。
-	if c.StartCork(len(buf)) {
-		// defer：出错的那一轮也要收尾，攒下的回包要在连接关掉之前出去。
-		// （Close 自己也会 flush，这里是让攒包标志位复位。）
-		defer c.EndCork()
-	}
+	// 效果：一条报文时写次数不变；一批 16 条时从 16 次降到 2 次
+	// （第一条直写 + 其余 15 条攒成一次）。
+	//
+	// 攒不了的时候 StartCork 返回 false（已经在攒、写缓冲有积压、TLS 那层
+	// 有写拦截器），照常走普通写。
+	corked := false
+	batch := 0
+	defer func() {
+		if corked {
+			// 出错那一轮也要收尾（Close 自己也会 flush，这里主要让攒包
+			// 标志位复位、缓冲区还回池子）。
+			c.EndCork()
+		}
+	}()
 
 	for consumed < len(buf) {
 		n, err := st.parser.Parse(buf[consumed:])
@@ -440,6 +447,11 @@ func (ch *ConnHandler) OnData(c *engine.Conn, buf []byte) (int, error) {
 			}
 			ch.writeError(c, st, 400, errNoUpgrade)
 			return consumed, errNoUpgrade
+		}
+
+		// 这一轮的第二条报文起开始攒（见上面的说明）。
+		if batch == 1 && !corked {
+			corked = c.StartCork(len(buf) - consumed)
 		}
 
 		// 交给业务处理
@@ -481,6 +493,7 @@ func (ch *ConnHandler) OnData(c *engine.Conn, buf []byte) (int, error) {
 		if err := st.w.finish(); err != nil {
 			return consumed, err
 		}
+		batch++
 
 		// keep-alive？
 		//
