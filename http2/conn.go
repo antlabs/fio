@@ -673,6 +673,44 @@ func (c *Conn) forgetStream(id uint32) {
 	delete(c.streams, id)
 }
 
+// applyLocalEndStreamLocked 我们这边发了 END_STREAM：推进流的状态。
+// 调用方要持 c.mu。
+//
+// **这条路径原来整个是缺的**：`localEnded` 声明了没人写，没有"本地结束"
+// 的状态推进，`CloseStream` 全仓库零调用。于是请求带 END_STREAM 进来把流
+// 推到 HalfClosedRemote 之后，响应带着 END_STREAM 出去就没人再动它——
+// **`c.streams` 每条连接上只涨不消**，每个请求留一个 map 表项 + 一块
+// *Stream 到连接关闭为止。
+//
+// 实测（baseline-h2c，4096 连接 / -m 100 / 5s）：容器峰值内存 **13.3GiB**，
+// 而 fib 同一档是 1.0GiB，h1 上两边都是 ~90MiB。7.34M req/s × 5s ÷ 4096 连接
+// ≈ 每条连接九千个残留表项，量级正好对得上。
+//
+// 只有**两边都发了 END_STREAM**才从表里拿掉。只关了一半的（比如我们先回
+// 404 带 END_STREAM、对端还在传 body）停在 HalfClosedLocal，等对端的
+// END_STREAM 到了由 applyRecvEndStream 收尾——那时候再删，对端也不会再
+// 往这条流上发东西了。
+func (c *Conn) applyLocalEndStreamLocked(s *Stream) {
+	if s == nil || s.localEnded {
+		return
+	}
+	s.localEnded = true
+	switch s.state {
+	case StreamOpen:
+		s.state = StreamHalfClosedLocal
+	case StreamHalfClosedRemote:
+		s.state = StreamClosed
+		c.forgetStream(s.ID)
+	}
+}
+
+// endStreamLocal 发完一个带 END_STREAM 的帧之后调（自己拿锁）。
+func (c *Conn) endStreamLocal(streamID uint32) {
+	c.mu.Lock()
+	c.applyLocalEndStreamLocked(c.streams[streamID])
+	c.mu.Unlock()
+}
+
 // frameKind 是"收到的帧"这种类别（用于状态检查）。
 //
 // 不直接用 FrameType 是因为状态检查关心的是"这类帧允不允许在这个状态
@@ -770,12 +808,20 @@ func (c *Conn) checkStreamRecv(streamID uint32, kind frameKind) error {
 				"%s on half-closed(remote)/closed stream", kindName(kind))
 		}
 	case StreamHalfClosedLocal:
-		// 我们发了 END_STREAM，对端还能继续发（那就是正常的请求体）
-		// ——除了 HEADERS：流已经半关，不能再开一个新的头部块
-		if kind == frameKindHeaders {
-			return streamError(streamID, ErrCodeStreamClosed,
-				"HEADERS on half-closed(local) stream")
-		}
+		// 我们发了 END_STREAM，对端**还能继续发任何帧**。
+		//
+		// RFC 9113 5.1 里 half-closed(local) 限制的是"我们不能再发"，
+		// 不是"对端不能再发"——流要到"收到带 END_STREAM 的帧"才转 closed。
+		//
+		// 这里原来把 HEADERS 也拒了（注释写的是"流已经半关，不能再开新
+		// 头块"），那是错的，而且错在最常见的两条路上：
+		//   - **客户端**：发完请求（带 END_STREAM）之后收到的那条响应头，
+		//     就是打在这个状态上的
+		//   - 任一侧发完 body 之后对端回的 trailer
+		// 以前看不出来，是因为状态机根本不推进到 half-closed(local)
+		// （见 applyLocalEndStreamLocked 的说明），这段是死代码；
+		// 补上推进之后 gRPC 的端到端用例立刻报
+		// "HEADERS on half-closed(local) stream"。
 	}
 
 	// 收到非 HEADERS 帧说明这个流真的在用，记下"对端用过这个 ID"
@@ -1044,7 +1090,13 @@ func (c *Conn) writeHeaderBlock(streamID uint32, block []byte, endStream bool) e
 	first := len(block) <= max
 
 	if first {
-		return c.writeFrame(AppendHeaders(nil, streamID, block, endStream, true))
+		if err := c.writeFrame(AppendHeaders(nil, streamID, block, endStream, true)); err != nil {
+			return err
+		}
+		if endStream {
+			c.endStreamLocal(streamID)
+		}
+		return nil
 	}
 
 	buf := AppendHeaders(nil, streamID, block[:max], endStream, false)
@@ -1059,7 +1111,13 @@ func (c *Conn) writeHeaderBlock(streamID uint32, block []byte, endStream bool) e
 		buf = append(buf, block[:n]...)
 		block = block[n:]
 	}
-	return c.writeFrame(buf)
+	if err := c.writeFrame(buf); err != nil {
+		return err
+	}
+	if endStream {
+		c.endStreamLocal(streamID)
+	}
+	return nil
 }
 
 func boolToFlag(b bool, f uint8) uint8 {
@@ -1129,6 +1187,9 @@ func (c *Conn) writeDataLocked(streamID uint32, data []byte, endStream bool) err
 	max := int(c.peerMaxFrameSize)
 	if len(data) <= max && int32(len(data)) <= c.sendWindow {
 		c.outBuf = AppendData(c.outBuf, streamID, data, endStream)
+		if endStream {
+			c.applyLocalEndStreamLocked(c.streams[streamID])
+		}
 		return nil
 	}
 
@@ -1160,6 +1221,9 @@ func (c *Conn) writeDataLocked(streamID uint32, data []byte, endStream bool) err
 
 		last := n == len(data)
 		c.outBuf = AppendData(c.outBuf, streamID, data[:n], last && endStream)
+		if last && endStream {
+			c.applyLocalEndStreamLocked(c.streams[streamID])
+		}
 
 		c.sendWindow -= int32(n)
 		if s := c.streams[streamID]; s != nil {
@@ -1237,6 +1301,9 @@ func (c *Conn) flushPending() error {
 		last := p.endStream && len(c.pending) == 1
 		if err := c.writeFrameLocked(AppendData(nil, p.streamID, p.data, last)); err != nil {
 			return err
+		}
+		if last {
+			c.applyLocalEndStreamLocked(c.streams[p.streamID])
 		}
 		c.pending[0] = pendingData{}
 		c.pending = c.pending[1:]
