@@ -428,6 +428,16 @@ func (ch *ConnHandler) OnData(c *engine.Conn, buf []byte) (int, error) {
 		}
 		consumed += n
 
+		// **解完第一条就知道后面还有没有报文**：有的话这一轮的回包都值得攒，
+		// 包括马上要写的这一条。没有的话（一次 read 一条，最常见）一个字都
+		// 不攒——攒包要白拿一块池化缓冲加一次拷贝。
+		//
+		// 放在 ServeHTTP **之前**：第一条响应也要进攒包，这样一批 N 条只有
+		// 一次 write（放在之后的话第一条已经直写出去，是 2 次）。
+		if batch == 0 && !corked && consumed < len(buf) {
+			corked = c.StartCork(len(buf) - consumed)
+		}
+
 		if !st.parser.Done() {
 			// 报文还没收全。已经解掉的那些字节算消化了（consumed），
 			// 剩下的（buf[consumed:]）留着——引擎会保留它们，下次多读到
@@ -447,11 +457,6 @@ func (ch *ConnHandler) OnData(c *engine.Conn, buf []byte) (int, error) {
 			}
 			ch.writeError(c, st, 400, errNoUpgrade)
 			return consumed, errNoUpgrade
-		}
-
-		// 这一轮的第二条报文起开始攒（见上面的说明）。
-		if batch == 1 && !corked {
-			corked = c.StartCork(len(buf) - consumed)
 		}
 
 		// 交给业务处理
