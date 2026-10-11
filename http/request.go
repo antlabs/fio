@@ -152,6 +152,13 @@ func (b *requestBuilder) setting(p *Parser) *httparser.Setting {
 			if b.owner.done {
 				return
 			}
+			// **单段时别走 `+=`**：`Target` 在 reset 之后是空串，`"" + s`
+			// 和 `s` 是同一个值，但 `+=` 会让编译器按"可能拼接"处理。
+			// URL 分段到多次回调是少数（只有超长或分包时才会）。
+			if len(b.req.Target) == 0 {
+				b.req.Target = string(buf)
+				return
+			}
 			b.req.Target += string(buf)
 		},
 		HeaderField: func(_ *httparser.Parser, buf []byte, _ int) {
@@ -165,16 +172,23 @@ func (b *requestBuilder) setting(p *Parser) *httparser.Setting {
 			if b.owner.done {
 				return
 			}
-			name := string(b.curField)
-			if name == "" {
+			if len(b.curField) == 0 {
 				return
 			}
-			if last, ok := b.req.Header[name]; ok {
+			// **不要先把 string(b.curField) 存进变量再查**：Go 对
+			// `m[string(bs)]` 这种查找有专门优化（不分配），一旦赋给变量
+			// 就退化成"先分配一个 string 再查"。头名在一条连接上是重复的
+			// （keep-alive 每个请求都是那几行），所以这里每次都命中、每次
+			// 都白分配一个。
+			//
+			// 实测（baseline）：这个回调占 2.32%，是和 fib 差距（5.8%）里
+			// 最大的一块。
+			if last, ok := b.req.Header[string(b.curField)]; ok {
 				// 同名头重复出现，用逗号合并（RFC 9110 的规矩）
-				b.req.Header[name] = last + ", " + string(buf)
+				b.req.Header[string(b.curField)] = last + ", " + string(buf)
 				return
 			}
-			b.req.Header[name] = string(buf)
+			b.req.Header[string(b.curField)] = string(buf)
 		},
 		HeadersComplete: func(p *httparser.Parser, _ int) {
 			if b.owner.done {
