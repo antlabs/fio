@@ -129,11 +129,12 @@ func (h *h2Handler) OnData(c *http2.Conn, streamID uint32, data []byte, endStrea
 func (h *h2Handler) OnRSTStream(c *http2.Conn, streamID uint32, code http2.ErrCode) {}
 
 // serveHTTP 是 HTTP/1.1 的业务。
-func serveHTTP(w *http.ResponseWriter, r *http.Request) {
+//
+// 形状就是 fiber 那种：一个参数，返回 error。
+func serveHTTP(c *http.Ctx) error {
 	body := "hello from fio\n"
-	w.Header()["Content-Type"] = []string{"text/plain"}
-	w.Header()["Content-Length"] = []string{fmt.Sprint(len(body))}
-	w.Write([]byte(body))
+	c.Set("Content-Length", fmt.Sprint(len(body)))
+	return c.String(body)
 }
 
 // grpcHandler 是 gRPC 的业务：把请求消息前面加个 "echo: " 回过去。

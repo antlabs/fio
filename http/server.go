@@ -282,17 +282,22 @@ func (w *ResponseWriter) Conn() *engine.Conn { return w.conn }
 
 // Handler 处理 HTTP 请求。
 //
-// 形状和 net/http 的 Handler 一样：拿到请求和 ResponseWriter，写响应。
-// 不同的是它跑在事件循环上——**不能阻塞**，要等什么东西的话得自己记住
-// 状态、让出，等下一次回调。
+// 形状取自 fiber：**一个参数**（请求和响应都在 Ctx 上）、返回 error。
+//
+//	http.HandlerFunc(func(c *http.Ctx) error {
+//	    return c.String("ok")
+//	})
+//
+// 和 net/http 的两参数形式不同，也和它一样跑在事件循环上——**不能阻塞**，
+// 要等什么东西的话用 Ctx.Defer 让出（见它的说明）。
 type Handler interface {
-	ServeHTTP(w *ResponseWriter, r *Request)
+	ServeHTTP(c *Ctx) error
 }
 
 // HandlerFunc 让普通函数当 Handler。
-type HandlerFunc func(w *ResponseWriter, r *Request)
+type HandlerFunc func(c *Ctx) error
 
-func (f HandlerFunc) ServeHTTP(w *ResponseWriter, r *Request) { f(w, r) }
+func (f HandlerFunc) ServeHTTP(c *Ctx) error { return f(c) }
 
 // ConnHandler 是每个连接一个的 engine.Handler。
 //
@@ -406,7 +411,8 @@ func (ch *ConnHandler) OnData(c *engine.Conn, buf []byte) (int, error) {
 			st.w = &ResponseWriter{}
 		}
 		st.w.reset(c, req.Proto)
-		ch.handler.ServeHTTP(st.w, req)
+		st.ctx.reset(st.w, req)
+		herr := ch.handler.ServeHTTP(st.ctx)
 
 		// 业务把响应推后了（见 Defer）：不要补头、不要 Reset 解析器——那会
 		// 把还没写的响应变成空响应，也会让下一个请求踩掉当前的状态。把连接
@@ -414,6 +420,14 @@ func (ch *ConnHandler) OnData(c *engine.Conn, buf []byte) (int, error) {
 		if st.w.deferred {
 			st.pending = true
 			return consumed, nil
+		}
+
+		// handler 报错、而且一个字都还没写：回 500 然后关连接（net/http
+		// 的 Error 也是这个语义）。已经写了响应的话走下面的正常收尾——报文
+		// 是完整的，只是这条连接接下来不再复用了。
+		if herr != nil && !st.w.headerSent {
+			ch.writeError(c, st, 500, herr)
+			return consumed, herr
 		}
 
 		// 响应收尾。
@@ -440,7 +454,7 @@ func (ch *ConnHandler) OnData(c *engine.Conn, buf []byte) (int, error) {
 		// 等到超时。
 		// closeAfterWrite 是"HTTP/1.0 且没给 Content-Length"那种——
 		// 体的边界只能靠关连接划出来（见 flushHeader）。
-		if wantClose(req) || st.w.closeAfterWrite {
+		if herr != nil || wantClose(req) || st.w.closeAfterWrite {
 			c.Close()
 			return len(buf), nil // 连接要关了，剩下的不用管
 		}
@@ -497,6 +511,7 @@ func containsFold(s, sub string) bool {
 func (ch *ConnHandler) newState() *connState {
 	return &connState{
 		parser: NewParser(ch.maxHeaderSize),
+		ctx:    &Ctx{},
 	}
 }
 
@@ -519,6 +534,8 @@ type connState struct {
 	parser *Parser
 	// w 是复用的响应写出器
 	w *ResponseWriter
+	// ctx 是复用的请求上下文（绑定 w 和当前这条请求）
+	ctx *Ctx
 
 	// pending 有一个被 Defer 挂起的请求还没收尾（见 Resume）。
 	pending bool

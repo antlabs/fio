@@ -58,10 +58,12 @@ func startServer(t *testing.T, h Handler) (string, func()) {
 
 // 一个最简单的 GET，校验响应行、头、体。
 func TestServerSimpleGet(t *testing.T) {
-	addr, stop := startServer(t, HandlerFunc(func(w *ResponseWriter, r *Request) {
-		w.Header()["Content-Type"] = []string{"text/plain"}
-		w.Header()["Content-Length"] = []string{"5"}
-		w.Write([]byte("hello"))
+	addr, stop := startServer(t, HandlerFunc(func(c *Ctx) error {
+		c.Set("Content-Type", "text/plain")
+		c.Set("Content-Length", "5")
+		c.Write([]byte("hello"))
+
+		return nil
 	}))
 	defer stop()
 
@@ -113,13 +115,15 @@ func TestServerPostBody(t *testing.T) {
 	type got struct{ method, path, body string }
 	gotCh := make(chan got, 1)
 
-	addr, stop := startServer(t, HandlerFunc(func(w *ResponseWriter, r *Request) {
+	addr, stop := startServer(t, HandlerFunc(func(c *Ctx) error {
 		select {
-		case gotCh <- got{r.Method, r.Target, string(r.Body)}:
+		case gotCh <- got{c.Method(), c.Target(), string(c.Body())}:
 		default:
 		}
-		w.Header()["Content-Length"] = []string{"2"}
-		w.Write([]byte("ok"))
+		c.Set("Content-Length", "2")
+		c.Write([]byte("ok"))
+
+		return nil
 	}))
 	defer stop()
 
@@ -155,12 +159,14 @@ func TestKeepAlive(t *testing.T) {
 	var mu sync.Mutex
 	var paths []string
 
-	addr, stop := startServer(t, HandlerFunc(func(w *ResponseWriter, r *Request) {
+	addr, stop := startServer(t, HandlerFunc(func(c *Ctx) error {
 		mu.Lock()
-		paths = append(paths, r.Target)
+		paths = append(paths, c.Target())
 		mu.Unlock()
-		w.Header()["Content-Length"] = []string{"2"}
-		w.Write([]byte("ok"))
+		c.Set("Content-Length", "2")
+		c.Write([]byte("ok"))
+
+		return nil
 	}))
 	defer stop()
 
@@ -223,12 +229,14 @@ func TestPipelining(t *testing.T) {
 	var mu sync.Mutex
 	var paths []string
 
-	addr, stop := startServer(t, HandlerFunc(func(w *ResponseWriter, r *Request) {
+	addr, stop := startServer(t, HandlerFunc(func(c *Ctx) error {
 		mu.Lock()
-		paths = append(paths, r.Target)
+		paths = append(paths, c.Target())
 		mu.Unlock()
-		w.Header()["Content-Length"] = []string{"1"}
-		w.Write([]byte("x"))
+		c.Set("Content-Length", "1")
+		c.Write([]byte("x"))
+
+		return nil
 	}))
 	defer stop()
 
@@ -293,8 +301,10 @@ func TestPipelining(t *testing.T) {
 // 继续的地方。测试要挑后者，不然测的是 httparser 的宽容度而不是我们的
 // 错误处理。
 func TestBadRequest(t *testing.T) {
-	addr, stop := startServer(t, HandlerFunc(func(w *ResponseWriter, r *Request) {
+	addr, stop := startServer(t, HandlerFunc(func(c *Ctx) error {
 		t.Error("坏报文不该走到业务处理")
+
+		return nil
 	}))
 	defer stop()
 
@@ -319,9 +329,11 @@ func TestBadRequest(t *testing.T) {
 
 // 响应没设状态码时默认 200。
 func TestDefaultStatus(t *testing.T) {
-	addr, stop := startServer(t, HandlerFunc(func(w *ResponseWriter, r *Request) {
-		w.Header()["Content-Length"] = []string{"2"}
-		w.Write([]byte("hi")) // 没调 WriteHeader
+	addr, stop := startServer(t, HandlerFunc(func(c *Ctx) error {
+		c.Set("Content-Length", "2")
+		c.Write([]byte("hi")) // 没调 WriteHeader
+
+		return nil
 	}))
 	defer stop()
 
@@ -345,13 +357,15 @@ func TestSlowRequest(t *testing.T) {
 	// 用 channel 而不是普通变量：handler 在事件循环的 goroutine 上跑，
 	// 测试在另一个上读，普通变量就是数据竞争（-race 会报）。
 	gotPath := make(chan string, 1)
-	addr, stop := startServer(t, HandlerFunc(func(w *ResponseWriter, r *Request) {
+	addr, stop := startServer(t, HandlerFunc(func(c *Ctx) error {
 		select {
-		case gotPath <- r.Target:
+		case gotPath <- c.Target():
 		default:
 		}
-		w.Header()["Content-Length"] = []string{"1"}
-		w.Write([]byte("x"))
+		c.Set("Content-Length", "1")
+		c.Write([]byte("x"))
+
+		return nil
 	}))
 	defer stop()
 
