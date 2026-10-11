@@ -117,7 +117,7 @@ func (c *Ctx) Set(name, value string) *Ctx {
 		h[name] = append(h[name][:0], value)
 		return c
 	}
-	h[name] = []string{value}
+	h[name] = c.w.putString(value)
 	return c
 }
 

@@ -40,6 +40,14 @@ type ResponseWriter struct {
 
 	// conn 是底层连接
 	conn *engine.Conn
+	// spare 是上一个请求留给下一个请求复用的头值切片（见 reset / putString）。
+	//
+	// 为什么要有：`Set` 对每个**新键**都要 `[]string{value}`——一个单元素
+	// 数组。而一条连接上每次请求设的头基本是同一批名字，所以那些数组完全
+	// 可以循环用。实测（limited-conn，18 万连接/秒）：这一处占**全部堆分配
+	// 的 19.9%**，每请求约 132 字节。
+	spare [][]string
+
 	// buf 是拼响应用的缓冲区（连接级复用）
 	//
 	// **不是 *[]byte**：原来写成指针 + `b := make(...); w.buf = &b`，那个
@@ -644,9 +652,30 @@ func (w *ResponseWriter) reset(c *engine.Conn, proto string) {
 	w.finished = false
 	w.closeAfterWrite = false
 	w.deferred = false
-	for k := range w.header {
+	// **不 delete 完就算**：把上一个请求用过的头值切片留下来给下一个请求
+	// 复用（见 spare / putString）。语义没变——下一个请求开始时 map 是空的，
+	// 只是那些单元素数组不还回去。
+	w.spare = w.spare[:0]
+	for k, v := range w.header {
 		delete(w.header, k)
+		if len(w.spare) < maxSpareHeaderSlices {
+			w.spare = append(w.spare, v[:0])
+		}
 	}
+}
+
+// maxSpareHeaderSlices 是留给下一个请求复用的头值切片上限。
+// 一条连接上每次请求的头就那几个，留多了只是白占内存。
+const maxSpareHeaderSlices = 32
+
+// putString 给一个新设的头弄一个单元素切片，优先复用上一个请求留下的底层数组。
+func (w *ResponseWriter) putString(value string) []string {
+	if n := len(w.spare); n > 0 {
+		s := w.spare[n-1]
+		w.spare = w.spare[:n-1]
+		return append(s[:0], value)
+	}
+	return []string{value}
 }
 
 // Defer 声明这次响应稍后再写。
