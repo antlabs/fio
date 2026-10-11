@@ -205,6 +205,15 @@ func (c *Conn) SetHandler(h StreamHandler) { c.handler = h }
 //
 // 非阻塞：不够一帧的字节攒在内部，下次接着拼。
 func (c *Conn) Feed(data []byte) (int, []byte, error) {
+	consumed, err := c.feed(data)
+	return consumed, c.takeOutput(), err
+}
+
+// feed 是 Feed 和 FeedWrite 共用的解析主体。
+//
+// **产生的帧留在 outBuf 里不交出去**，由调用方决定怎么拿走（Feed 用
+// takeOutput 交出所有权，FeedWrite 就地写掉再复用那块内存）。
+func (c *Conn) feed(data []byte) (int, error) {
 	consumed := 0
 
 	// 服务端先认客户端的连接序言。
@@ -218,10 +227,10 @@ func (c *Conn) Feed(data []byte) (int, []byte, error) {
 
 		if len(c.prefaceBuf) < len(clientPreface) {
 			// 还没凑全，等下一次
-			return consumed, nil, nil
+			return consumed, nil
 		}
 		if string(c.prefaceBuf[:len(clientPreface)]) != string(clientPreface) {
-			return consumed, nil, fmt.Errorf("%w: bad client preface", ErrBadFrameHeader)
+			return consumed, fmt.Errorf("%w: bad client preface", ErrBadFrameHeader)
 		}
 		// 序言之后可能还跟着帧数据（同一个 TCP 段里）
 		rest := c.prefaceBuf[len(clientPreface):]
@@ -232,7 +241,7 @@ func (c *Conn) Feed(data []byte) (int, []byte, error) {
 			n, _ := c.parser.Parse(rest, c.onFrame)
 			_ = n
 		}
-		return consumed, c.takeOutput(), nil
+		return consumed, nil
 	}
 
 	n, err := c.parser.Parse(data, c.onFrame)
@@ -241,9 +250,10 @@ func (c *Conn) Feed(data []byte) (int, []byte, error) {
 		consumed = len(data)
 	}
 	if err != nil {
-		return consumed, c.handleError(err), err
+		c.handleErrorKeep(err)
+		return consumed, err
 	}
-	return consumed, c.takeOutput(), nil
+	return consumed, nil
 }
 
 // handleError 按错误的级别决定怎么回：连接错误 GOAWAY，流错误 RST_STREAM。
@@ -273,7 +283,23 @@ func (c *Conn) handleError(err error) []byte {
 
 	// 连接错误（以及没分类的）：GOAWAY 然后关
 	ce := asConnError(err)
-	return c.sendGoAway(ce.Code, ce.Msg)
+	c.sendGoAway(ce.Code, ce.Msg)
+	return c.takeOutput()
+}
+
+// handleErrorKeep 和 handleError 一样，但**把帧留在 outBuf 里不交出去**，
+// 交给 feed 的调用方去写（见 FeedWrite）。
+func (c *Conn) handleErrorKeep(err error) {
+	if err == nil {
+		return
+	}
+	if se, ok := asStreamError(err); ok {
+		c.writeFrame(AppendRSTStream(nil, se.StreamID, uint32(se.Code)))
+		c.forgetStream(se.StreamID)
+		return
+	}
+	ce := asConnError(err)
+	c.sendGoAway(ce.Code, ce.Msg)
 }
 
 // onFrame 处理一个解析出来的帧。
@@ -1088,13 +1114,25 @@ func (c *Conn) WriteData(streamID uint32, data []byte, endStream bool) error {
 
 // writeDataLocked 是 WriteData 的实现，调用方要持锁。
 func (c *Conn) writeDataLocked(streamID uint32, data []byte, endStream bool) error {
+	// **帧直接建在发送缓冲上**，不要 AppendData(nil, ...) 再 append 进去：
+	//
+	//	AppendData(nil, ...)    分配一块，把体拷进去
+	//	writeFrameLocked(...)   再把它拷进 outBuf
+	//
+	// 8KB 的响应就是每请求分配 8KB + 拷两遍，而这份 data 往往本来就是现成
+	// 的缓冲（static 是缓存里的文件、echo 是请求体），拷进 outBuf 一次就够。
+	// 实测（static 8KB over h2c）：GC 扫描占 CPU 的 30%，这一处是两个大头
+	// 之一（另一个是 takeOutput 每次把 outBuf 数组丢掉）。
+	//
+	// 语义和原来的快路径完全一致：**快路径不动窗口**（只有下面拆帧那条
+	// 慢路径才动）。
 	max := int(c.peerMaxFrameSize)
 	if len(data) <= max && int32(len(data)) <= c.sendWindow {
-		return c.writeFrameLocked(AppendData(nil, streamID, data, endStream))
+		c.outBuf = AppendData(c.outBuf, streamID, data, endStream)
+		return nil
 	}
 
 	// 拆成多帧，但要受窗口限制
-	var buf []byte
 	for len(data) > 0 {
 		n := max
 		if len(data) < n {
@@ -1121,16 +1159,13 @@ func (c *Conn) writeDataLocked(streamID uint32, data []byte, endStream bool) err
 		}
 
 		last := n == len(data)
-		buf = AppendData(buf, streamID, data[:n], last && endStream)
+		c.outBuf = AppendData(c.outBuf, streamID, data[:n], last && endStream)
 
 		c.sendWindow -= int32(n)
 		if s := c.streams[streamID]; s != nil {
 			s.sendWindow -= int32(n)
 		}
 		data = data[n:]
-	}
-	if len(buf) > 0 {
-		return c.writeFrameLocked(buf)
 	}
 	return nil
 }
@@ -1216,10 +1251,8 @@ func (c *Conn) sendGoAway(code ErrCode, debug string) []byte {
 	buf := AppendGoAway(nil, c.lastStreamID, uint32(code), []byte(debug))
 	c.mu.Lock()
 	c.outBuf = append(c.outBuf, buf...)
-	out := c.outBuf
-	c.outBuf = nil
 	c.mu.Unlock()
-	return out
+	return nil
 }
 
 // writeFrame 把一个帧追加到待发缓冲区。
