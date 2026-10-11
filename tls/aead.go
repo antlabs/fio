@@ -164,6 +164,58 @@ func (p *recordProtector) seal(innerType uint8, plaintext []byte) ([]byte, error
 	return out, nil
 }
 
+// appendWindow 把"a 和 b 拼接之后、从 off 开始的 n 字节"追加到 dst。
+//
+// a、b 是两段连续语义的输入（HTTP 的响应头 + 响应体），窗口可能横跨两者的
+// 交界，所以要分两次 append。调用方保证 off+n <= len(a)+len(b)。
+func appendWindow(dst, a, b []byte, off, n int) []byte {
+	if off < len(a) {
+		k := len(a) - off
+		if k > n {
+			k = n
+		}
+		dst = append(dst, a[off:off+k]...)
+		n -= k
+		off = 0
+	} else {
+		off -= len(a)
+	}
+	if n > 0 {
+		dst = append(dst, b[off:off+n]...)
+	}
+	return dst
+}
+
+// sealWindow 和 seal 做的是同一件事，只是明文取自"a 和 b 拼接后的一段窗口"。
+//
+// 存在的理由是少一次 write 系统调用：内层的响应头和响应体是两块内存，分开
+// 加封就是两条记录、两次 write，而它们本来能装进同一条记录。见
+// StateMachine.WriteTwo。
+func (p *recordProtector) sealWindow(innerType uint8, a, b []byte, off, n int) ([]byte, error) {
+	if p.aead == nil {
+		return nil, ErrAEADNotReady
+	}
+	if p.seq == ^uint64(0) {
+		return nil, ErrSequenceLimit
+	}
+
+	need := n + 1 + p.aead.Overhead()
+	if cap(p.scratch) < need {
+		p.scratch = make([]byte, 0, need)
+	}
+	buf := appendWindow(p.scratch[:0], a, b, off, n)
+	buf = append(buf, innerType)
+
+	nonce := p.nonce()
+	// 外层长度 = 内层长度 + 认证标签
+	ad := p.additionalData(0x0303, len(buf)+p.aead.Overhead())
+
+	out := p.aead.Seal(buf[:0], nonce, buf, ad)
+	p.scratch = out
+	p.seq++
+	return out, nil
+}
+
 // open 解密一条密文，返回内层明文和真实类型。
 func (p *recordProtector) open(ciphertext []byte) ([]byte, uint8, error) {
 	if p.aead == nil {
