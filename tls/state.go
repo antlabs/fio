@@ -799,12 +799,10 @@ func (sm *StateMachine) WriteTwo(a, b []byte) ([]byte, error) {
 		if n > maxRecordPayload {
 			n = maxRecordPayload
 		}
-		var ct []byte
-		ct, err = sm.writeKeys.sealWindow(recordApplicationData, a, b, off, n)
+		out, err = sm.writeKeys.sealWindow(out, recordApplicationData, a, b, off, n)
 		if err != nil {
 			return out, err
 		}
-		out = AppendRecord(out, recordApplicationData, 0x0303, ct)
 		off += n
 	}
 	sm.writeBuf = out

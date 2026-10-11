@@ -187,34 +187,65 @@ func appendWindow(dst, a, b []byte, off, n int) []byte {
 	return dst
 }
 
-// sealWindow 和 seal 做的是同一件事，只是明文取自"a 和 b 拼接后的一段窗口"。
+// sealWindow 加密一段内层明文，把整条记录（5 字节头 + 密文）追加到 dst。
 //
-// 存在的理由是少一次 write 系统调用：内层的响应头和响应体是两块内存，分开
-// 加封就是两条记录、两次 write，而它们本来能装进同一条记录。见
-// StateMachine.WriteTwo。
-func (p *recordProtector) sealWindow(innerType uint8, a, b []byte, off, n int) ([]byte, error) {
+// 明文取自"a 和 b 拼接后的一段窗口"——两段是 HTTP 的响应头和响应体。
+//
+// **一条记录只拷一遍**：先按"记录头 + 明文 + 内层类型"的长度往 dst 里填，
+// 然后把密文写回明文自己那块地方（Seal 允许的精确重叠）。对比 seal 那条路
+// （明文→scratch、原地加密、密文→输出缓冲，两遍）。
+//
+// 为什么两条路的拷贝数不一样，是**量出来的**，不是推导出来的：
+//
+//	                static-tls   json-tls   static-h2 / baseline-h2
+//	一遍（这个函数）   -4.9%        -1.3%      **+5.0%**
+//	两遍（seal）        基准         基准         基准
+//
+// h1 的 WriteTwo 走这条路（一次调用就是一条响应，输出缓冲也就是那一条响应），
+// h2 的 Write 走 seal（一次调用里装着多个流的输出，缓冲大得多）。同一件事在
+// 两条路上结论相反，**没有解释清楚**，所以各自用各自量出来更好的那个。
+func (p *recordProtector) sealWindow(dst []byte, innerType uint8, a, b []byte, off, n int) ([]byte, error) {
 	if p.aead == nil {
-		return nil, ErrAEADNotReady
+		return dst, ErrAEADNotReady
 	}
 	if p.seq == ^uint64(0) {
-		return nil, ErrSequenceLimit
+		return dst, ErrSequenceLimit
 	}
 
-	need := n + 1 + p.aead.Overhead()
-	if cap(p.scratch) < need {
-		p.scratch = make([]byte, 0, need)
+	// 外层长度 = 内层长度（窗口 + 类型 + 标签）
+	ctLen := n + 1 + p.aead.Overhead()
+	start := len(dst)
+
+	// 容量先留够（记录头 + 明文 + 内层类型 + 标签）。
+	//
+	// **不能省**：Seal 在 dst 的容量放不下标签时不报错，它返回另分配的一块
+	// 的切片——密文就落不到 dst 里，写出去的是明文（对端报 bad record MAC）。
+	if cap(dst) < start+recordHeaderLen+ctLen {
+		grown := make([]byte, len(dst), start+recordHeaderLen+ctLen)
+		copy(grown, dst)
+		dst = grown
 	}
-	buf := appendWindow(p.scratch[:0], a, b, off, n)
-	buf = append(buf, innerType)
 
-	nonce := p.nonce()
-	// 外层长度 = 内层长度 + 认证标签
-	ad := p.additionalData(0x0303, len(buf)+p.aead.Overhead())
+	// 预留记录头，紧接着窗口里的明文和内层类型
+	dst = append(dst, 0, 0, 0, 0, 0)
+	dst = appendWindow(dst, a, b, off, n)
+	dst = append(dst, innerType)
 
-	out := p.aead.Seal(buf[:0], nonce, buf, ad)
-	p.scratch = out
+	// 明文把自己那块地方让给密文：两者起点相同，是 Seal 允许的精确重叠
+	ct := dst[start+recordHeaderLen:]
+	p.aead.Seal(ct[:0], p.nonce(), ct, p.additionalData(0x0303, ctLen))
+	// 密文比明文长一个标签，把 dst 伸到它的全长
+	dst = dst[:start+recordHeaderLen+ctLen]
+
+	h := dst[start : start+recordHeaderLen]
+	h[0] = recordApplicationData
+	h[1] = 0x03
+	h[2] = 0x03
+	h[3] = byte(ctLen >> 8)
+	h[4] = byte(ctLen)
+
 	p.seq++
-	return out, nil
+	return dst, nil
 }
 
 // openInto 解密一条密文，**解到 dst 的尾巴上**，返回追加后的 dst 和真实类型。
