@@ -109,6 +109,24 @@ func (ch *ConnHandler) OnOpen(c *engine.Conn) {
 		}
 		return nil
 	})
+
+	// 两段版：HTTP 的响应头 + 响应体一次收下，编进**同一条记录**、只发一次
+	// write。走单段那个的话每次响应要两次 write（见 engine.SetWritevHook）。
+	//
+	// 契约不变：不能在钩子里调 c.Write，要发数据用 c.WriteRaw。
+	c.SetWritevHook(func(a, b []byte) error {
+		if ch.sm == nil || !ch.sm.Established() {
+			return nil
+		}
+		ct, err := ch.sm.WriteTwo(a, b)
+		if err != nil {
+			return err
+		}
+		if len(ct) > 0 {
+			return c.WriteRaw(ct)
+		}
+		return nil
+	})
 }
 
 // OnData 有数据可读：喂给 TLS 状态机，把解出来的明文转给内层。

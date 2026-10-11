@@ -74,15 +74,17 @@ func TestStdlibClientAgainstOurServer(t *testing.T) {
 	var mu sync.Mutex
 	var paths []string
 
-	addr, stop := startHTTPServer(t, HandlerFunc(func(w *ResponseWriter, r *Request) {
+	addr, stop := startHTTPServer(t, HandlerFunc(func(c *Ctx) error {
 		mu.Lock()
-		paths = append(paths, r.Target)
+		paths = append(paths, c.Target())
 		mu.Unlock()
 
-		w.Header()["Content-Type"] = []string{"text/plain"}
-		body := "you asked for " + r.Target
-		w.Header()["Content-Length"] = []string{fmt.Sprint(len(body))}
-		w.Write([]byte(body))
+		c.Set("Content-Type", "text/plain")
+		body := "you asked for " + c.Target()
+		c.Set("Content-Length", fmt.Sprint(len(body)))
+		c.Write([]byte(body))
+
+		return nil
 	}))
 	defer stop()
 
@@ -130,14 +132,16 @@ func TestStdlibPostAgainstOurServer(t *testing.T) {
 	type got struct{ method, path, body, ctype string }
 	gotCh := make(chan got, 1)
 
-	addr, stop := startHTTPServer(t, HandlerFunc(func(w *ResponseWriter, r *Request) {
-		ct, _ := r.Get("Content-Type")
+	addr, stop := startHTTPServer(t, HandlerFunc(func(c *Ctx) error {
+		ct, _ := c.Get("Content-Type")
 		select {
-		case gotCh <- got{r.Method, r.Target, string(r.Body), ct}:
+		case gotCh <- got{c.Method(), c.Target(), string(c.Body()), ct}:
 		default:
 		}
-		w.Header()["Content-Length"] = []string{"2"}
-		w.Write([]byte("ok"))
+		c.Set("Content-Length", "2")
+		c.Write([]byte("ok"))
+
+		return nil
 	}))
 	defer stop()
 
@@ -180,16 +184,18 @@ func TestStdlibHeaders(t *testing.T) {
 	}
 	gotCh := make(chan hdrs, 1)
 
-	addr, stop := startHTTPServer(t, HandlerFunc(func(w *ResponseWriter, r *Request) {
-		a, _ := r.Get("X-Custom-A")
-		b, _ := r.Get("x-custom-b") // 小写查
-		m, _ := r.Get("X-Multi")
+	addr, stop := startHTTPServer(t, HandlerFunc(func(c *Ctx) error {
+		a, _ := c.Get("X-Custom-A")
+		b, _ := c.Get("x-custom-b") // 小写查
+		m, _ := c.Get("X-Multi")
 		select {
 		case gotCh <- hdrs{a, b, m}:
 		default:
 		}
-		w.Header()["Content-Length"] = []string{"1"}
-		w.Write([]byte("x"))
+		c.Set("Content-Length", "1")
+		c.Write([]byte("x"))
+
+		return nil
 	}))
 	defer stop()
 
@@ -236,13 +242,15 @@ func TestStdlibHeaders(t *testing.T) {
 func TestLargeBody(t *testing.T) {
 	gotCh := make(chan int, 8)
 
-	addr, stop := startHTTPServer(t, HandlerFunc(func(w *ResponseWriter, r *Request) {
+	addr, stop := startHTTPServer(t, HandlerFunc(func(c *Ctx) error {
 		select {
-		case gotCh <- len(r.Body):
+		case gotCh <- len(c.Body()):
 		default:
 		}
-		w.Header()["Content-Length"] = []string{"2"}
-		w.Write([]byte("ok"))
+		c.Set("Content-Length", "2")
+		c.Write([]byte("ok"))
+
+		return nil
 	}))
 	defer stop()
 
@@ -282,10 +290,12 @@ func TestOurClientAgainstStdlibServer(t *testing.T) {
 
 // 多个客户端并发打（标准库的 Transport 会开多条连接）。
 func TestConcurrentClients(t *testing.T) {
-	addr, stop := startHTTPServer(t, HandlerFunc(func(w *ResponseWriter, r *Request) {
-		body := "ok:" + r.Target
-		w.Header()["Content-Length"] = []string{fmt.Sprint(len(body))}
-		w.Write([]byte(body))
+	addr, stop := startHTTPServer(t, HandlerFunc(func(c *Ctx) error {
+		body := "ok:" + c.Target()
+		c.Set("Content-Length", fmt.Sprint(len(body)))
+		c.Write([]byte(body))
+
+		return nil
 	}))
 	defer stop()
 
@@ -348,8 +358,10 @@ func TestStdlibTLSClient(t *testing.T) {
 	}
 	defer m.Free()
 
-	app := HandlerFunc(func(w *ResponseWriter, r *Request) {
-		fmt.Fprintf(w, "you asked for %s", r.Target)
+	app := HandlerFunc(func(c *Ctx) error {
+		fmt.Fprintf(c, "you asked for %s", c.Target())
+
+		return nil
 	})
 
 	// accept 交给 engine.Listener（非阻塞 accept + 停止标志，两个平台的
@@ -409,10 +421,12 @@ func TestStdlibTLSClient(t *testing.T) {
 // 而数据其实早就到了。这条路径自己写的测试撞不到（那些测试都规规矩矩
 // 设了 Content-Length），是拿标准库客户端打才打出来的。
 func TestChunkedResponse(t *testing.T) {
-	addr, stop := startHTTPServer(t, HandlerFunc(func(w *ResponseWriter, r *Request) {
+	addr, stop := startHTTPServer(t, HandlerFunc(func(c *Ctx) error {
 		// 刻意不设 Content-Length，还分两次写（多段 chunk）
-		w.Write([]byte("first part, "))
-		w.Write([]byte("second part"))
+		c.Write([]byte("first part, "))
+		c.Write([]byte("second part"))
+
+		return nil
 	}))
 	defer stop()
 
@@ -449,8 +463,10 @@ func TestChunkedResponse(t *testing.T) {
 
 // 204 按定义没有体，不该加 chunked（加了反而是错的）。
 func TestNoBodyStatus(t *testing.T) {
-	addr, stop := startHTTPServer(t, HandlerFunc(func(w *ResponseWriter, r *Request) {
-		w.WriteHeader(204)
+	addr, stop := startHTTPServer(t, HandlerFunc(func(c *Ctx) error {
+		c.Status(204)
+
+		return nil
 	}))
 	defer stop()
 
