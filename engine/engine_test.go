@@ -313,3 +313,51 @@ func (h *closeHandler) OnClose(*Conn, error) {
 		h.onClose()
 	}
 }
+
+// TestPostOnLoop 投到循环上的任务会被执行，而且投递方不等它。
+//
+// 和 SyncOnLoop 的区别就是这个"不等"：投完立刻返回，任务在循环上跑。
+// http 的 /delay 收尾走这条路（见 PostOnLoop 的说明）。
+func TestPostOnLoop(t *testing.T) {
+	ran := make(chan struct{}, 1)
+	h := &postHandler{onPost: func() {
+		select {
+		case ran <- struct{}{}:
+		default:
+		}
+	}}
+	addr, stop := startServer(t, h)
+	defer stop()
+
+	conn, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	if _, err := conn.Write([]byte("go")); err != nil {
+		t.Fatal(err)
+	}
+
+	select {
+	case <-ran:
+	case <-time.After(5 * time.Second):
+		t.Fatal("5 秒内没等到投上去的任务执行")
+	}
+}
+
+// postHandler 收到任何数据就在自己的循环上投一个任务。
+type postHandler struct {
+	onPost func()
+}
+
+func (h *postHandler) OnOpen(*Conn) {}
+
+func (h *postHandler) OnData(c *Conn, buf []byte) (int, error) {
+	if len(buf) == 0 {
+		return 0, io.EOF
+	}
+	c.PostOnLoop(h.onPost)
+	return len(buf), nil
+}
+
+func (h *postHandler) OnClose(*Conn, error) {}

@@ -213,6 +213,27 @@ func (c *Conn) SyncOnLoop(f func()) {
 	<-done
 }
 
+// PostOnLoop 把 f 投到这条连接的事件循环上执行，**不等它跑完**。
+//
+// 和 SyncOnLoop 只差一个"等"：那边每次要分配一个 chan、把任务投进队列、
+// 写一次唤醒管道，然后阻塞收 chan。从别的 goroutine 收尾的场景经常并不
+// 需要那个回执——投完就该干别的去了。
+//
+// 实测（async，32000 连接 GET /delay/10）：把 /delay 的收尾从 SyncOnLoop
+// 换成它之后，casgstatus + chanrecv + closechan + gopark + SyncOnLoop 这一
+// 串 goroutine 机制的开销明显下来了，见那一档的数字。
+//
+// **安全前提和 SyncOnLoop 一样**：f 迟早会在这条连接的循环上跑，但
+// 在这之前连接可能已经关了、循环可能已经 Free 了，所以 f 里要对这两种
+// 情况有准备（IsClosed 那类检查）。**不要**在 f 里假设调用方的栈还活着。
+func (c *Conn) PostOnLoop(f func()) {
+	if c.parent == nil {
+		f()
+		return
+	}
+	c.parent.runOnLoop(f)
+}
+
 // UserData 取协议挂的状态。没设过返回 nil。
 func (c *Conn) UserData() any {
 	p := c.userData.Load()
