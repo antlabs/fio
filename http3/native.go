@@ -18,6 +18,9 @@ import (
 	"context"
 	"crypto/tls"
 	"io"
+	"os"
+	"strconv"
+	"sync"
 
 	"github.com/quic-go/qpack"
 	"github.com/quic-go/quic-go"
@@ -93,17 +96,30 @@ type Conn struct {
 	qc *quic.Conn
 	// h 是流事件的接收者（和 http2.Conn 的 handler 一个位置）
 	h StreamHandler
-	// streams 是活着的请求流：WriteHeaders/WriteData 靠它按 streamID 找
-	// 到对应的 QUIC 流
-	streams map[uint64]*quic.Stream
+	// newH 是 handler 工厂：并行通道 >1 时每条通道一个实例
+	newH func() StreamHandler
+	// mu 保护 streams
+	mu sync.Mutex
+	// streams 是活着的请求流：WriteHeaders/WriteData 靠它按 streamID 拿到
+	// 那条流的发送状态（缓冲在 lane 里，见 lane）
+	streams map[uint64]*streamState
 
-	// QPACK。编码器只走静态表，解码器同样。
+	// dec 是 QPACK 解码器。只用静态表，所以无状态——几条 lane 同时用
+	// 也没事（qpack.Decoder 是个空结构体）。
 	dec *qpack.Decoder
+}
+
+// streamState 是一条流处理中的收发状态。
+//
+// 它归**一条 lane**所有（见 lane）：lane 串行处理自己那些流，所以这套
+// 缓冲不需要锁。把发送缓冲放进来的原因是 WriteHeaders/WriteData 是按
+// streamID 调的（和 http2 一个形状），得能从连接上找到当前这条流的缓冲。
+type streamState struct {
+	str *quic.Stream
 	// enc 的落点是 &encW（构造时传进去，字段地址稳定），
 	// 每编一块头先把 encW.p 指到 block 上。
 	enc  *qpack.Encoder
 	encW sliceWriter
-
 	// 复用缓冲：读、头块、发送、头字段
 	rbuf  []byte
 	block []byte
@@ -130,35 +146,49 @@ func (w *sliceWriter) Write(b []byte) (int, error) {
 //
 // **一次响应从这里开始**：内部发送缓冲在这一刻复位。
 func (c *Conn) WriteHeaders(streamID uint64, fields []HeaderField, endStream bool) error {
-	c.wbuf = c.wbuf[:0]
-
-	c.block = c.block[:0]
-	c.encW.p = c.block
+	st := c.streamState(streamID)
+	if st == nil {
+		return nil
+	}
+	st.wbuf = st.wbuf[:0]
+	st.block = st.block[:0]
+	st.encW.p = st.block
 	for i := range fields {
-		if err := c.enc.WriteField(fields[i]); err != nil {
+		if err := st.enc.WriteField(fields[i]); err != nil {
 			return err
 		}
 	}
 	// Close 只是复位编码器（头块前缀下次重写），不是"关流"
-	if err := c.enc.Close(); err != nil {
+	if err := st.enc.Close(); err != nil {
 		return err
 	}
-	c.block = c.encW.p
-	c.wbuf = AppendHeaders(c.wbuf, c.block)
+	st.block = st.encW.p
+	st.wbuf = AppendHeaders(st.wbuf, st.block)
 
 	if endStream {
-		return c.flush(streamID, true)
+		return st.flush(true)
 	}
 	return nil
+}
+
+func (c *Conn) streamState(streamID uint64) *streamState {
+	c.mu.Lock()
+	st := c.streams[streamID]
+	c.mu.Unlock()
+	return st
 }
 
 // WriteData 往一个流上写体。
 //
 // 和 http2.Conn.WriteData 一样：这次调用会把积压的头帧一起发出去。
 func (c *Conn) WriteData(streamID uint64, data []byte, endStream bool) error {
-	c.wbuf = AppendData(c.wbuf, data)
+	st := c.streamState(streamID)
+	if st == nil {
+		return nil
+	}
+	st.wbuf = AppendData(st.wbuf, data)
 	if endStream {
-		return c.flush(streamID, true)
+		return st.flush(true)
 	}
 	return nil
 }
@@ -167,37 +197,37 @@ func (c *Conn) WriteData(streamID uint64, data []byte, endStream bool) error {
 //
 // HTTP/3 和 h2 一样有 trailer（gRPC 用它送调用状态）。
 func (c *Conn) WriteTrailers(streamID uint64, fields []HeaderField) error {
-	c.block = c.block[:0]
-	c.encW.p = c.block
+	st := c.streamState(streamID)
+	if st == nil {
+		return nil
+	}
+	st.block = st.block[:0]
+	st.encW.p = st.block
 	for i := range fields {
-		if err := c.enc.WriteField(fields[i]); err != nil {
+		if err := st.enc.WriteField(fields[i]); err != nil {
 			return err
 		}
 	}
-	if err := c.enc.Close(); err != nil {
+	if err := st.enc.Close(); err != nil {
 		return err
 	}
-	c.block = c.encW.p
-	c.wbuf = AppendHeaders(c.wbuf, c.block)
-	return c.flush(streamID, true)
+	st.block = st.encW.p
+	st.wbuf = AppendHeaders(st.wbuf, st.block)
+	return st.flush(true)
 }
 
 // flush 把攒下来的帧交给 QUIC 流。
 //
 // QUIC 那层负责按包切、重传、流控，这里一次交完就行。
-func (c *Conn) flush(streamID uint64, close bool) error {
-	str := c.streams[streamID]
-	if str == nil {
-		return nil
-	}
-	_, err := str.Write(c.wbuf)
-	c.wbuf = c.wbuf[:0]
+func (st *streamState) flush(close bool) error {
+	_, err := st.str.Write(st.wbuf)
+	st.wbuf = st.wbuf[:0]
 	if err != nil {
 		return err
 	}
 	if close {
 		// 半关：响应发完这一侧就结束了，对端据此知道没有更多数据
-		return str.Close()
+		return st.str.Close()
 	}
 	return nil
 }
@@ -255,12 +285,10 @@ func (s *NativeServer) serveConn(qc *quic.Conn, h StreamHandler) {
 	c := &Conn{
 		qc:      qc,
 		h:       h,
-		streams: make(map[uint64]*quic.Stream),
+		newH:    s.NewHandler,
+		streams: make(map[uint64]*streamState),
 		dec:     qpack.NewDecoder(),
-		rbuf:    make([]byte, 8*1024),
-		hb:      make([]HeaderField, 0, 16),
 	}
-	c.enc = qpack.NewEncoder(&c.encW)
 
 	ctx := context.Background()
 	if err := c.sendSettings(ctx); err != nil {
@@ -271,13 +299,86 @@ func (s *NativeServer) serveConn(qc *quic.Conn, h StreamHandler) {
 	// 那边的流配额会被占住。单开一个 goroutine 收它们。
 	go c.recvUniStreams(ctx)
 
+	// **每条连接的并行通道数**。
+	//
+	// 1 = 就地串行（连接的 goroutine 上一条一条来）。这是实测最快的默认：
+	// baseline-h3 上它比 quic-go 的"每流一个 goroutine"快 3.7 倍。
+	//
+	// >1 是为了 static-h3 那种**大响应**：一条流写 16KB 时会被 QUIC 的
+	// 流控挡住（str.Write 阻塞），串行的话同连接上后面 63 条流都得等。
+	// 但也不能每流一个 goroutine——那条路测下来反而更慢（baseline-h3
+	// 2.51M -> 1.44M），goroutine 创建加上 quic-go 发送路径的锁竞争，
+	// 比省下来的并行度更贵。所以只有限的几条通道，每条自己一套缓冲和
+	// handler 实例。
+	//
+	// 注意 lanes > 1 时**同一个 StreamHandler 实例不再被串行调用**，
+	// 见 StreamHandler 的说明。
+	lanes := h3Lanes
+	if lanes <= 1 {
+		l := &lane{h: h, st: newStreamState()}
+		for {
+			str, err := qc.AcceptStream(ctx)
+			if err != nil {
+				return
+			}
+			c.handleStream(l, str, uint64(str.StreamID()))
+		}
+	}
+
+	type streamItem struct {
+		str *quic.Stream
+		id  uint64
+	}
+	ch := make(chan streamItem, lanes*2)
+	for i := 0; i < lanes; i++ {
+		go func() {
+			l := &lane{h: c.newH(), st: newStreamState()}
+			for it := range ch {
+				c.handleStream(l, it.str, it.id)
+			}
+		}()
+	}
 	for {
 		str, err := qc.AcceptStream(ctx)
 		if err != nil {
+			close(ch)
 			return
 		}
-		c.handleRequest(str, uint64(str.StreamID()))
+		ch <- streamItem{str, uint64(str.StreamID())}
 	}
+}
+
+// h3Lanes 是每条连接的并行通道数。环境变量是为了能在 lab 上扫一遍
+// （不改代码就能试 1/2/4/8），默认 4。
+//
+// **4 是量出来的**（lab，服务端 0-11 / 客户端 12-23 / MTU 1500）：
+//
+//	              1        4        8      quic-go(http3.Server)
+//	baseline-h3  2.51M    2.41M    2.34M        0.67M
+//	static-h3    199K     235K     233K         215K
+//
+// baseline-h3 是"小响应、高并发"，串行最快；static-h3 是"16KB 响应、64 条
+// 并发流"，一条流写大响应时会被 QUIC 流控挡住，串行就把同连接后面几十条流
+// 一起堵住——4 条通道刚好，再多（8）反而回到锁竞争上。
+var h3Lanes = func() int {
+	if v := os.Getenv("FIO_H3_LANES"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			return n
+		}
+	}
+	return 4
+}()
+
+// lane 是一条并行通道：自己的 handler 实例 + 自己的那套缓冲。
+type lane struct {
+	h  StreamHandler
+	st *streamState
+}
+
+func newStreamState() *streamState {
+	st := &streamState{rbuf: make([]byte, 8*1024), hb: make([]HeaderField, 0, 16)}
+	st.enc = qpack.NewEncoder(&st.encW)
+	return st
 }
 
 // sendSettings 开控制流，发 SETTINGS。
@@ -322,28 +423,42 @@ func (c *Conn) recvUniStreams(ctx context.Context) {
 	}
 }
 
-// handleRequest 处理一条请求流（就地，不起 goroutine）。
+// handleStream 处理一条请求流（在它所属的 lane 上串行执行）。
 //
 // 先把这条流上的帧读完（GET 一次 Read 就到底），再按 http2 那套回调
 // 顺序交给 Handler：OnHeaders 一次，body 非空时再 OnData 一次收尾。
 // **endStream 是这么定出来的**：HTTP/3 的"请求结束"是 QUIC 流的 FIN，
 // 不是帧里的标志（这点和 h2 不同），所以要读完才知道最后那一下算谁的。
-func (c *Conn) handleRequest(str *quic.Stream, streamID uint64) {
-	c.streams[streamID] = str
-	defer delete(c.streams, streamID)
+func (c *Conn) handleStream(l *lane, str *quic.Stream, streamID uint64) {
+	st := l.st
+	st.str = str
+	st.fp.Reset()
+	st.hb = st.hb[:0]
+	st.body = st.body[:0]
 
-	c.fp.Reset()
-	hc := c.hb[:0]     // 这次请求的头字段
-	body := c.body[:0] // 这次请求的体
-	// 头帧里攒下的头块，解完立刻转成字段（载荷指向解析器的内部缓冲，
-	// 不能留到 Parse 返回之后）
-	raw := []byte(nil)
+	c.mu.Lock()
+	c.streams[streamID] = st
+	c.mu.Unlock()
+
+	cbErr := st.readAndDispatch(c, l.h, streamID)
+
+	c.mu.Lock()
+	delete(c.streams, streamID)
+	c.mu.Unlock()
+	st.str = nil
+	_ = cbErr
+}
+
+// readAndDispatch 把一条流读完并交给 Handler。
+func (st *streamState) readAndDispatch(c *Conn, h StreamHandler, streamID uint64) error {
+	// 头帧里攒下的头块：载荷指向解析器的内部缓冲，不能留到 Parse 返回之后
+	var raw []byte
 
 	var cbErr error
 	for {
-		n, err := str.Read(c.rbuf)
+		n, err := st.str.Read(st.rbuf)
 		if n > 0 {
-			if _, perr := c.fp.Parse(c.rbuf[:n], func(f *Frame) error {
+			if _, perr := st.fp.Parse(st.rbuf[:n], func(f *Frame) error {
 				switch f.Type {
 				case FrameHeaders:
 					raw = append(raw[:0], f.Payload...)
@@ -356,10 +471,10 @@ func (c *Conn) handleRequest(str *quic.Stream, streamID uint64) {
 						if derr != nil {
 							return derr
 						}
-						hc = append(hc, hf)
+						st.hb = append(st.hb, hf)
 					}
 				case FrameData:
-					body = append(body, f.Payload...)
+					st.body = append(st.body, f.Payload...)
 				default:
 					// 请求流上不该有别的帧（SETTINGS/GOAWAY 在控制流上）
 				}
@@ -377,17 +492,15 @@ func (c *Conn) handleRequest(str *quic.Stream, streamID uint64) {
 		}
 	}
 
-	c.hb = hc
-	c.body = body[:0]
-
 	if cbErr != nil {
-		c.h.OnRSTStream(c, streamID, ErrCodeGeneralProtocolError)
-		str.CancelRead(quic.StreamErrorCode(ErrCodeGeneralProtocolError))
-		return
+		h.OnRSTStream(c, streamID, ErrCodeGeneralProtocolError)
+		st.str.CancelRead(quic.StreamErrorCode(ErrCodeGeneralProtocolError))
+		return cbErr
 	}
 
-	c.h.OnHeaders(c, streamID, hc, len(body) == 0)
-	if len(body) > 0 {
-		c.h.OnData(c, streamID, body, true)
+	h.OnHeaders(c, streamID, st.hb, len(st.body) == 0)
+	if len(st.body) > 0 {
+		h.OnData(c, streamID, st.body, true)
 	}
+	return nil
 }

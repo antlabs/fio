@@ -92,7 +92,10 @@ func (h *testH3Handler) respond(c *Conn, streamID uint64, body []byte) {
 	}
 }
 
-func startNativeServer(t *testing.T, h StreamHandler) string {
+// startNativeServer 起一个服务端。**传的是响应函数不是 handler 实例**：
+// NewHandler 每条并行通道都要一个自己的实例（见 StreamHandler 的说明），
+// 返回同一个的话几条通道会并发写同一份状态。
+func startNativeServer(t *testing.T, fn func(method, path, query string, body []byte) (int, string)) string {
 	t.Helper()
 	cert, err := fiotls.SelfSignedCert()
 	if err != nil {
@@ -101,7 +104,7 @@ func startNativeServer(t *testing.T, h StreamHandler) string {
 	srv := &NativeServer{
 		Addr:       "127.0.0.1:0",
 		TLSConfig:  &tls.Config{Certificates: []tls.Certificate{cert}, NextProtos: []string{"h3"}},
-		NewHandler: func() StreamHandler { return h },
+		NewHandler: func() StreamHandler { return newTestH3Handler(fn) },
 	}
 	ln, err := quic.ListenAddr(srv.Addr, srv.TLSConfig, nil)
 	if err != nil {
@@ -124,10 +127,9 @@ func nativeClient() *http.Client {
 // （tls 那边 RSA-PSS 的盐长就是这么藏了很久）。对端用 quic-go 的
 // http3 client，它用的是完整的 QPACK + 自己的流管理。
 func TestNativeServerGet(t *testing.T) {
-	addr := startNativeServer(t, newTestH3Handler(
-		func(method, path, query string, body []byte) (int, string) {
-			return 200, fmt.Sprintf("%s %s q=%s", method, path, query)
-		}))
+	addr := startNativeServer(t, func(method, path, query string, body []byte) (int, string) {
+		return 200, fmt.Sprintf("%s %s q=%s", method, path, query)
+	})
 	c := nativeClient()
 	resp, err := c.Get("https://" + addr + "/hello?a=1&b=2")
 	if err != nil {
@@ -148,10 +150,9 @@ func TestNativeServerGet(t *testing.T) {
 
 // POST 带体：走 DATA 帧，两个方向都要对。
 func TestNativeServerPostBody(t *testing.T) {
-	addr := startNativeServer(t, newTestH3Handler(
-		func(method, path string, q string, body []byte) (int, string) {
-			return 200, ":" + string(body)
-		}))
+	addr := startNativeServer(t, func(method, path string, q string, body []byte) (int, string) {
+		return 200, ":" + string(body)
+	})
 	c := nativeClient()
 	resp, err := c.Post("https://"+addr+"/echo", "application/octet-stream",
 		strings.NewReader(strings.Repeat("abc", 5000)))
@@ -168,10 +169,9 @@ func TestNativeServerPostBody(t *testing.T) {
 
 // 同一连接上并发多条流：每个请求的/响应不能串。
 func TestNativeServerConcurrentStreams(t *testing.T) {
-	addr := startNativeServer(t, newTestH3Handler(
-		func(method, path string, q string, body []byte) (int, string) {
-			return 200, path
-		}))
+	addr := startNativeServer(t, func(method, path string, q string, body []byte) (int, string) {
+		return 200, path
+	})
 
 	c := nativeClient()
 	const n = 32
@@ -202,13 +202,12 @@ func TestNativeServerConcurrentStreams(t *testing.T) {
 
 // 状态码不是硬编码成 200。
 func TestNativeServerStatus(t *testing.T) {
-	addr := startNativeServer(t, newTestH3Handler(
-		func(method, path string, q string, body []byte) (int, string) {
-			if path != "/ok" {
-				return 404, "nope"
-			}
-			return 200, "ok"
-		}))
+	addr := startNativeServer(t, func(method, path string, q string, body []byte) (int, string) {
+		if path != "/ok" {
+			return 404, "nope"
+		}
+		return 200, "ok"
+	})
 	c := nativeClient()
 	resp, err := c.Get("https://" + addr + "/missing")
 	if err != nil {
