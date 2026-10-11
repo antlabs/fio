@@ -295,21 +295,29 @@ func (sm *StateMachine) onRecord(r *Record) error {
 		if sm.readKeys == nil || sm.readKeys.aead == nil {
 			return errors.New("tls: encrypted record before keys")
 		}
-		content, innerType, err := sm.readKeys.open(r.Payload)
+		// **解到 sm.plaintext 的尾巴上**（见 openInto）：应用数据那条路
+		// 是每请求每条记录都走的，不能再多一次分配 + 一次拷贝。
+		base := len(sm.plaintext)
+		content, innerType, err := sm.readKeys.openInto(sm.plaintext, r.Payload)
 		if err != nil {
 			return err
 		}
 		switch innerType {
+		case recordApplicationData:
+			// 明文已经在 plaintext 里了，只把末尾那个类型字节剥掉
+			sm.plaintext = content[:len(content)-1]
+			return nil
 		case recordHandshake:
-			_, err := sm.handshakes.Parse(content, func(h *Handshake) error {
+			// 应用阶段极少（基本只有 KeyUpdate）。拷一份交出去：解析器会
+			// 留着它，而上面那块内存马上会被下一条记录覆盖。
+			msg := append([]byte(nil), content[base:len(content)-1]...)
+			_, err := sm.handshakes.Parse(msg, func(h *Handshake) error {
 				return sm.onHandshake(h)
 			})
 			return err
-		case recordApplicationData:
-			sm.plaintext = append(sm.plaintext, content...)
-			return nil
 		case recordAlert:
-			return sm.onAlert(content)
+			alert := append([]byte(nil), content[base:len(content)-1]...)
+			return sm.onAlert(alert)
 		}
 		return nil
 

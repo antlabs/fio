@@ -20,6 +20,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"slices"
 )
 
 // TLS 1.3 的记录保护（RFC 8446 section 5.2）。
@@ -216,57 +217,40 @@ func (p *recordProtector) sealWindow(innerType uint8, a, b []byte, off, n int) (
 	return out, nil
 }
 
-// open 解密一条密文，返回内层明文和真实类型。
-func (p *recordProtector) open(ciphertext []byte) ([]byte, uint8, error) {
+// openInto 解密一条密文，**解到 dst 的尾巴上**，返回追加后的 dst 和真实类型。
+//
+// 调用方传进来的就是攒明文的那块缓冲（StateMachine.plaintext），于是解出来
+// 的明文不用先落到一块临时缓冲、再 append 拷进去。原来那条路是每条记录一次
+// `aead.Open(nil, ...)`（分配一块）+ 一次 append（再拷一遍）——100KB 的请求体
+// 按 16KB 一条记录切就是 7 条，7 次分配、7 次多余拷贝，全在 GC 的账上。
+//
+// 返回的切片**末尾带着内层的真实类型字节**（TLS 1.3 把真实类型藏在密文里，
+// 见文件开头那段），调用方自己剥。返回的切片**只在调用方再动 dst 之前有效**。
+func (p *recordProtector) openInto(dst []byte, ciphertext []byte) ([]byte, uint8, error) {
 	if p.aead == nil {
-		return nil, 0, ErrAEADNotReady
+		return dst, 0, ErrAEADNotReady
 	}
 	if len(ciphertext) < p.aead.Overhead() {
-		return nil, 0, fmt.Errorf("%w: too short", ErrAEADOpen)
+		return dst, 0, fmt.Errorf("%w: too short", ErrAEADOpen)
 	}
 
-	nonce := p.nonce()
-	ad := p.additionalData(0x0303, len(ciphertext))
+	base := len(dst)
+	// 先把容量留够，Open 才能写在 dst 的尾巴上而不是另分配一块。
+	// 用 slices.Grow 而不是自己 make：它按倍增扩，不会让这里变成 O(n^2)
+	// （plaintext 是攒整条请求体的）。
+	dst = slices.Grow(dst, len(ciphertext)-p.aead.Overhead())
 
-	inner, err := p.aead.Open(nil, nonce, ciphertext, ad)
+	// dst[base:base] 的容量就是 Open 能落脚的地方
+	plain, err := p.aead.Open(dst[base:base], p.nonce(), ciphertext,
+		p.additionalData(0x0303, len(ciphertext)))
 	if err != nil {
-		return nil, 0, ErrAEADOpen
+		return dst, 0, ErrAEADOpen
 	}
 	p.seq++
 
-	// 最后一个字节是真实类型
-	if len(inner) == 0 {
-		return nil, 0, fmt.Errorf("%w: empty inner plaintext", ErrAEADOpen)
+	out := dst[:base+len(plain)]
+	if len(plain) == 0 {
+		return out, 0, fmt.Errorf("%w: empty inner plaintext", ErrAEADOpen)
 	}
-	innerType := inner[len(inner)-1]
-	content := inner[:len(inner)-1]
-
-	// **剥填充：从末尾往前，但只剥"类型字节那一段连续的零"里属于填充的
-	// 部分——而光看零是分不清"填充的零"和"数据末尾的零"的。**
-	//
-	// 这是个真踩过的坑：EE（EncryptedExtensions）的内容是
-	// `08 00 00 02 00 00`，最后那两个 0 是"空扩展列表的长度字段"，
-	// 是**真实数据**。早先这里无脑把末尾的零全剥了，结果 EE 只剩
-	// `08 00 00 02`（一个不完整的握手头），被攒进握手解析器；下一条
-	// 记录的明文接上去，长度字段就成了天文数字（实测报
-	// "handshake message 3604480 bytes"）。
-	//
-	// 正确的做法：**填充只能是"整个明文就是 0 组成"那段的前缀**，
-	// 也就是 RFC 8446 说的 "zeros[length_of_padding]"。但接收方没有
-	// 内层长度可参照，所以只能按"零填充是发送方为了对齐而加的、内容
-	// 本身不该以零结尾"这个约定来剥——**而这个约定对 EE 不成立**。
-	//
-	// 所以这里用另一条更可靠的规则：**只剥掉"末尾连续的零里，
-	// 最后一个非零字节之后的那一段"**，也就是……不剥。
-	//
-	// 结论：**不做填充剥离**。我们自己的发送端不加填充（seal 里没加），
-	// 而标准实现（crypto/tls、openssl）默认也不加。真遇到加填充的对端，
-	// 那部分零会被当成内容的一段——对握手消息来说会导致解析失败。
-	// 要支持加填充的对端，得按 RFC 的规则来：接收方解析时**先用
-	// 内层长度字段**判断内容多长（比如握手消息的前 4 字节），而不是
-	// 靠剥零。
-	//
-	// 这里先把"剥零"去掉——它带来的问题是实实在在的（把真实数据当
-	// 填充吃掉），而它想解决的"对端加填充"我们还没遇到。
-	return content, innerType, nil
+	return out, out[len(out)-1], nil
 }
