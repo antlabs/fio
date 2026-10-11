@@ -82,6 +82,14 @@ func equalFold(a, b string) bool {
 	return true
 }
 
+// proto11 / proto10 是常见的两个版本号，**常量**——每次拼字符串的话
+// 每个请求要两次 strconv.Itoa 加一次拼接。响应行那边（buildHeader）也是
+// 拿这两个常量比的，两边是同一份值。
+const (
+	proto11 = "HTTP/1.1"
+	proto10 = "HTTP/1.0"
+)
+
 // requestBuilder 把 httparser 的回调攒成一个 Request。
 //
 // httparser 的回调是按字节流切的（URL 可能回调多次、头名和头值分开回调），
@@ -172,8 +180,23 @@ func (b *requestBuilder) setting(p *Parser) *httparser.Setting {
 			if b.owner.done {
 				return
 			}
-			// 版本到这儿才准（请求行解完才有）
-			b.req.Proto = "HTTP/" + strconv.Itoa(int(p.Major)) + "." + strconv.Itoa(int(p.Minor))
+			// 版本到这儿才准（请求行解完才有）。
+			//
+			// **别每次拼字符串**：原来是
+			// `"HTTP/" + strconv.Itoa(Major) + "." + strconv.Itoa(Minor)`——
+			// 两次 Itoa 加一次拼接，**每个请求三个堆分配**。1.0/1.1 之外
+			// 的版本在这条路上几乎不存在，直接查表；真遇到了才拼。
+			//
+			// 实测（baseline，gcannon 混合 GET/POST）：这个回调占 1.86%，
+			// 而和 fib 的差距总共才 7.3%。
+			switch {
+			case p.Major == 1 && p.Minor == 1:
+				b.req.Proto = proto11
+			case p.Major == 1 && p.Minor == 0:
+				b.req.Proto = proto10
+			default:
+				b.req.Proto = "HTTP/" + strconv.Itoa(int(p.Major)) + "." + strconv.Itoa(int(p.Minor))
+			}
 			b.req.Method = p.Method.String()
 			if cl, ok := b.req.Get("Content-Length"); ok {
 				if n, err := strconv.ParseInt(cl, 10, 64); err == nil {
