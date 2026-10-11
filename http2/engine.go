@@ -126,16 +126,41 @@ func (ch *ConnHandler) OnData(c *engine.Conn, buf []byte) (int, error) {
 		ch.OnOpen(c)
 	}
 
-	consumed, out, err := ch.conn.Feed(buf)
-	if len(out) > 0 {
-		if werr := c.Write(out); werr != nil {
-			return consumed, werr
-		}
+	return ch.conn.FeedWrite(c, buf)
+}
+
+// FeedWrite 喂一段字节，并**在这次调用里把产生的帧写出去**，返回消化量。
+//
+// 和 Feed 只差输出怎么交出去，而这一点对 static 这类大响应是决定性的：
+// Feed 走 TakeOutput，那把发送缓冲的数组交出去之后连接就丢了它
+// （outBuf = nil），下一批帧只能重新分配——8KB 的响应就是每请求一块 8KB，
+// 实测那一处占 static 全部堆分配的 90%。这里改成写完把数组复位留着，
+// 下一批接着用。
+//
+// **写的时候持着协议锁**：那块缓冲马上要被复用，锁外写的话另一个 goroutine
+// 的一次 WriteData 就能把它覆盖掉——这正是这把锁存在的理由。ec.Write 自己
+// 拿引擎那把锁，而两把锁的获取顺序在别处都是"协议 → 引擎"（引擎调 OnData
+// 时不持自己的锁），不会反向，所以不构成死锁。
+func (c *Conn) FeedWrite(ec *engine.Conn, data []byte) (int, error) {
+	consumed, err := c.feed(data)
+	if werr := c.WriteOutput(ec); werr != nil && err == nil {
+		err = werr
 	}
-	if err != nil {
-		return consumed, err
+	return consumed, err
+}
+
+// WriteOutput 把攒下的帧写给 ec，并保留那块缓冲给下一轮。
+func (c *Conn) WriteOutput(ec *engine.Conn) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if len(c.outBuf) == 0 {
+		return nil
 	}
-	return consumed, nil
+	if err := ec.Write(c.outBuf); err != nil {
+		return err
+	}
+	c.outBuf = c.outBuf[:0]
+	return nil
 }
 
 // OnClose 连接关闭。
@@ -148,9 +173,7 @@ func (ch *ConnHandler) Conn() *Conn { return ch.conn }
 
 // flush 把内部缓冲里的东西写出去。
 func (ch *ConnHandler) flush(c *engine.Conn) {
-	if out := ch.conn.TakeOutput(); len(out) > 0 {
-		_ = c.Write(out)
-	}
+	_ = ch.conn.WriteOutput(c)
 }
 
 // WriteHeaders 发响应头（走 engine 的连接）。
@@ -181,8 +204,5 @@ func (ch *ConnHandler) WriteTrailers(c *engine.Conn, streamID uint32, fields []H
 
 // writeOut 把状态机吐出来的字节写进连接。
 func (ch *ConnHandler) writeOut(c *engine.Conn) error {
-	if out := ch.conn.TakeOutput(); len(out) > 0 {
-		return c.Write(out)
-	}
-	return nil
+	return ch.conn.WriteOutput(c)
 }
