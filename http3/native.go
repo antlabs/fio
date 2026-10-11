@@ -17,9 +17,7 @@ package http3
 import (
 	"context"
 	"crypto/tls"
-	"errors"
 	"io"
-	"strconv"
 
 	"github.com/quic-go/qpack"
 	"github.com/quic-go/quic-go"
@@ -27,6 +25,10 @@ import (
 
 // 自建的 HTTP/3 服务端：**只借 quic-go 的 QUIC 传输**，HTTP/3 这一层
 // （帧、QPACK、流分类、请求生命周期）全在这里，不经过 net/http。
+//
+// **对外的形状和 http2 那套一致**——一样的 StreamHandler 接口、一样的
+// Conn.WriteHeaders/WriteData(streamID, ...)、一样把 HeaderField 做成
+// 类型别名。协议层的实现者（比如 arena 的入口）两个协议用同一套写法。
 //
 // 为什么不直接用 quic-go/http3.Server：那一层把每条 QUIC 流适配成
 // net/http 的 Request/ResponseWriter，而且**每个请求起一个 goroutine**。
@@ -42,104 +44,133 @@ import (
 // 也就是说那 63% 里有约九成是"把 QUIC 流翻译成 net/http"的开销，而栈
 // 拷贝那 21% 也是那套深调用链带出来的。
 //
-// 这里的几个取舍，都是为了把这条路压到最短：
-//
+// 几个取舍：
 //   - **不为每个请求起 goroutine**：请求流在连接的 goroutine 上就地处理。
-//     h3 的流本来互相独立，但一个请求的帧读完之前不会阻塞在网络上（数据
-//     已经在 QUIC 的接收缓冲里），就地做省掉一次 goroutine 创建 + 调度 +
-//     （见下面的 readRequest）一次栈增长。
-//   - **QPACK 只用静态表**：SETTINGS 里把 MAX_TABLE_CAPACITY 和
+//   - **QPACK 只用静态表**：SETTINGS 里 MAX_TABLE_CAPACITY 和
 //     BLOCKED_STREAMS 都报 0，对端就只用静态表和字面量表示，解码器不需要
-//     任何动态状态（quic-go/qpack 的 Decoder 正好只支持这一档）。代价是
-//     头块比用动态表大一点，但省掉的是编解码器单向流的往返和阻塞语义。
-//   - **响应一个 Write 发完**：HEADERS 帧 + DATA 帧拼在同一个缓冲里，
-//     只调一次 Stream.Write。QUIC 那层会按包边界自己切。
-//   - **每条连接复用四块缓冲**（读、头块、输出、头字段），一个请求里
-//     不分配。
-type Handler func(w *ResponseWriter, r *Request) error
+//     任何跨流状态（quic-go/qpack 的 Decoder 正好只支持这一档）。
+//   - **一次响应一个 Write**：HEADERS 帧 + DATA 帧拼在同一个缓冲里。
+//   - **每条连接复用几块缓冲**，一个请求不分配（除非体长过现有容量）。
 
-// Request 是一次 HTTP/3 请求。
+// HeaderField 和 http2 那边一样是个别名——两边的用法完全相同。
+type HeaderField = qpack.HeaderField
+
+// ErrCode 是 HTTP/3 的应用错误码（RFC 9114 section 8.1）。
+type ErrCode uint64
+
+const (
+	// ErrCodeNoError 没有错误。
+	ErrCodeNoError ErrCode = 0x100
+	// ErrCodeGeneralProtocolError 通用协议错误。
+	ErrCodeGeneralProtocolError ErrCode = 0x101
+	// ErrCodeInternalError 内部错误。
+	ErrCodeInternalError ErrCode = 0x102
+	// ErrCodeStreamCreationError 流创建错误。
+	ErrCodeStreamCreationError ErrCode = 0x103
+)
+
+// StreamHandler 是流上面的事件回调。
 //
-// **只在 Handler 返回之前有效**：里面的切片指向连接复用的缓冲，要留着
-// 自己拷。这条和 net/http 的 Request 不一样，是刻意的——拷一份 100KB 的
-// 请求体在每个请求上都发生一次，而这个包的使用者（benchmark 的服务端）
-// 从来不留。
-type Request struct {
-	// Method 是 :method（"GET"、"POST"……）
-	Method string
-	// Path 是 :path 里 '?' 之前那一段
-	Path string
-	// Query 是 :path 里 '?' 之后那一段（不含 '?'）
-	Query string
-	// Proto 固定是 "HTTP/3.0"
-	Proto string
-	// Header 是普通的头字段（伪头已经拆到上面的字段里，不在这里）
-	Header []qpack.HeaderField
-	// Body 是请求体（DATA 帧拼起来的）
-	Body []byte
+// **和 http2.StreamHandler 是同一套**：协议层（比如 gRPC）实现它，http3
+// 把流上的请求头、数据、结束通知交给它。差别只有 streamID 是 uint64
+// （QUIC 的流 ID 是 62 位变长整数）。
+type StreamHandler interface {
+	// OnHeaders 一个流的请求头解完了。
+	OnHeaders(c *Conn, streamID uint64, headers []HeaderField, endStream bool)
+
+	// OnData 流上的数据。末尾那次 endStream 为真。
+	OnData(c *Conn, streamID uint64, data []byte, endStream bool)
+
+	// OnRSTStream 对端重置了一个流。
+	OnRSTStream(c *Conn, streamID uint64, code ErrCode)
 }
 
-// Get 按名字取一个请求头，**大小写敏感**（HTTP/3 的头名规定是小写，
-// 对端不规范的话这里取不到，和 net/http 的宽松处理不同）。
-func (r *Request) Get(name string) (string, bool) {
-	for i := range r.Header {
-		if r.Header[i].Name == name {
-			return r.Header[i].Value, true
-		}
-	}
-	return "", false
-}
-
-// StatusText 常见状态码的文本。不走 net/http 的 StatusText 是为了少一个
-// 依赖，也少一次 map 查找。
-func StatusText(code int) string {
-	switch code {
-	case 200:
-		return "200"
-	case 204:
-		return "204"
-	case 404:
-		return "404"
-	case 500:
-		return "500"
-	}
-	return strconv.Itoa(code)
-}
-
-// ResponseWriter 写一次响应。
-type ResponseWriter struct {
-	str *quic.Stream
-	// c 是它所属的连接（缓冲都从那里借）
-	c *nativeConn
-	// wrote 表示这次响应已经写过了
-	wrote bool
-}
-
-// WriteResponse 一次把整个响应写出去。
+// Conn 是一条 HTTP/3 连接。
 //
-// status 是状态码，headers 是普通头字段（Content-Length 由这里按
-// len(body) 补，调用方不用传），body 是响应体。
-//
-// **只调一次 Stream.Write**：HEADERS 帧和 DATA 帧拼在同一个缓冲里。
-func (w *ResponseWriter) WriteResponse(status int, headers []qpack.HeaderField, body []byte) error {
-	if w.wrote {
-		return errors.New("http3: response already written")
-	}
-	w.wrote = true
+// 和 http2.Conn 一样是"每条连接一个"，**不是并发安全的**：所有回调都
+// 在这条连接的 goroutine 上跑（见 NativeServer.serveConn）。
+type Conn struct {
+	qc *quic.Conn
+	// h 是流事件的接收者（和 http2.Conn 的 handler 一个位置）
+	h StreamHandler
+	// streams 是活着的请求流：WriteHeaders/WriteData 靠它按 streamID 找
+	// 到对应的 QUIC 流
+	streams map[uint64]*quic.Stream
 
-	c := w.c
-	// ── 头块：QPACK 编码 ──────────────────────────────────────────
+	// QPACK。编码器只走静态表，解码器同样。
+	dec *qpack.Decoder
+	// enc 的落点是 &encW（构造时传进去，字段地址稳定），
+	// 每编一块头先把 encW.p 指到 block 上。
+	enc  *qpack.Encoder
+	encW sliceWriter
+
+	// 复用缓冲：读、头块、发送、头字段
+	rbuf  []byte
+	block []byte
+	wbuf  []byte
+	hb    []HeaderField
+	body  []byte
+
+	fp FrameParser
+}
+
+// sliceWriter 是 qpack.Encoder 的落点：直接 append 进复用的切片，
+// 不走 bytes.Buffer（那个每次 Write 都可能重新分配）。
+type sliceWriter struct{ p []byte }
+
+func (w *sliceWriter) Write(b []byte) (int, error) {
+	w.p = append(w.p, b...)
+	return len(b), nil
+}
+
+// WriteHeaders 把一个流的响应头发出去。
+//
+// 和 http2.Conn.WriteHeaders 一样：fields 里要自己带 :status，endStream
+// 为真表示这次响应没有体（或者体已经在之前发出去了）。
+//
+// **一次响应从这里开始**：内部发送缓冲在这一刻复位。
+func (c *Conn) WriteHeaders(streamID uint64, fields []HeaderField, endStream bool) error {
+	c.wbuf = c.wbuf[:0]
+
 	c.block = c.block[:0]
 	c.encW.p = c.block
-	// 复用编码器：它只在第一个 WriteField 时写一次头块前缀（两个 0），
-	// Close 之后可以接着编下一块
-
-	// 伪头在前（RFC 9114 4.3.1 要求）
-	if err := c.enc.WriteField(qpack.HeaderField{Name: ":status", Value: StatusText(status)}); err != nil {
+	for i := range fields {
+		if err := c.enc.WriteField(fields[i]); err != nil {
+			return err
+		}
+	}
+	// Close 只是复位编码器（头块前缀下次重写），不是"关流"
+	if err := c.enc.Close(); err != nil {
 		return err
 	}
-	for i := range headers {
-		if err := c.enc.WriteField(headers[i]); err != nil {
+	c.block = c.encW.p
+	c.wbuf = AppendHeaders(c.wbuf, c.block)
+
+	if endStream {
+		return c.flush(streamID, true)
+	}
+	return nil
+}
+
+// WriteData 往一个流上写体。
+//
+// 和 http2.Conn.WriteData 一样：这次调用会把积压的头帧一起发出去。
+func (c *Conn) WriteData(streamID uint64, data []byte, endStream bool) error {
+	c.wbuf = AppendData(c.wbuf, data)
+	if endStream {
+		return c.flush(streamID, true)
+	}
+	return nil
+}
+
+// WriteTrailers 发 trailer：一个带 END_STREAM 的 HEADERS 帧。
+//
+// HTTP/3 和 h2 一样有 trailer（gRPC 用它送调用状态）。
+func (c *Conn) WriteTrailers(streamID uint64, fields []HeaderField) error {
+	c.block = c.block[:0]
+	c.encW.p = c.block
+	for i := range fields {
+		if err := c.enc.WriteField(fields[i]); err != nil {
 			return err
 		}
 	}
@@ -147,41 +178,38 @@ func (w *ResponseWriter) WriteResponse(status int, headers []qpack.HeaderField, 
 		return err
 	}
 	c.block = c.encW.p
+	c.wbuf = AppendHeaders(c.wbuf, c.block)
+	return c.flush(streamID, true)
+}
 
-	// ── 拼帧：HEADERS + DATA ─────────────────────────────────────
-	out := c.wbuf[:0]
-	out = AppendHeaders(out, c.block)
-	if len(body) > 0 {
-		out = AppendData(out, body)
+// flush 把攒下来的帧交给 QUIC 流。
+//
+// QUIC 那层负责按包切、重传、流控，这里一次交完就行。
+func (c *Conn) flush(streamID uint64, close bool) error {
+	str := c.streams[streamID]
+	if str == nil {
+		return nil
 	}
-	c.wbuf = out
-
-	// QUIC 的流写会把数据交给传输层（按包切、重传、流控都在那边），
-	// 这里一次交完。
-	if _, err := w.str.Write(out); err != nil {
+	_, err := str.Write(c.wbuf)
+	c.wbuf = c.wbuf[:0]
+	if err != nil {
 		return err
 	}
-	// 半关：响应发完这一侧就结束了，对端据此知道没有更多数据
-	return w.str.Close()
+	if close {
+		// 半关：响应发完这一侧就结束了，对端据此知道没有更多数据
+		return str.Close()
+	}
+	return nil
 }
 
-// WriteResponseKV 和 WriteResponse 一样，但头用 [][2]string 给。
-//
-// 给的是"键值成对"的切片（arena 那类 handler 内部就是这么存的），
-// 这里用连接级的复用切片转成 HeaderField，省掉每请求一次分配。
-func (w *ResponseWriter) WriteResponseKV(status int, headers [][2]string, body []byte) error {
-	c := w.c
-	c.hfc = c.hfc[:0]
-	for i := range headers {
-		c.hfc = append(c.hfc, qpack.HeaderField{Name: headers[i][0], Value: headers[i][1]})
-	}
-	return w.WriteResponse(status, c.hfc, body)
-}
+// Conn 暴露底层的 QUIC 连接（拿对端地址这类用途）。
+func (c *Conn) QUICConn() *quic.Conn { return c.qc }
 
 // NativeServer 是自建的 HTTP/3 服务端。
 //
-// 和 Server 的区别：Server 把请求交给 net/http 的 Handler，这个交给
-// 自己的 Handler——请求/响应不经过 net/http 的任何对象。
+// 和 Server 的区别：Server 把请求交给 net/http 的 Handler（那是 quic-go
+// 的 http3.Server 要求的），这个把流事件交给 StreamHandler——**和 http2
+// 那套入口一个形状**。
 type NativeServer struct {
 	// Addr 是监听的 UDP 地址，形如 ":443"。
 	Addr string
@@ -189,8 +217,12 @@ type NativeServer struct {
 	TLSConfig *tls.Config
 	// QUICConfig 是 QUIC 那层的参数。
 	QUICConfig *quic.Config
-	// Handler 处理请求。
-	Handler Handler
+	// NewHandler 每条连接建一个流事件接收者。
+	//
+	// **是工厂不是单个实例**：Handler 是每条连接一份的有状态对象（攒流的
+	// 头、复用缓冲），共用一个就得加锁。fio 里 engine.ListenAndServe 的
+	// newHandler 也是这个形状。
+	NewHandler func() StreamHandler
 }
 
 // ListenAndServe 起服务，阻塞到出错。
@@ -213,58 +245,26 @@ func (s *NativeServer) Serve(ln *quic.Listener) error {
 		if err != nil {
 			return err
 		}
-		go s.serveConn(qc)
+		// 一条 QUIC 连接一个 goroutine（和 http2 那边"一个 engine.Conn
+		// 一个协议状态"是一个量级），但**流不再各起一个**。
+		go s.serveConn(qc, s.NewHandler())
 	}
 }
 
-// ── 连接 ────────────────────────────────────────────────────────────────
-
-type nativeConn struct {
-	s  *NativeServer
-	qc *quic.Conn
-
-	dec *qpack.Decoder
-	// enc 的落点是 &encW（构造时传进去，字段地址稳定），
-	// 每编一块头先把 encW.p 指到 block 上。
-	enc  *qpack.Encoder
-	encW sliceWriter
-
-	// 复用缓冲。一个请求走完不分配新内存（除非请求体或响应体长过现有容量）。
-	rbuf  []byte
-	block []byte
-	wbuf  []byte
-	// hb 是请求头（复用），hfc 是响应头转成 HeaderField 后的复用切片
-	hb  []qpack.HeaderField
-	hfc []qpack.HeaderField
-
-	fp  FrameParser
-	req Request
-	w   ResponseWriter
-}
-
-// sliceWriter 是 qpack.Encoder 的落点：直接 append 进复用的切片，
-// 不走 bytes.Buffer（那个每次 Write 都可能重新分配）。
-type sliceWriter struct{ p []byte }
-
-func (w *sliceWriter) Write(b []byte) (int, error) {
-	w.p = append(w.p, b...)
-	return len(b), nil
-}
-
-func (s *NativeServer) serveConn(qc *quic.Conn) {
-	c := &nativeConn{
-		s:    s,
-		qc:   qc,
-		dec:  qpack.NewDecoder(),
-		rbuf: make([]byte, 8*1024),
-		hb:   make([]qpack.HeaderField, 0, 16),
+func (s *NativeServer) serveConn(qc *quic.Conn, h StreamHandler) {
+	c := &Conn{
+		qc:      qc,
+		h:       h,
+		streams: make(map[uint64]*quic.Stream),
+		dec:     qpack.NewDecoder(),
+		rbuf:    make([]byte, 8*1024),
+		hb:      make([]HeaderField, 0, 16),
 	}
 	c.enc = qpack.NewEncoder(&c.encW)
-	c.w.c = c
 
 	ctx := context.Background()
 	if err := c.sendSettings(ctx); err != nil {
-		qc.CloseWithError(0, "")
+		qc.CloseWithError(quic.ApplicationErrorCode(ErrCodeInternalError), "")
 		return
 	}
 	// 对端的单向流（控制流、QPACK 编/解码器流）要收，不然 quic-go
@@ -276,7 +276,7 @@ func (s *NativeServer) serveConn(qc *quic.Conn) {
 		if err != nil {
 			return
 		}
-		c.handleRequest(str)
+		c.handleRequest(str, uint64(str.StreamID()))
 	}
 }
 
@@ -285,7 +285,7 @@ func (s *NativeServer) serveConn(qc *quic.Conn) {
 // **MAX_TABLE_CAPACITY 和 BLOCKED_STREAMS 都报 0**：告诉对端"别用动态表"。
 // 这样头块里出现的只可能是静态表引用和字面量，解码器不需要任何跨流的
 // 状态（也就不需要处理 QPACK 编解码器单向流上的指令）。
-func (c *nativeConn) sendSettings(ctx context.Context) error {
+func (c *Conn) sendSettings(ctx context.Context) error {
 	str, err := c.qc.OpenUniStreamSync(ctx)
 	if err != nil {
 		return err
@@ -307,7 +307,7 @@ func (c *nativeConn) sendSettings(ctx context.Context) error {
 //
 // 我们只关心控制流（对端的 SETTINGS），别的读干净丢掉——不读的话
 // 对面那条流会一直挂着，占住它的单向流配额。
-func (c *nativeConn) recvUniStreams(ctx context.Context) {
+func (c *Conn) recvUniStreams(ctx context.Context) {
 	buf := make([]byte, 4096)
 	for {
 		str, err := c.qc.AcceptUniStream(ctx)
@@ -323,30 +323,22 @@ func (c *nativeConn) recvUniStreams(ctx context.Context) {
 }
 
 // handleRequest 处理一条请求流（就地，不起 goroutine）。
-func (c *nativeConn) handleRequest(str *quic.Stream) {
-	c.fp.Reset()
-	c.req = Request{Proto: "HTTP/3.0", Body: c.req.Body[:0], Header: c.hb[:0]}
-	c.w.str = str
-	c.w.wrote = false
-
-	if err := c.readRequest(str); err != nil {
-		str.CancelRead(0)
-		return
-	}
-	c.hb = c.req.Header
-
-	if c.s.Handler != nil {
-		_ = c.s.Handler(&c.w, &c.req)
-		return
-	}
-	_ = c.w.WriteResponse(204, nil, nil)
-}
-
-// readRequest 把一条请求流上的帧读完，填进 c.req。
 //
-// 就地循环读：读到流结束（客户端发完请求就 END_STREAM）。GET 请求
-// 上来就是"HEADERS + FIN"，一次 Read 就完事。
-func (c *nativeConn) readRequest(str *quic.Stream) error {
+// 先把这条流上的帧读完（GET 一次 Read 就到底），再按 http2 那套回调
+// 顺序交给 Handler：OnHeaders 一次，body 非空时再 OnData 一次收尾。
+// **endStream 是这么定出来的**：HTTP/3 的"请求结束"是 QUIC 流的 FIN，
+// 不是帧里的标志（这点和 h2 不同），所以要读完才知道最后那一下算谁的。
+func (c *Conn) handleRequest(str *quic.Stream, streamID uint64) {
+	c.streams[streamID] = str
+	defer delete(c.streams, streamID)
+
+	c.fp.Reset()
+	hc := c.hb[:0]     // 这次请求的头字段
+	body := c.body[:0] // 这次请求的体
+	// 头帧里攒下的头块，解完立刻转成字段（载荷指向解析器的内部缓冲，
+	// 不能留到 Parse 返回之后）
+	raw := []byte(nil)
+
 	var cbErr error
 	for {
 		n, err := str.Read(c.rbuf)
@@ -354,8 +346,8 @@ func (c *nativeConn) readRequest(str *quic.Stream) error {
 			if _, perr := c.fp.Parse(c.rbuf[:n], func(f *Frame) error {
 				switch f.Type {
 				case FrameHeaders:
-					// 载荷指向解析器的内部缓冲，**要当场解掉**
-					dec := c.dec.Decode(f.Payload)
+					raw = append(raw[:0], f.Payload...)
+					dec := c.dec.Decode(raw)
 					for {
 						hf, derr := dec()
 						if derr == io.EOF {
@@ -364,52 +356,38 @@ func (c *nativeConn) readRequest(str *quic.Stream) error {
 						if derr != nil {
 							return derr
 						}
-						c.addField(hf)
+						hc = append(hc, hf)
 					}
 				case FrameData:
-					c.req.Body = append(c.req.Body, f.Payload...)
+					body = append(body, f.Payload...)
 				default:
 					// 请求流上不该有别的帧（SETTINGS/GOAWAY 在控制流上）
 				}
 				return nil
 			}); perr != nil {
-				return perr
+				cbErr = perr
+				break
 			}
 		}
 		if err != nil {
-			if err == io.EOF {
-				return cbErr
+			if err != io.EOF {
+				cbErr = err
 			}
-			return err
+			break
 		}
 	}
-}
 
-// addField 把一个头字段收进请求里：伪头拆成字段，普通的进 Header。
-func (c *nativeConn) addField(hf qpack.HeaderField) {
-	switch hf.Name {
-	case ":method":
-		c.req.Method = hf.Value
-	case ":path":
-		if i := indexByte(hf.Value, '?'); i >= 0 {
-			c.req.Path = hf.Value[:i]
-			c.req.Query = hf.Value[i+1:]
-		} else {
-			c.req.Path = hf.Value
-			c.req.Query = ""
-		}
-	case ":scheme", ":authority":
-		// 回环的 benchmark 用不上；留着会让 Header 多两次遍历
-	default:
-		c.req.Header = append(c.req.Header, hf)
-	}
-}
+	c.hb = hc
+	c.body = body[:0]
 
-func indexByte(s string, b byte) int {
-	for i := 0; i < len(s); i++ {
-		if s[i] == b {
-			return i
-		}
+	if cbErr != nil {
+		c.h.OnRSTStream(c, streamID, ErrCodeGeneralProtocolError)
+		str.CancelRead(quic.StreamErrorCode(ErrCodeGeneralProtocolError))
+		return
 	}
-	return -1
+
+	c.h.OnHeaders(c, streamID, hc, len(body) == 0)
+	if len(body) > 0 {
+		c.h.OnData(c, streamID, body, true)
+	}
 }

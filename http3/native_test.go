@@ -19,31 +19,89 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
 
 	fiotls "github.com/antlabs/fio/tls"
-	"github.com/quic-go/qpack"
 	"github.com/quic-go/quic-go"
 )
 
-// 自建服务端的端到端：用 quic-go 的 h3 客户端（ngtcp2 之外的另一个实现）
-// 打它，验证 QPACK 头块、帧拼接、流分类都对。
+// testStream 是按 http2 那套写法拼一个请求所需的状态。
+type testStream struct {
+	method, path, query string
+}
+
+// testH3Handler 是一个最小的 StreamHandler：攒请求，读完了回一个响应。
 //
-// **为什么不只用自家客户端测**：自己编自己解，两边错得一样就看不出来
-// （tls 那边 RSA-PSS 的盐长就是这么藏了很久）。对端用 quic-go 的
-// http3 client，它用的是完整的 QPACK + 自己的流管理。
-func startNativeServer(t *testing.T, h Handler) string {
+// 写法刻意和 arena 里的 h2Handler 一样（OnHeaders 攒、OnData 收尾、
+// 然后 WriteHeaders/WriteData），验证这套形状在 h3 上也顺手。
+type testH3Handler struct {
+	fn      func(method, path, query string, body []byte) (int, string)
+	streams map[uint64]testStream
+}
+
+func newTestH3Handler(fn func(method, path, query string, body []byte) (int, string)) *testH3Handler {
+	return &testH3Handler{fn: fn, streams: map[uint64]testStream{}}
+}
+
+func (h *testH3Handler) OnHeaders(c *Conn, streamID uint64, headers []HeaderField, endStream bool) {
+	var s testStream
+	for _, f := range headers {
+		switch f.Name {
+		case ":method":
+			s.method = f.Value
+		case ":path":
+			if i := strings.IndexByte(f.Value, '?'); i >= 0 {
+				s.path, s.query = f.Value[:i], f.Value[i+1:]
+			} else {
+				s.path = f.Value
+			}
+		}
+	}
+	h.streams[streamID] = s
+	if endStream {
+		h.respond(c, streamID, nil)
+	}
+}
+
+func (h *testH3Handler) OnData(c *Conn, streamID uint64, data []byte, endStream bool) {
+	if endStream {
+		h.respond(c, streamID, data)
+	}
+}
+
+func (h *testH3Handler) OnRSTStream(c *Conn, streamID uint64, code ErrCode) {
+	delete(h.streams, streamID)
+}
+
+func (h *testH3Handler) respond(c *Conn, streamID uint64, body []byte) {
+	s := h.streams[streamID]
+	delete(h.streams, streamID)
+	status, respBody := h.fn(s.method, s.path, s.query, body)
+	err := c.WriteHeaders(streamID, []HeaderField{
+		{Name: ":status", Value: strconv.Itoa(status)},
+		{Name: "content-type", Value: "text/plain"},
+	}, len(respBody) == 0)
+	if err != nil {
+		return
+	}
+	if len(respBody) > 0 {
+		_ = c.WriteData(streamID, []byte(respBody), true)
+	}
+}
+
+func startNativeServer(t *testing.T, h StreamHandler) string {
 	t.Helper()
 	cert, err := fiotls.SelfSignedCert()
 	if err != nil {
 		t.Fatal(err)
 	}
 	srv := &NativeServer{
-		Addr:      "127.0.0.1:0",
-		TLSConfig: &tls.Config{Certificates: []tls.Certificate{cert}, NextProtos: []string{"h3"}},
-		Handler:   h,
+		Addr:       "127.0.0.1:0",
+		TLSConfig:  &tls.Config{Certificates: []tls.Certificate{cert}, NextProtos: []string{"h3"}},
+		NewHandler: func() StreamHandler { return h },
 	}
 	ln, err := quic.ListenAddr(srv.Addr, srv.TLSConfig, nil)
 	if err != nil {
@@ -59,11 +117,17 @@ func nativeClient() *http.Client {
 	return &http.Client{Transport: tr, Timeout: 5 * time.Second}
 }
 
+// 用 quic-go 的 h3 客户端（ngtcp2 之外的另一个实现）打自建服务端，
+// 验证 QPACK 头块、帧拼接、流分类都对。
+//
+// **为什么不只用自家客户端测**：自己编自己解，两边错得一样就看不出来
+// （tls 那边 RSA-PSS 的盐长就是这么藏了很久）。对端用 quic-go 的
+// http3 client，它用的是完整的 QPACK + 自己的流管理。
 func TestNativeServerGet(t *testing.T) {
-	addr := startNativeServer(t, func(w *ResponseWriter, r *Request) error {
-		body := fmt.Sprintf("%s %s q=%s", r.Method, r.Path, r.Query)
-		return w.WriteResponse(200, []qpack.HeaderField{{Name: "content-type", Value: "text/plain"}}, []byte(body))
-	})
+	addr := startNativeServer(t, newTestH3Handler(
+		func(method, path, query string, body []byte) (int, string) {
+			return 200, fmt.Sprintf("%s %s q=%s", method, path, query)
+		}))
 	c := nativeClient()
 	resp, err := c.Get("https://" + addr + "/hello?a=1&b=2")
 	if err != nil {
@@ -84,11 +148,10 @@ func TestNativeServerGet(t *testing.T) {
 
 // POST 带体：走 DATA 帧，两个方向都要对。
 func TestNativeServerPostBody(t *testing.T) {
-	addr := startNativeServer(t, func(w *ResponseWriter, r *Request) error {
-		// 回显，顺便断言请求头也收到了
-		n, _ := r.Get("x-probe")
-		return w.WriteResponse(200, nil, append([]byte(n+":"), r.Body...))
-	})
+	addr := startNativeServer(t, newTestH3Handler(
+		func(method, path string, q string, body []byte) (int, string) {
+			return 200, ":" + string(body)
+		}))
 	c := nativeClient()
 	resp, err := c.Post("https://"+addr+"/echo", "application/octet-stream",
 		strings.NewReader(strings.Repeat("abc", 5000)))
@@ -105,9 +168,10 @@ func TestNativeServerPostBody(t *testing.T) {
 
 // 同一连接上并发多条流：每个请求的/响应不能串。
 func TestNativeServerConcurrentStreams(t *testing.T) {
-	addr := startNativeServer(t, func(w *ResponseWriter, r *Request) error {
-		return w.WriteResponse(200, nil, []byte(r.Path))
-	})
+	addr := startNativeServer(t, newTestH3Handler(
+		func(method, path string, q string, body []byte) (int, string) {
+			return 200, path
+		}))
 
 	c := nativeClient()
 	const n = 32
@@ -136,14 +200,15 @@ func TestNativeServerConcurrentStreams(t *testing.T) {
 	}
 }
 
-// 404 路径也要能走通（状态码不是硬编码成 200）。
+// 状态码不是硬编码成 200。
 func TestNativeServerStatus(t *testing.T) {
-	addr := startNativeServer(t, func(w *ResponseWriter, r *Request) error {
-		if r.Path != "/ok" {
-			return w.WriteResponse(404, nil, []byte("nope"))
-		}
-		return w.WriteResponse(200, nil, []byte("ok"))
-	})
+	addr := startNativeServer(t, newTestH3Handler(
+		func(method, path string, q string, body []byte) (int, string) {
+			if path != "/ok" {
+				return 404, "nope"
+			}
+			return 200, "ok"
+		}))
 	c := nativeClient()
 	resp, err := c.Get("https://" + addr + "/missing")
 	if err != nil {
