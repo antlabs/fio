@@ -105,12 +105,15 @@ type Conn struct {
 	// 释放这两块内存。
 	mu sync.Mutex
 
-	// writeHookFn 是写拦截器（TLS 用），见 SetWriteHook。
-	writeHookFn func([]byte) error
-
-	// writeHookvFn 是两段写拦截器（TLS 用），见 SetWritevHook。
-	// 装了它，Writev 就不再走单段那个。
-	writeHookvFn func(a, b []byte) error
+	// hooks 是写拦截器（TLS 用），见 SetWriteHook / SetWritevHook。
+	//
+	// **读路径不加锁**：原来是两个函数字段 + `c.mu`，而 Writev 要连着查两个
+	// （先两段的、没有再单段的），等于**每个请求两对加解锁，只为确认"这条
+	// 连接没有 TLS 钩子"**。实测（baseline）writeHook + writeHookv 合计占
+	// 1%，而那一档和 fib 的总差距才 4.7%。
+	//
+	// 写（SetWriteHook）只在 OnOpen 里发生一次，读在每个请求上。
+	hooks atomic.Pointer[writeHooks]
 
 	// releaseReadBuf 上一轮读缓冲区已经消费完、等着下次 Read 时释放。
 	// 见 ConsumeRead 里"为什么不能马上还"的说明。
@@ -263,15 +266,36 @@ func (c *Conn) IsClosed() bool { return atomic.LoadInt32(&c.closed) == 1 }
 // **不要在里面调 c.Write** —— 会无限递归。拦截器应该调
 // c.WriteRaw 发真正要出去的字节。
 func (c *Conn) SetWriteHook(h func([]byte) error) {
-	c.mu.Lock()
-	c.writeHookFn = h
-	c.mu.Unlock()
+	c.updateHooks(func(w *writeHooks) { w.one = h })
 }
 
 func (c *Conn) writeHook() func([]byte) error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return c.writeHookFn
+	if w := c.hooks.Load(); w != nil {
+		return w.one
+	}
+	return nil
+}
+
+// writeHooks 是两个拦截器的组合。**打包成一个指针原子发布**：两个 setter
+// 各改一半的话，读的时候可能看到"新的单段 + 旧的两段"这种半成品。
+type writeHooks struct {
+	one func([]byte) error
+	two func(a, b []byte) error
+}
+
+// updateHooks 原子地改一项（read-modify-write）。
+func (c *Conn) updateHooks(f func(*writeHooks)) {
+	for {
+		old := c.hooks.Load()
+		next := &writeHooks{}
+		if old != nil {
+			*next = *old
+		}
+		f(next)
+		if c.hooks.CompareAndSwap(old, next) {
+			return
+		}
+	}
 }
 
 // SetWritevHook 装一个两段写拦截器。
@@ -288,15 +312,14 @@ func (c *Conn) writeHook() func([]byte) error {
 // 两段是**拼接**关系：a 的最后一个字节后面紧跟 b 的第一个字节。b 可以为空。
 // 契约和 SetWriteHook 一样：不要在里面调 c.Write，发数据用 c.WriteRaw。
 func (c *Conn) SetWritevHook(h func(a, b []byte) error) {
-	c.mu.Lock()
-	c.writeHookvFn = h
-	c.mu.Unlock()
+	c.updateHooks(func(w *writeHooks) { w.two = h })
 }
 
 func (c *Conn) writeHookv() func(a, b []byte) error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return c.writeHookvFn
+	if w := c.hooks.Load(); w != nil {
+		return w.two
+	}
+	return nil
 }
 
 // WriteRaw 绕过写拦截器，直接写 fd。
