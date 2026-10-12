@@ -165,6 +165,23 @@ func (p *recordProtector) seal(innerType uint8, plaintext []byte) ([]byte, error
 	return out, nil
 }
 
+// sealInto 把一段明文加密后**追加**到 dst 的尾巴上，返回追加后的 dst。
+//
+// 和 seal 的区别是明文不进中转：seal 那条是"明文拷进 scratch、原地加密"，
+// 明文多走一遍内存（读+写）；这里直接 `Seal(dst, nonce, plaintext, ad)`——
+// GCM 从明文读、往 dst 写，一遍就完。**明文和 dst 不能重叠**。
+//
+// 调用方负责记录头（5 字节）和 seq 之外的一切：它已经按 ctLen 预留好了位置
+// （见 WritePretyped），这里只补密文。
+func (p *recordProtector) sealInto(dst []byte, plaintext []byte, ctLen int) ([]byte, error) {
+	if p.seq == ^uint64(0) {
+		return dst, ErrSequenceLimit
+	}
+	out := p.aead.Seal(dst, p.nonce(), plaintext, p.additionalData(0x0303, ctLen))
+	p.seq++
+	return out, nil
+}
+
 // appendWindow 把"a 和 b 拼接之后、从 off 开始的 n 字节"追加到 dst。
 //
 // a、b 是两段连续语义的输入（HTTP 的响应头 + 响应体），窗口可能横跨两者的

@@ -276,11 +276,13 @@ func (c *Conn) writeHook() func([]byte) error {
 	return nil
 }
 
-// writeHooks 是两个拦截器的组合。**打包成一个指针原子发布**：两个 setter
+// writeHooks 是三个拦截器的组合。**打包成一个指针原子发布**：几个 setter
 // 各改一半的话，读的时候可能看到"新的单段 + 旧的两段"这种半成品。
 type writeHooks struct {
 	one func([]byte) error
 	two func(a, b []byte) error
+	// pre 收的是"已经按协议层要求备好的整段"（见 WritePrepared）。
+	pre func([]byte) error
 }
 
 // updateHooks 原子地改一项（read-modify-write）。
@@ -320,6 +322,40 @@ func (c *Conn) writeHookv() func(a, b []byte) error {
 		return w.two
 	}
 	return nil
+}
+
+// SetWritePreparedHook 装"整段已经备好"的写拦截器。
+//
+// 和 SetWritevHook 的差别在**明文不进中转**：那个收的是头、体两段，加密
+// 之前总得把它们拼到一起（一次 memmove）；这个收的是**已经拼好的整段**
+// （静态文件那种"整条响应在缓存里就是一段连续内存"），TLS 那层可以
+// 直接从它读到输出缓冲里，省掉那一遍拷贝。
+//
+// 实测（static-tls）：那遍 memmove 占该档 CPU 的 **9.3%**，其中 93% 是
+// tls.appendWindow。
+//
+// 契约：p 是**调用方备好的**——TLS 那种要末尾带内层类型字节的，用
+// tls.PreparePretyped 拼（类型字节藏在哪里是 TLS 的事，不该由业务代码
+// 拼）。同样不要在钩子里调 c.Write，发数据用 c.WriteRaw。
+func (c *Conn) SetWritePreparedHook(h func(p []byte) error) {
+	c.updateHooks(func(w *writeHooks) { w.pre = h })
+}
+
+// WritePrepared 写一段**已经备好的**整段明文。
+//
+// 没装 SetWritePreparedHook（比如明文连接）时退回普通 Write——那条路
+// 不知道什么"内层类型"，收到什么写什么。
+func (c *Conn) WritePrepared(p []byte) error {
+	if c.IsClosed() {
+		return ErrClosed
+	}
+	if len(p) == 0 {
+		return nil
+	}
+	if w := c.hooks.Load(); w != nil && w.pre != nil {
+		return w.pre(p)
+	}
+	return c.Write(p)
 }
 
 // WriteRaw 绕过写拦截器，直接写 fd。

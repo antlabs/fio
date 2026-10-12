@@ -127,6 +127,23 @@ func (ch *ConnHandler) OnOpen(c *engine.Conn) {
 		}
 		return nil
 	})
+
+	// 整段已经备好的（末尾带内层类型字节，见 PreparePretyped）：直接封，
+	// 明文不进中转。静态文件那种"整条响应就是一段连续内存"走这条——
+	// 实测那遍 memmove 占 static-tls CPU 的 9.3%。
+	c.SetWritePreparedHook(func(p []byte) error {
+		if ch.sm == nil || !ch.sm.Established() {
+			return nil
+		}
+		ct, err := ch.sm.WritePretyped(p)
+		if err != nil {
+			return err
+		}
+		if len(ct) > 0 {
+			return c.WriteRaw(ct)
+		}
+		return nil
+	})
 }
 
 // OnData 有数据可读：喂给 TLS 状态机，把解出来的明文转给内层。

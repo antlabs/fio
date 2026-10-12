@@ -809,6 +809,98 @@ func (sm *StateMachine) WriteTwo(a, b []byte) ([]byte, error) {
 	return out, nil
 }
 
+// PreparePretyped 把一段"完整的应用数据"排成 WritePretyped 要的形状：
+// **每 maxRecordPayload 字节后面插一个内层类型字节**，最后再来一个。
+//
+// 为什么是"每段后面"而不是只补末尾：TLS 1.3 的记录类型藏在密文里（见
+// aead.go 开头），**每一条记录**的明文末尾都得是类型字节——不是只有最后
+// 一条。切记录是按内容长度切的，所以类型字节必须物理地待在每个切点上，
+// 封的时候才能"每段直接读、不拼"。
+//
+// 踩过的坑：只补末尾那一个，多记录的响应（>16KB）第一条记录的最后一个内容
+// 字节就被对端当成了类型（实测收到 'A' = 65），客户端报
+// "tls: unexpected message"；单记录的小响应看不出问题。
+//
+// 多出来的开销是每 16KB 一个字节，而省掉的是每请求把整段明文拷一遍。
+func PreparePretyped(p []byte) []byte {
+	nrec := (len(p) + maxRecordPayload - 1) / maxRecordPayload
+	if nrec == 0 {
+		nrec = 1
+	}
+	out := make([]byte, 0, len(p)+nrec)
+	for off := 0; off < len(p); off += maxRecordPayload {
+		end := off + maxRecordPayload
+		if end > len(p) {
+			end = len(p)
+		}
+		out = append(out, p[off:end]...)
+		out = append(out, recordApplicationData)
+	}
+	return out
+}
+
+// WritePretyped 封一段**已经排好记录边界**的明文（见 PreparePretyped）。
+//
+// 和 Write 的区别是**明文不进中转**：Write 那条路是"明文经 seal 落到
+// scratch、密文再 AppendRecord 进输出"（或 WriteTwo 那条"明文拷进输出缓冲
+// 再原地加密"），两条都至少把明文搬一次。这里直接
+// `aead.Seal(输出缓冲, nonce, 明文, ad)`——读一遍明文、写一遍密文，就这些。
+//
+// 为什么要这么一条：static-tls 的 profile 里 **appendWindow 的 memmove
+// 占 9.3% 的 CPU**（静态文件的整条响应，平均 16KB，每请求拷一遍）。静态
+// 文件的内容和响应头都不变，整条响应在缓存里就是一段连续内存，正好可以
+// 直接封。
+//
+// 每条记录 **maxRecordPayload+1 字节**（内容 + 类型），正好是 TLS 1.3 允许
+// 的内层明文上限（RFC 8446 5.2：2^14 + 1）。
+//
+// **返回的切片在下一次 Write/WriteTwo/WritePretyped 之前有效**（契约同
+// Write）。
+func (sm *StateMachine) WritePretyped(plain []byte) ([]byte, error) {
+	if sm.state != StateEstablished {
+		return nil, ErrHandshakeIncomplete
+	}
+	if sm.writeKeys == nil || sm.writeKeys.aead == nil {
+		return nil, ErrAEADNotReady
+	}
+	if len(plain) == 0 {
+		return nil, nil
+	}
+
+	// 已经排好边界：一条记录 = maxRecordPayload 内容 + 1 类型。
+	const perRecord = maxRecordPayload + 1
+	nrec := (len(plain) + perRecord - 1) / perRecord
+	need := len(plain) + nrec*(recordHeaderLen+sm.writeKeys.aead.Overhead())
+	if cap(sm.writeBuf) < need {
+		sm.writeBuf = make([]byte, 0, need)
+	}
+	out := sm.writeBuf[:0]
+	for off := 0; off < len(plain); {
+		n := len(plain) - off
+		if n > perRecord {
+			n = perRecord
+		}
+		ctLen := n + sm.writeKeys.aead.Overhead()
+		start := len(out)
+		// 先占记录头的位置，Seal 直接往它后面写密文。
+		out = append(out, 0, 0, 0, 0, 0)
+		var err error
+		out, err = sm.writeKeys.sealInto(out, plain[off:off+n], ctLen)
+		if err != nil {
+			return out, err
+		}
+		h := out[start : start+recordHeaderLen]
+		h[0] = recordApplicationData
+		h[1] = 0x03
+		h[2] = 0x03
+		h[3] = byte(ctLen >> 8)
+		h[4] = byte(ctLen)
+		off += n
+	}
+	sm.writeBuf = out
+	return out, nil
+}
+
 // Write 把明文加密成应用数据记录。
 //
 // 握手没完成时返回错误。

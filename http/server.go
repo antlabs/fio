@@ -273,6 +273,25 @@ func (w *ResponseWriter) buildHeader() {
 // **不走攒包**：它是"整条报文我自己写"的场景（错误响应），攒起来反而多一层。
 func (w *ResponseWriter) WriteRaw(b []byte) error { return w.conn.Write(b) }
 
+// WritePrepared 写一段**已经拼好的整条响应**（见 engine.Conn.WritePrepared）。
+//
+// 用在"整条响应能在缓存里拼好、之后一个字节都不变"的地方（静态文件那种）：
+// TLS 那层可以直接从这段连续内存读到输出缓冲，省掉"先拷进中转再原地加密"
+// 的那一遍 memmove（实测占 static-tls 该档 CPU 的 9.3%）。
+//
+// 明文连接上等价于 WriteRaw。
+//
+// **写完之后要把 ResponseWriter 标成"头已经出去了"**：整条响应绕过了
+// Write/WriteHeader 那套记账，收尾时框架看 headerSent 还是 false，会再补
+// 一条空的 chunked 响应——线上就是"响应后面又跟了一条"，标准库客户端
+// 报 "Unsolicited response received on idle HTTP channel"，TLS 那条路
+// 更狠：多出来的字节把记录流顶歪，客户端直接 "unexpected message"。
+func (w *ResponseWriter) WritePrepared(b []byte) error {
+	w.wroteHeader = true
+	w.headerSent = true
+	return w.conn.WritePrepared(b)
+}
+
 // send 把一段字节交给连接，攒包开着的时候走攒包。
 //
 // 一次 read 里可能带进来多条报文（pipeline），它们的回包合成一次 write

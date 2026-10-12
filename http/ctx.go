@@ -154,6 +154,10 @@ func (c *Ctx) Conn() *engine.Conn { return c.w.Conn() }
 // WriteRaw 绕过响应拼装直接写（要手写一整条响应的时候用）。
 func (c *Ctx) WriteRaw(b []byte) error { return c.w.WriteRaw(b) }
 
+// WritePrepared 写一整条**已经拼好**的响应（见 ResponseWriter.WritePrepared）。
+// 静态文件那种"内容恒定、整条在缓存里"的响应走这条最省。
+func (c *Ctx) WritePrepared(b []byte) error { return c.w.WritePrepared(b) }
+
 // Defer 声明这次响应稍后再写。见 ResponseWriter.Defer。
 //
 // 调了它就该立刻返回，之后再写响应并调 Resume 收尾。
