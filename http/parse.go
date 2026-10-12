@@ -174,7 +174,11 @@ func (p *Parser) parseHeaderBlock(block []byte) error {
 		// **obsolete line folding 不收**（RFC 9112 5.2：以 SP/HTAB 开头的
 		// 行只能出现在被废弃的折行里，服务端遇到要当 400）。parseHeaderLine
 		// 已经保证名字是 token，所以这里不用再判。
-		if string(name) == "Transfer-Encoding" {
+		// 头名**大小写无关**（RFC 9110 5.1）——这里原来是 `string(name) ==
+		// "Content-Length"` 那种精确比，全靠客户端发规范大小写才成立。
+		// arena 那条 `POST, lower-cased content-length` 的碎裂测试就是发
+		// 小写的：解析器看不见这个头，请求被当成没有体，body 少了 20 字节。
+		if equalFoldString(name, "transfer-encoding") {
 			// chunked 是唯一要求支持的传输编码；带别的（gzip 之类）当 400
 			if !equalFoldString(value, "chunked") {
 				return ErrBadMessage
@@ -182,7 +186,7 @@ func (p *Parser) parseHeaderBlock(block []byte) error {
 			p.chunked = true
 			p.chunkState = ckSize
 		}
-		if string(name) == "Content-Length" {
+		if equalFoldString(name, "content-length") {
 			// RFC 9112 6.3：有 Transfer-Encoding 就忽略 Content-Length
 			if !p.chunked {
 				n, err := parseContentLength(value)
@@ -209,7 +213,7 @@ func (p *Parser) parseHeaderBlock(block []byte) error {
 				}
 			}
 		}
-		if string(name) == "Upgrade" {
+		if equalFoldString(name, "upgrade") {
 			p.upgrade = true
 		}
 		// 同名头用逗号合并（RFC 9110 5.3）

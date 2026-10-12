@@ -60,6 +60,36 @@ func TestHeaderLookupCaseInsensitive(t *testing.T) {
 	}
 }
 
+// 分帧用的头名也大小写无关（RFC 9110 5.1）。
+//
+// Get 那边一直是无关的（上面那个测试），但**解析器认头决定分帧**的地方
+// 原来是精确比：小写 `content-length` 看不见，请求被当成没有体。arena 的
+// 碎裂测试就发小写，响应因此少了那 20 字节的 body。
+func TestFramingHeadersCaseInsensitive(t *testing.T) {
+	req := feedAll(t, "POST / HTTP/1.1\r\nhost: x\r\ncontent-length: 5\r\n\r\nhello")
+	if string(req.Body) != "hello" {
+		t.Errorf("小写 content-length: Body = %q, want hello", req.Body)
+	}
+	if req.ContentLength != 5 {
+		t.Errorf("小写 content-length: ContentLength = %d, want 5", req.ContentLength)
+	}
+
+	raw := "POST / HTTP/1.1\r\nhost: x\r\ntransfer-encoding: chunked\r\n\r\n" +
+		"5\r\nhello\r\n0\r\n\r\n"
+	req = feedAll(t, raw)
+	if string(req.Body) != "hello" {
+		t.Errorf("小写 transfer-encoding: Body = %q, want hello", req.Body)
+	}
+
+	p := NewParser(0)
+	if _, err := p.Parse([]byte("GET / HTTP/1.1\r\nupgrade: websocket\r\n\r\n")); err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if !p.Upgrade() {
+		t.Error("小写 upgrade 没被认出来")
+	}
+}
+
 // POST 带 Content-Length 的 body。
 func TestPostBody(t *testing.T) {
 	req := feedAll(t, "POST /submit HTTP/1.1\r\nHost: x\r\nContent-Length: 11\r\n\r\nhello world")
