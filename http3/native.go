@@ -18,12 +18,15 @@ import (
 	"context"
 	"crypto/tls"
 	"io"
+	"net"
 	"os"
 	"strconv"
 	"sync"
+	"syscall"
 
 	"github.com/quic-go/qpack"
 	"github.com/quic-go/quic-go"
+	"golang.org/x/sys/unix"
 )
 
 // 自建的 HTTP/3 服务端：**只借 quic-go 的 QUIC 传输**，HTTP/3 这一层
@@ -253,6 +256,11 @@ type NativeServer struct {
 	// 头、复用缓冲），共用一个就得加锁。fio 里 engine.ListenAndServe 的
 	// newHandler 也是这个形状。
 	NewHandler func() StreamHandler
+
+	// ReusePort 让 UDP socket 带 SO_REUSEPORT——预派生时几个进程绑同一个
+	// 端口用（见 engine.WithReusePort）。QUIC 是每连接一个四元组，内核按
+	// 四元组哈希分，整条连接落在一个进程上，不会跨进程。
+	ReusePort bool
 }
 
 // ListenAndServe 起服务，阻塞到出错。
@@ -261,11 +269,38 @@ func (s *NativeServer) ListenAndServe() error {
 	if addr == "" {
 		addr = ":443"
 	}
-	ln, err := quic.ListenAddr(addr, s.TLSConfig, s.QUICConfig)
+	var ln *quic.Listener
+	var err error
+	if s.ReusePort {
+		// 自己建 socket 才能带 SO_REUSEPORT：quic.ListenAddr 内部用
+		// net.ListenUDP，没有开这个选项的口子。
+		pc, perr := reusePortPacketConn(addr)
+		if perr != nil {
+			return perr
+		}
+		ln, err = quic.Listen(pc, s.TLSConfig, s.QUICConfig)
+	} else {
+		ln, err = quic.ListenAddr(addr, s.TLSConfig, s.QUICConfig)
+	}
 	if err != nil {
 		return err
 	}
 	return s.Serve(ln)
+}
+
+// reusePortPacketConn 建一个带 SO_REUSEPORT 的 UDP socket。
+func reusePortPacketConn(addr string) (net.PacketConn, error) {
+	var lc net.ListenConfig
+	lc.Control = func(network, address string, c syscall.RawConn) error {
+		var serr error
+		if err := c.Control(func(fd uintptr) {
+			serr = unix.SetsockoptInt(int(fd), unix.SOL_SOCKET, unix.SO_REUSEPORT, 1)
+		}); err != nil {
+			return err
+		}
+		return serr
+	}
+	return lc.ListenPacket(context.Background(), "udp", addr)
 }
 
 // Serve 在一个 QUIC listener 上服务。

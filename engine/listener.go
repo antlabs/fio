@@ -76,6 +76,14 @@ func Listen(m *MultiEventLoop, addr string, newHandler func() Handler) (*Listene
 		unix.Close(lfd)
 		return nil, err
 	}
+	// 预派生（见 WithReusePort）：允许多个进程绑同一个端口，内核按四元组
+	// 哈希分连接。不开的话第二个进程直接 EADDRINUSE。
+	if m.reusePort {
+		if err := unix.SetsockoptInt(lfd, unix.SOL_SOCKET, unix.SO_REUSEPORT, 1); err != nil {
+			unix.Close(lfd)
+			return nil, err
+		}
+	}
 
 	if err := unix.Bind(lfd, sa); err != nil {
 		unix.Close(lfd)

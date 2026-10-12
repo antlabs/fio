@@ -47,6 +47,9 @@ type MultiEventLoop struct {
 	// pool 是事件移交用的 worker 池（WithEventWorkers 开了才有），
 	// 见 worker.go。
 	pool *taskPool
+
+	// reusePort 见 WithReusePort：监听 socket 带不带 SO_REUSEPORT。
+	reusePort bool
 }
 
 // Options
@@ -56,6 +59,8 @@ type options struct {
 	level       slog.Level
 	// eventWorkers > 0 时开启事件移交（worker 池），见 worker.go。
 	eventWorkers int
+	// reusePort 让监听 socket 带 SO_REUSEPORT，见 WithReusePort。
+	reusePort bool
 }
 
 // Option 配 MultiEventLoop。
@@ -83,6 +88,27 @@ func WithEventWorkers(n int) Option {
 // WithMaxEventNum 一次 epoll_wait 最多拿多少事件。
 func WithMaxEventNum(n int) Option {
 	return func(o *options) { o.maxEventNum = n }
+}
+
+// WithReusePort 给监听 socket 带上 SO_REUSEPORT。
+//
+// 这是为**预派生**（一个 CPU 一个子进程、大家一起 accept 同一个端口）准备
+// 的：没有它第二个进程 Bind 会直接 EADDRINUSE。内核按四元组哈希把新连接
+// 分给其中一个 socket，各进程之间不用协调。
+//
+// 为什么值得这么干（实测，latency-1m 那档 12 核满速率）：
+//
+//	核数/速率        cpu/req   mean    p99
+//	12 核 @ 1M       7.16us    78us    167us
+//	2 核  @ 167k     4.71us    30us     62us
+//
+// 每核负载完全一样，只有**进程里的 P 数**不同——park/wake 的代价（调度器
+// 自旋、偷取、加锁）随 P 数涨，占掉 2.4us/请求。切小进程就按核数除下去。
+//
+// 默认关：它允许**另一个进程**绑同一个端口，单进程部署时那是个静默的错误
+// 掩盖器（起两份以为是热重启，其实是两个都在收），所以由调用方显式开。
+func WithReusePort() Option {
+	return func(o *options) { o.reusePort = true }
 }
 
 // WithLogLevel 日志级别。
@@ -116,6 +142,7 @@ func New(opts ...Option) (*MultiEventLoop, error) {
 		numLoops:    o.numLoops,
 		maxEventNum: o.maxEventNum,
 		pool:        newTaskPool(workers),
+		reusePort:   o.reusePort,
 	}
 	m.log = slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: o.level}))
 	m.conns.Init(core.GetMaxFd())
