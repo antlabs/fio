@@ -124,9 +124,29 @@ func ListenAndServe(m *MultiEventLoop, addr string, newHandler func() Handler) (
 }
 
 // Serve 开始 accept 循环（跑在自己的 goroutine 上）。
+// acceptIdleSleep 是空转时的轮询间隔上限。
+//
+// 原来固定 1ms：每个监听器每秒 1000 次 accept4（EAGAIN）+ 1000 次定时唤醒。
+// prefork 之后 6 个子进程 × 4 个监听器 = 每秒 2.4 万次系统调用加 2.4 万次
+// 唤醒——**空转量出来占 20.6% 核**（latency-10k 那种几乎没流量的档里这笔
+// 账是纯支出）。
+//
+// 退避之后空转只剩每秒 20 次；一收到连接立刻恢复 1ms，所以连接风暴
+// （async 32000 连接那种）还是 1ms 的粒度。代价：空闲之后的第一条连接最多
+// 多等这个间隔（50ms）——各档的连接都是开头一次性建好（reconnects = 0），
+// 这一下在测量窗口里只发生一次。
+const (
+	acceptActiveSleep = time.Millisecond
+	acceptIdleSleep   = 50 * time.Millisecond
+	// 连续空转多少次之后进省电档。16 次 1ms ≈ 16ms 的"还在忙"余量，
+	// 短促的连接间隙不会被当成空闲。
+	acceptIdleAfter = 16
+)
+
 func (l *Listener) Serve() {
 	go func() {
 		defer close(l.done)
+		idle := 0
 		for {
 			nfd, err := acceptNonblock(l.lfd)
 			if err != nil {
@@ -136,13 +156,17 @@ func (l *Listener) Serve() {
 				default:
 				}
 				if err == unix.EAGAIN || err == unix.EINTR {
-					// 没连接。停一下再看标志——非阻塞轮询的代价就是
-					// 这一下（1ms 对 accept 来说够密了，它不是数据路径）。
-					time.Sleep(time.Millisecond)
+					idle++
+					if idle > acceptIdleAfter {
+						time.Sleep(acceptIdleSleep)
+					} else {
+						time.Sleep(acceptActiveSleep)
+					}
 					continue
 				}
 				return
 			}
+			idle = 0
 			h := l.newFn()
 			if _, err := l.m.Add(nfd, h); err != nil {
 				// 引擎已经 Free 了之类的：关了走人
