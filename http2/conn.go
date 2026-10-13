@@ -427,7 +427,27 @@ func (c *Conn) onSettings(f *Frame) error {
 			if val > 1<<31-1 {
 				return fmt.Errorf("%w: INITIAL_WINDOW_SIZE too large", ErrBadFrameLength)
 			}
+			// **已经存在的流要按差值调**（RFC 9113 6.5.2）：不是把每条流的
+			// 窗口重置成新值——重置会把"这条流已经用掉的额度"抹掉，窗口
+			// 凭空变大，对端就收到超过它声明窗口的数据（判违规、断连接）。
+			// 窗口允许调到负数（规范明确写了），所以下面不做下限检查。
+			delta := int32(val) - int32(c.peerInitialWindow)
 			c.peerInitialWindow = val
+			if delta != 0 {
+				c.mu.Lock()
+				for _, s := range c.streams {
+					if delta > 0 && s.sendWindow > (1<<31-1)-delta {
+						s.sendWindow = 1<<31 - 1
+						continue
+					}
+					s.sendWindow += delta
+				}
+				c.mu.Unlock()
+				// 窗口调大之后攒着的数据要续发（和收到 WINDOW_UPDATE 一样）
+				if err := c.flushPending(); err != nil {
+					return err
+				}
+			}
 		case 0x5: // SETTINGS_MAX_FRAME_SIZE
 			if val < defaultMaxFrameSize || val > MaxFrameSize {
 				return fmt.Errorf("%w: MAX_FRAME_SIZE %d", ErrBadFrameLength, val)

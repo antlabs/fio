@@ -501,3 +501,48 @@ func TestSendFlowControlWindow(t *testing.T) {
 		t.Error("收尾一个 DATA 帧都没有")
 	}
 }
+
+// 对端改 SETTINGS_INITIAL_WINDOW_SIZE 时，**已存在的流按差值调窗口**
+// （RFC 9113 6.5.2），不是重置成新值；调大之后攒着的数据要续发。
+func TestSettingsInitialWindowDelta(t *testing.T) {
+	server := NewConn(false, &recorder{})
+	client := NewConn(true, &recorder{})
+
+	in := append([]byte(nil), clientPreface...)
+	in = AppendSettings(in, [2]uint32{0x4, 20}) // 流窗口先给 20
+	in = append(in, client.MustHeaders(1, []HeaderField{
+		{Name: ":method", Value: "GET"},
+		{Name: ":path", Value: "/big"},
+		{Name: ":scheme", Value: "http"},
+		{Name: ":authority", Value: "x"},
+	}, true)...)
+	if _, _, err := server.Feed(in); err != nil {
+		t.Fatalf("Feed 请求: %v", err)
+	}
+	if err := server.WriteData(1, make([]byte, 60), true); err != nil {
+		t.Fatalf("WriteData: %v", err)
+	}
+	// 窗口 20 → 先发 20，剩 40 排队（把那 20 取走，后面只看新增的）
+	if _, out, _ := server.Feed(nil); len(out) == 0 {
+		t.Fatalf("窗口 20 时应该先发出去一段")
+	}
+
+	// 把 INITIAL_WINDOW_SIZE 从 20 改到 50：差值 +30，该再发 30
+	_, out, err := server.Feed(AppendSettings(nil, [2]uint32{0x4, 50}))
+	if err != nil {
+		t.Fatalf("Feed SETTINGS: %v", err)
+	}
+	sent := 0
+	p := NewFrameParser()
+	if _, err := p.Parse(out, func(f *Frame) error {
+		if f.Type == FrameData {
+			sent += len(f.Payload)
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("解析输出: %v", err)
+	}
+	if sent != 30 {
+		t.Fatalf("窗口按差值 +30 之后发了 %d 字节, want 30（重置成新值会多发）", sent)
+	}
+}
