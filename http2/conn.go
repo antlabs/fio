@@ -18,6 +18,8 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+
+	"github.com/antlabs/fio/engine"
 )
 
 // 连接级的状态。
@@ -139,6 +141,12 @@ type Conn struct {
 	// 新流，也不能重复用一个已经关掉的 ID。不用这个记账的话，"重复
 	// 使用旧 ID"会被当成新请求——两边的理解就此分叉。
 	maxPeerStreamID uint32
+
+	// ec 是挂着的那条 engine 连接（OnData 喂进来的时候记下）。
+	//
+	// 请求级的 Writer.Conn() 要拿它（见 handler.go）——h2c 是跑在 engine
+	// 上的，所以 handler 拿得到底层连接。
+	ec *engine.Conn
 
 	// maxLocalStreamID 我们这边开过的最大流 ID（和 maxPeerStreamID 对称）。
 	//
@@ -965,6 +973,7 @@ func (c *Conn) onData(f *Frame) error {
 	}
 
 	s.recvBodyLen += int64(len(payload))
+
 	if c.handler != nil && len(payload) > 0 {
 		c.handler.OnData(c, f.StreamID, payload, endStream)
 	}

@@ -43,10 +43,14 @@ type ConnHandler struct {
 	conn *Conn
 }
 
-// NewConnHandler 建一个服务端的 HTTP/2 engine.Handler。
+// NewStreamConnHandler 建一个**流级**的服务端 HTTP/2 engine.Handler：
+// h 自己处理 HEADERS/DATA/RST（要自己管每条流的状态）。gRPC 走这条。
+//
+// 想跟 http1 一个形状（一个 http.Handler、参数是 *http.Ctx）的话用
+// NewConnHandler，见 handler.go。
 //
 // 每条连接一个（HPACK 的编解码器是有状态的，不能共用）。
-func NewConnHandler(h StreamHandler) *ConnHandler {
+func NewStreamConnHandler(h StreamHandler) *ConnHandler {
 	return &ConnHandler{handler: h}
 }
 
@@ -142,6 +146,8 @@ func (ch *ConnHandler) OnData(c *engine.Conn, buf []byte) (int, error) {
 // 拿引擎那把锁，而两把锁的获取顺序在别处都是"协议 → 引擎"（引擎调 OnData
 // 时不持自己的锁），不会反向，所以不构成死锁。
 func (c *Conn) FeedWrite(ec *engine.Conn, data []byte) (int, error) {
+	// 记下底层连接：请求级的 Writer.Conn() 要用（见 handler.go）
+	c.ec = ec
 	consumed, err := c.feed(data)
 	if werr := c.WriteOutput(ec); werr != nil && err == nil {
 		err = werr

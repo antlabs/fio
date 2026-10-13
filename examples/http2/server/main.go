@@ -15,7 +15,21 @@
 // HTTP/2 服务端（h2c，明文）。
 //
 // fio 的 http2 包是帧层 + 流 + HPACK 的完整实现，挂在 engine 的事件
-// 循环上：引擎喂字节 -> Conn.Feed 解帧 -> 业务回调（StreamHandler）。
+// 循环上：引擎喂字节 -> Conn.Feed 解帧 -> 业务回调。
+//
+// **业务这一端的形状和 HTTP/1.1 那边一模一样**（见 examples/http1/server）：
+//
+//	func serveHTTP(c *http.Ctx) error
+//
+//	http2.NewConnHandler(http.HandlerFunc(serveHTTP), 0)
+//	http.NewConnHandler(http.HandlerFunc(serveHTTP), 0)
+//
+// 同一个 serveHTTP 两个协议都能挂——HTTP/2 那层（HEADERS/DATA 拼成请求、
+// 响应编回帧）由请求级的 ConnHandler 做。
+//
+// 要自己处理流级事件（HEADERS/DATA/RST 自己管状态）的话用
+// NewStreamConnHandler：gRPC 走那条（conformance/server 的 -proto=grpc），
+// 客户端本来就是流级的（见 examples/http2/client）。
 //
 // 这里用 h2c（明文）而不是 TLS：例子里只有帧和流，没有 TLS 的干扰。
 // TLS 上的 HTTP/2 见 conformance/server（-proto=h2）——HTTP/2 外面
@@ -29,7 +43,7 @@
 //
 //	go run ./examples/http2/client
 //
-// 接口（业务在 echoHandler 里）：
+// 接口（业务在 serveHTTP 里）：
 //
 //	GET  /hello   回 "hello, GET /hello"
 //	POST /echo    回显请求体
@@ -40,9 +54,9 @@ import (
 	"fmt"
 	"log"
 	"log/slog"
-	"strconv"
 
 	"github.com/antlabs/fio/engine"
+	"github.com/antlabs/fio/http"
 	"github.com/antlabs/fio/http2"
 )
 
@@ -60,10 +74,10 @@ func main() {
 	defer m.Free()
 
 	ln, err := engine.ListenAndServe(m, *addr, func() engine.Handler {
-		// **每条连接一个 ConnHandler + 一个业务 handler**：
-		// HPACK 的动态表和流表都是连接级的，不能跨连接共用
-		// （见 http2/conn.go 里 Conn 的说明）。
-		return http2.NewConnHandler(newEchoHandler())
+		// **每条连接一个 ConnHandler**：HPACK 的动态表和流表都是连接级的，
+		// 不能跨连接共用（见 http2/conn.go 里 Conn 的说明）。
+		// maxHeaderSize 传 0 = 用默认值。
+		return http2.NewConnHandler(http.HandlerFunc(serveHTTP), 0)
 	})
 	if err != nil {
 		log.Fatal(err)
@@ -74,79 +88,20 @@ func main() {
 	select {}
 }
 
-// echoHandler 是流上的业务：收齐一条请求（头 + 体）就回一条响应。
+// serveHTTP 是业务。形状和 HTTP/1.1 那边完全一样：一个 Ctx 参数、
+// 返回 error（Ctx 包着 Request/ResponseWriter 那套）。
 //
-// 实现 http2.StreamHandler 三个方法。每条连接一个实例，回调都在
-// 同一条连接的事件循环 goroutine 上跑，所以下面这些 map 不用加锁。
-type echoHandler struct {
-	method map[uint32]string
-	path   map[uint32]string
-	body   map[uint32][]byte
-}
-
-func newEchoHandler() *echoHandler {
-	return &echoHandler{
-		method: make(map[uint32]string),
-		path:   make(map[uint32]string),
-		body:   make(map[uint32][]byte),
-	}
-}
-
-// OnHeaders 一个流的请求头解完了（HPACK 已经解开）。
-// headers 里 :method/:scheme/:authority/:path 是伪头（RFC 9113 8.3）。
-func (h *echoHandler) OnHeaders(c *http2.Conn, streamID uint32, headers []http2.HeaderField, endStream bool) {
-	for _, f := range headers {
-		switch f.Name {
-		case ":method":
-			h.method[streamID] = f.Value
-		case ":path":
-			h.path[streamID] = f.Value
-		}
+// **跑在事件循环上，不能阻塞**——要等什么东西得自己记状态、让出，
+// 等下一次回调。
+func serveHTTP(c *http.Ctx) error {
+	body := fmt.Sprintf("hello, %s %s\n", c.Method(), c.Target())
+	if c.Path() == "/echo" {
+		body = string(c.Body())
 	}
 
-	// endStream：没有体的请求（GET），头收完就可以回了
-	if endStream {
-		h.reply(c, streamID)
-	}
-}
-
-// OnData 流上的数据。endStream 为真的那次是这条流的最后一个数据块。
-func (h *echoHandler) OnData(c *http2.Conn, streamID uint32, data []byte, endStream bool) {
-	h.body[streamID] = append(h.body[streamID], data...)
-	if endStream {
-		h.reply(c, streamID)
-	}
-}
-
-// OnRSTStream 对端重置了这条流，把状态清掉。
-func (h *echoHandler) OnRSTStream(c *http2.Conn, streamID uint32, code http2.ErrCode) {
-	log.Printf("流 %d 被对端重置: %s", streamID, code)
-	h.cleanup(streamID)
-}
-
-// reply 回一条 200。和 HTTP/1.1 一样是两个动作：先头后体，
-// 区别是 HTTP/2 里没有"连接"的概念，一切按流来。
-func (h *echoHandler) reply(c *http2.Conn, streamID uint32) {
-	body := fmt.Sprintf("hello, %s %s\n", h.method[streamID], h.path[streamID])
-	if h.path[streamID] == "/echo" {
-		body = string(h.body[streamID])
-	}
-
-	// :status 是响应伪头，必须在普通头前面。content-length 不是必须的
-	// （流靠 END_STREAM 结束），写上只是让客户端提前知道长度。
-	_ = c.WriteHeaders(streamID, []http2.HeaderField{
-		{Name: ":status", Value: "200"},
-		{Name: "content-type", Value: "text/plain; charset=utf-8"},
-		{Name: "content-length", Value: strconv.Itoa(len(body))},
-	}, false)
-	// 最后一个 DATA 带 END_STREAM，结束这条流
-	_ = c.WriteData(streamID, []byte(body), true)
-
-	h.cleanup(streamID)
-}
-
-func (h *echoHandler) cleanup(streamID uint32) {
-	delete(h.method, streamID)
-	delete(h.path, streamID)
-	delete(h.body, streamID)
+	// HTTP/2 的流靠 END_STREAM 结束，content-length 不是必须的；设上是为了
+	// 和 HTTP/1.1 那边的行为对齐。
+	c.Set("Content-Type", "text/plain; charset=utf-8")
+	c.Set("Content-Length", fmt.Sprint(len(body)))
+	return c.String(body)
 }

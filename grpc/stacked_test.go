@@ -73,7 +73,7 @@ func TestStackedGRPCOverTLSOnEngine(t *testing.T) {
 	ln, err := engine.ListenAndServe(m, "127.0.0.1:0", func() engine.Handler {
 		return fiotls.NewConnHandler(&fiotls.Config{
 			Certificates: []tls.Certificate{cert},
-		}, http2.NewConnHandler(NewServerHandler(runHandler{})))
+		}, http2.NewStreamConnHandler(NewServerHandler(runHandler{})))
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -203,7 +203,7 @@ func TestStackedGRPCMultipleCallsOnOneTLSConn(t *testing.T) {
 	// Close 行为一致，见那个类型的说明）。
 	ln, err := engine.ListenAndServe(m, "127.0.0.1:0", func() engine.Handler {
 		return fiotls.NewConnHandler(&fiotls.Config{Certificates: []tls.Certificate{cert}},
-			http2.NewConnHandler(NewServerHandler(runHandler{})))
+			http2.NewStreamConnHandler(NewServerHandler(runHandler{})))
 	})
 	if err != nil {
 		t.Fatal(err)

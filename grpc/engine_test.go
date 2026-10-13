@@ -50,7 +50,7 @@ func startGRPCServer(t *testing.T, h Handler) (string, func()) {
 	// 两个平台的 Close 行为一致（见那个类型的说明）。
 	ln, err := engine.ListenAndServe(m, "127.0.0.1:0", func() engine.Handler {
 		// 每条连接：http2 的适配层，里面套 gRPC 的流处理器
-		return http2.NewConnHandler(NewServerHandler(h))
+		return http2.NewStreamConnHandler(NewServerHandler(h))
 	})
 	if err != nil {
 		t.Fatal(err)

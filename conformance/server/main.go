@@ -59,7 +59,8 @@ func main() {
 	case "h2c":
 		// 明文 HTTP/2（h2spec 默认打这个）
 		newHandler = func() engine.Handler {
-			return http2.NewConnHandler(&h2Handler{})
+			// 和 http1 一个形状：同一个 serveHTTP 两个协议都能挂
+			return http2.NewConnHandler(http.HandlerFunc(serveHTTP), 0)
 		}
 	case "h2":
 		// TLS 上的 HTTP/2——**必须配 NextProtos**，不然客户端
@@ -72,7 +73,7 @@ func main() {
 			return fiotls.NewConnHandler(&fiotls.Config{
 				Certificates: []tls.Certificate{cert},
 				NextProtos:   []string{fiotls.ALPNProtoH2},
-			}, http2.NewConnHandler(&h2Handler{}))
+			}, http2.NewConnHandler(http.HandlerFunc(serveHTTP), 0))
 		}
 	case "http":
 		newHandler = func() engine.Handler {
@@ -80,7 +81,7 @@ func main() {
 		}
 	case "grpc":
 		newHandler = func() engine.Handler {
-			return http2.NewConnHandler(grpc.NewServerHandler(&grpcHandler{}))
+			return http2.NewStreamConnHandler(grpc.NewServerHandler(&grpcHandler{}))
 		}
 	default:
 		fmt.Fprintf(os.Stderr, "unknown proto %q\n", *proto)

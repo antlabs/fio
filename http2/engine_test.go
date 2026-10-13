@@ -42,7 +42,7 @@ func startServer(t *testing.T, h StreamHandler) (string, func()) {
 	// accept 循环交给 engine.Listener：非阻塞 accept + 停止标志，
 	// 两个平台的 Close 行为一致（见那个类型的说明）。
 	ln, err := engine.ListenAndServe(m, "127.0.0.1:0", func() engine.Handler {
-		return NewConnHandler(h)
+		return NewStreamConnHandler(h)
 	})
 	if err != nil {
 		t.Fatal(err)

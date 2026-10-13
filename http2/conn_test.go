@@ -546,3 +546,4 @@ func TestSettingsInitialWindowDelta(t *testing.T) {
 		t.Fatalf("窗口按差值 +30 之后发了 %d 字节, want 30（重置成新值会多发）", sent)
 	}
 }
+
