@@ -391,3 +391,36 @@ func TestDataSplit(t *testing.T) {
 		t.Errorf("拼回来的数据不对: %d 字节 vs %d", len(got), len(payload))
 	}
 }
+
+// 序言和它后面跟着的帧被切开喂进来时，**解析器没吃完的半个帧不能算成
+// 已消费**——算错了引擎就把那几个字节丢掉，下一次从帧中间开始解析。
+//
+// 实测症状（真实客户端发 256KB 请求体时偶发）：服务端把 body 里的
+// 'x'（0x78）读成帧长，报 "frame exceeds max size: 7895160 > 16384"，
+// 自己发 GOAWAY 把连接断了——7895160 就是 'xxx' 那三个字节。
+func TestPrefaceWithPartialFrame(t *testing.T) {
+	server := NewConn(false, &recorder{})
+
+	// 序言之后跟一个 SETTINGS 帧，切在帧头中间
+	stream := append([]byte(nil), clientPreface...)
+	stream = AppendSettings(stream, [2]uint32{0x3, 100})
+	cut := len(clientPreface) + 4
+
+	n1, _, err := server.Feed(stream[:cut])
+	if err != nil {
+		t.Fatalf("第一次 Feed: %v", err)
+	}
+	if n1 != len(clientPreface) {
+		t.Errorf("第一次 Feed 消费 %d 字节, want %d（后面 %d 字节是半截帧头，得留给下一次）",
+			n1, len(clientPreface), cut-len(clientPreface))
+	}
+
+	// 第二次喂的是**引擎真正会喂的那段**：上一次没消费的尾巴（n1 之后）
+	n2, _, err := server.Feed(stream[n1:])
+	if err != nil {
+		t.Fatalf("第二次 Feed: %v（半截帧被上一次吞掉的话，这里会从帧中间解析）", err)
+	}
+	if n1+n2 != len(stream) {
+		t.Errorf("两次一共消费 %d 字节, want %d", n1+n2, len(stream))
+	}
+}

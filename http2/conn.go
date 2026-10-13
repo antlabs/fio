@@ -222,24 +222,41 @@ func (c *Conn) feed(data []byte) (int, error) {
 	// 早先这里是"不够 24 字节就直接 return"——那等于把读到的几个字节
 	// 丢了，客户端永远握不上手。
 	if c.state == statePreface {
-		c.prefaceBuf = append(c.prefaceBuf, data...)
-		consumed = len(data)
+		// 这次喂进来的字节里，有多少是补进序言的（剩下的都是帧）。
+		need := len(clientPreface) - len(c.prefaceBuf)
+		if need > len(data) {
+			need = len(data)
+		}
+		c.prefaceBuf = append(c.prefaceBuf, data[:need]...)
 
 		if len(c.prefaceBuf) < len(clientPreface) {
 			// 还没凑全，等下一次
-			return consumed, nil
+			return need, nil
 		}
 		if string(c.prefaceBuf[:len(clientPreface)]) != string(clientPreface) {
-			return consumed, fmt.Errorf("%w: bad client preface", ErrBadFrameHeader)
+			return need, fmt.Errorf("%w: bad client preface", ErrBadFrameHeader)
 		}
-		// 序言之后可能还跟着帧数据（同一个 TCP 段里）
-		rest := c.prefaceBuf[len(clientPreface):]
 		c.prefaceBuf = c.prefaceBuf[:0]
 		c.state = stateSettings
 
+		// 序言之后可能还跟着帧数据（同一个 TCP 段里）。
+		//
+		// **只报"真正消化掉的"**：解析器切不完一个帧时会停下来，剩下的
+		// （半个帧）要留给下一次 feed——以前这里一律报 len(data) 全消费，
+		// 那半个帧的字节就被吞了，下一次从帧中间开始解析，读到的是
+		// body 内容当帧头（实测：客户端发 256KB 请求体时偶发，我们这边
+		// 报 "frame exceeds max size: 7895160 > 16384"、主动 GOAWAY，
+		// 7895160 就是 'xxx' 那三个字节）。解析器不吃"留着"这套，尾巴
+		// 必须留在引擎的读缓冲区里，由引擎下次再喂。
+		consumed = need
+		rest := data[need:]
 		if len(rest) > 0 {
-			n, _ := c.parser.Parse(rest, c.onFrame)
-			_ = n
+			n, err := c.parser.Parse(rest, c.onFrame)
+			consumed += n
+			if err != nil {
+				c.handleErrorKeep(err)
+				return consumed, err
+			}
 		}
 		return consumed, nil
 	}
