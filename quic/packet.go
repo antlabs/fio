@@ -44,6 +44,10 @@ const (
 	pktZeroRTT   = 0x01
 	pktHandshake = 0x02
 	pktRetry     = 0x03
+
+	// connIDLen 是我们自己发的连接 ID 长度（服务端）。短头里目标连接 ID
+	// 不带长度字段，靠这个约定切。
+	connIDLen = 8
 )
 
 // header 是一个解析出来的包头。raw 始终指向整个报文。

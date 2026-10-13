@@ -19,6 +19,9 @@ package quic
 // encrypted_extensions 里（服务端）和 ClientHello 里（客户端）。
 
 const (
+	// 0x00 是服务端必须发的 original_destination_connection_id：
+	// 客户端拿它和我们回的包对不上就直接 TRANSPORT_PARAMETER_ERROR。
+	tpOriginalDestinationConnID = 0x00
 	tpMaxIdleTimeout          = 0x01
 	tpMaxUDPPayloadSize       = 0x03
 	tpInitialMaxData          = 0x04
@@ -45,15 +48,33 @@ type transportParams struct {
 	initialMaxStreamsBidi uint64
 	initialMaxStreamsUni  uint64
 	idleTimeout         uint64 // 毫秒
+
+	// 连接 ID 类的参数是**裸字节**（不是 varint）：
+	// odcid 客户端第一个 Initial 里的目标连接 ID，iscid 我们自己的源连接 ID。
+	// RFC 9000 7.3：服务端必须发这两个，客户端两个都要核对。
+	odcid []byte
+	iscid []byte
 }
 
 func (p transportParams) appendTo(dst []byte) []byte {
+	// 长度必须按**值的实际编码长度**写（下面统一用 varintLen）：TLV 的
+	// 长度字段和值不是一回事，写死一个常数的话值一超过那档就错位——对端
+	// 会直接 TRANSPORT_PARAMETER_ERROR（踩过：idleTimeout=30000 是 4 字节
+	// 的 varint，长度字段写死 1）。
+	dst = appendVarint(dst, tpOriginalDestinationConnID)
+	dst = appendVarint(dst, uint64(len(p.odcid)))
+	dst = append(dst, p.odcid...)
+
+	dst = appendVarint(dst, tpInitialSourceConnID)
+	dst = appendVarint(dst, uint64(len(p.iscid)))
+	dst = append(dst, p.iscid...)
+
 	dst = appendVarint(dst, tpMaxIdleTimeout)
-	dst = appendVarint(dst, 1)
+	dst = appendVarint(dst, uint64(varintLen(p.idleTimeout)))
 	dst = appendVarint(dst, p.idleTimeout)
 
 	dst = appendVarint(dst, tpMaxUDPPayloadSize)
-	dst = appendVarint(dst, 2)
+	dst = appendVarint(dst, uint64(varintLen(p.maxUDPPayload)))
 	dst = appendVarint(dst, p.maxUDPPayload)
 
 	dst = appendVarint(dst, tpInitialMaxData)
