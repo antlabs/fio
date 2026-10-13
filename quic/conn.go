@@ -24,7 +24,10 @@ import (
 	"os"
 	"strconv"
 	"sync"
+	"syscall"
 	"time"
+
+	"golang.org/x/sys/unix"
 )
 
 // Conn 是一条 QUIC 连接（服务端一侧）。
@@ -135,6 +138,13 @@ type Conn struct {
 	// hook 是"对端的新流到了"的同步钩子（可选），见 SetStreamHook。
 	hook StreamHook
 
+	// 发送侧攒包用：txBuf 里是封好的若干包，txSizes 是各包长度。
+	// fd/remoteSA 是 GSO 那条路要的（一次 sendmsg 发一批），见 writePackets。
+	txBuf    []byte
+	txSizes  []int
+	fd       int
+	remoteSA unix.Sockaddr
+
 	// appOut 是 1-RTT 上待发的帧（各流的 STREAM、控制帧）。攒起来一次发；
 	// appEnds 记每个帧的结束偏移——**帧不能跨包**，切包只能切在帧边界上
 	// （见 flushLocked）。
@@ -189,6 +199,15 @@ func newConn(pc net.PacketConn, remote net.Addr, odcid, peerCID []byte, cfg Conf
 		maxStreams:  maxStreamsOf(cfg),
 		flushSig:    make(chan struct{}, 1),
 		done:        make(chan struct{}),
+		fd:          -1,
+		remoteSA:    sockaddrOf(remote),
+	}
+	// GSO 那条路要裸 fd（net.PacketConn -> RawConn -> fd）。拿不到就
+	// fd=-1，发送退回一个个 WriteTo（功能一样，就是系统调用多）。
+	if c.remoteSA != nil {
+		if fd, err := syscallConnFd(pc); err == nil {
+			c.fd = fd
+		}
 	}
 	c.maxStreamsSent = c.maxStreams
 	go c.runFlusher()
@@ -226,6 +245,49 @@ func newConn(pc net.PacketConn, remote net.Addr, odcid, peerCID []byte, cfg Conf
 	}
 	dbg("newConn: scid=%x dcid=%x 启动完成 initialCryptoOut=%d", c.scid, c.dcid, len(c.cryptoOut[lvlInitial]))
 	return c, nil
+}
+
+var errNoGSO = errors.New("quic: gso not available")
+
+// sockaddrOf 把 net.Addr 转成 sendmsg 要的 sockaddr（GSO 那条路用）。
+// 转不了就返回 nil，调用方退回 WriteTo。
+func sockaddrOf(a net.Addr) unix.Sockaddr {
+	ua, ok := a.(*net.UDPAddr)
+	if !ok {
+		return nil
+	}
+	if ip4 := ua.IP.To4(); ip4 != nil {
+		sa := &unix.SockaddrInet4{Port: ua.Port}
+		copy(sa.Addr[:], ip4)
+		return sa
+	}
+	ip := ua.IP.To16()
+	if ip == nil {
+		return nil
+	}
+	sa := &unix.SockaddrInet6{Port: ua.Port}
+	copy(sa.Addr[:], ip)
+	return sa
+}
+
+// syscallConnFd 从 PacketConn 里挖出裸 fd。
+func syscallConnFd(pc net.PacketConn) (int, error) {
+	sc, ok := pc.(syscall.Conn)
+	if !ok {
+		return -1, errors.New("quic: packet conn is not a syscall conn")
+	}
+	raw, err := sc.SyscallConn()
+	if err != nil {
+		return -1, err
+	}
+	fd := -1
+	if err := raw.Control(func(f uintptr) { fd = int(f) }); err != nil {
+		return -1, err
+	}
+	if fd < 0 {
+		return -1, errors.New("quic: no fd")
+	}
+	return fd, nil
 }
 
 // maxStreamsOf 是对端可以在一条连接上开的双向流总数。
@@ -338,6 +400,10 @@ func (c *Conn) handlePacket(b []byte) error {
 	c.mu.Lock()
 	inlineDone := c.hook != nil
 	c.mu.Unlock()
+	// FIO_QUIC_ACK_NOW=1：收到带数据的包**立刻**回 ACK（不搭响应的车）。
+	// 默认关（搭车省一个 sendto），留开关是因为 ACK 的时机会影响对端的
+	// RTT 估计和 pacing——扫档的时候用得上。
+	ackNow := os.Getenv("FIO_QUIC_ACK_NOW") == "1"
 	for len(b) > 0 {
 		h, err := parseHeader(b, len(c.scid))
 		if err != nil {
@@ -411,7 +477,7 @@ func (c *Conn) handlePacket(b []byte) error {
 		}
 		b = b[next:]
 	}
-	if streamData && !inlineDone {
+	if streamData && !inlineDone && !ackNow {
 		// 这一包的数据已经交给某条 lane 了：**ACK 不单独发**，让响应
 		// 那个包捎出去（回环上响应就在几微秒之后）。单独发的话每请求
 		// 多一个 sendto，profile 里光系统调用就占 45%。
@@ -722,13 +788,18 @@ func (c *Conn) flushLocked() error {
 				payload = appendVarint(payload, frMaxStreamsBidi)
 				payload = appendVarint(payload, c.maxStreamsSent)
 			}
-			// 攒下的帧按帧边界装包：装得下就装，装不下先发掉当前这包。
+			// 攒下的帧按帧边界装包：装得下就装，装不下先封好这一包。
+			//
+			// 封好的包攒在 c.txBuf 里（c.txSizes 记长度），最后一起发：
+			// 长度一致时走 GSO，一次系统调用发一把（见 gso_linux.go）。
+			buf := c.txBuf[:0]
+			sizes := c.txSizes[:0]
 			start := 0
 			for _, end := range c.appEnds {
 				if len(payload) > 0 && len(payload)+end-start > maxPacketPayload {
-					if err := c.sendPacketLocked(lvl, payload); err != nil {
-						return err
-					}
+					off := len(buf)
+					buf = c.sealPacketLocked(lvl, payload, buf)
+					sizes = append(sizes, len(buf)-off)
 					payload = payload[:0]
 				}
 				payload = append(payload, c.appOut[start:end]...)
@@ -736,6 +807,18 @@ func (c *Conn) flushLocked() error {
 			}
 			c.appOut = c.appOut[:0]
 			c.appEnds = c.appEnds[:0]
+			if len(payload) > 0 {
+				off := len(buf)
+				buf = c.sealPacketLocked(lvl, payload, buf)
+				sizes = append(sizes, len(buf)-off)
+			}
+			c.txBuf, c.txSizes = buf, sizes
+			if len(sizes) > 0 {
+				if err := c.writePackets(); err != nil {
+					return err
+				}
+			}
+			continue
 		}
 		if len(payload) == 0 {
 			continue
@@ -749,45 +832,127 @@ func (c *Conn) flushLocked() error {
 
 // sendPacketLocked 封一个包发出去。调用方持有 c.mu。
 func (c *Conn) sendPacketLocked(lvl int, payload []byte) error {
-	k := c.send[lvl]
-	if k == nil {
-		dbg("flush: lvl=%d 有 %d 字节要发但没密钥", lvl, len(payload))
+	pkt := c.sealPacketLocked(lvl, payload, nil)
+	if len(pkt) == 0 {
 		return nil
-	}
-	pn := c.nextPN[lvl]
-	c.nextPN[lvl]++
-	var pkt []byte
-	if lvl == lvlApp {
-		// 短头要带当前的 Key Phase（对端换代之后我们也得标新相位，
-		// 见 updateKeys）
-		pkt = sealPacket(nil, false, 0, c.dcid, nil, nil, pn, payload, k, c.keyPhase)
-	} else {
-		typ := byte(pktInitial)
-		if lvl == lvlHandshake {
-			typ = pktHandshake
-		}
-		if lvl == lvlInitial {
-			// RFC 9000 14.1：带 Initial 的数据报至少要 1200 字节（服务端
-			// 也适用），不够就补 PADDING 帧。补在明文里，不是密文外
-			// （见 sealPacket 那段注释）。长度字段本身可能跟着变长，
-			// 所以循环到真的够为止。
-			for {
-				pkt = sealPacket(nil, true, typ, c.dcid, c.scid, nil, pn, payload, k, 0)
-				if len(pkt) >= 1200 {
-					break
-				}
-				payload = append(payload, make([]byte, 1200-len(pkt))...)
-			}
-		} else {
-			pkt = sealPacket(nil, true, typ, c.dcid, c.scid, nil, pn, payload, k, 0)
-		}
 	}
 	if _, err := c.pc.WriteTo(pkt, c.remote); err != nil {
 		dbg("flush: lvl=%d 写 %d 字节失败: %v", lvl, len(pkt), err)
 		return err
 	}
-	dbg("flush: lvl=%d pn=%d 发出 %d 字节（载荷 %d）", lvl, pn, len(pkt), len(payload))
 	return nil
+}
+
+// sealPacketLocked 封一个包，**追加到 dst 后面**并返回（不发送）。
+//
+// 追加而不是新建，是为了让 flush 能把一批包攒在一块缓冲里一次发出去
+// （见 writePackets 里的 GSO）。调用方持有 c.mu。
+func (c *Conn) sealPacketLocked(lvl int, payload, dst []byte) []byte {
+	k := c.send[lvl]
+	if k == nil {
+		dbg("flush: lvl=%d 有 %d 字节要发但没密钥", lvl, len(payload))
+		return dst
+	}
+	pn := c.nextPN[lvl]
+	c.nextPN[lvl]++
+	if lvl == lvlApp {
+		// 短头要带当前的 Key Phase（对端换代之后我们也得标新相位，
+		// 见 updateKeys）
+		return sealPacket(dst, false, 0, c.dcid, nil, nil, pn, payload, k, c.keyPhase)
+	}
+	typ := byte(pktInitial)
+	if lvl == lvlHandshake {
+		typ = pktHandshake
+	}
+	if lvl == lvlInitial {
+		// RFC 9000 14.1：带 Initial 的数据报至少要 1200 字节（服务端
+		// 也适用），不够就补 PADDING 帧。补在明文里，不是密文外
+		// （见 sealPacket 那段注释）。长度字段本身可能跟着变长，
+		// 所以循环到真的够为止。
+		base := len(dst)
+		for {
+			dst = sealPacket(dst, true, typ, c.dcid, c.scid, nil, pn, payload, k, 0)
+			if len(dst)-base >= 1200 {
+				break
+			}
+			payload = append(payload, make([]byte, 1200-(len(dst)-base))...)
+		}
+		return dst
+	}
+	return sealPacket(dst, true, typ, c.dcid, c.scid, nil, pn, payload, k, 0)
+}
+
+// writePackets 把 c.txBuf 里攒好的包发出去（c.txSizes 是每个包的长度）。
+//
+// 中间**长度一致**的连续若干个包走 GSO：一次 sendmsg 交一把，内核自己切成
+// 数据报（见 gso_linux.go——static-h3 那种 16KB 响应一个包一次 sendto 的话，
+// 62% 的 CPU 都花在系统调用上）。头和尾长度不一样的零头（ACK 搭在第一包上
+// 会大一点、最后一包会短一点）单独发。
+//
+// 调用方持有 c.mu。
+func (c *Conn) writePackets() error {
+	buf, sizes := c.txBuf, c.txSizes
+	// off 和 idx 是一起走的游标：off 是 buf 里的字节偏移，idx 是第几个包。
+	// （一开始写成两个独立的循环，重发/错位——包被发成垃圾，8.8 req/s。）
+	off, idx := 0, 0
+	sendUntil := func(end int) error {
+		for ; idx < end; idx++ {
+			if _, err := c.pc.WriteTo(buf[off:off+sizes[idx]], c.remote); err != nil {
+				dbg("flush: 写 %d 字节失败: %v", sizes[idx], err)
+				return err
+			}
+			off += sizes[idx]
+		}
+		return nil
+	}
+
+	if gsoEnabled && c.fd >= 0 && c.remoteSA != nil {
+		if i, j := longestEqualRun(sizes); j-i >= 2 {
+			if err := sendUntil(i); err != nil {
+				return err
+			}
+			seg := sizes[i]
+			// **一批 GSO 的段数要有上限**：整段塞给内核的话数据量会超过
+			// 发送缓冲（默认两百来 KB），sendmsg 直接 ENOBUFS，然后退回
+			// 一个个发——GSO 等于白做。（踩过：static-h3 上 64 条流各
+			// 16KB，攒出来一批 960 个段 ≈ 1MB，profile 里 sendto 还是占 55%。）
+			for k := i; k < j; {
+				n := j - k
+				if n > maxGSOSegments {
+					n = maxGSOSegments
+				}
+				if err := sendBatchGSO(c.fd, c.remoteSA, buf[off:off+n*seg], seg); err != nil {
+					dbg("GSO 失败（%d 段 × %d 字节）: %v", n, seg, err)
+					break
+				}
+				off += n * seg
+				k += n
+				idx = k
+			}
+			// GSO 失败：游标没动，往下走普通路径，别把包丢了
+		}
+	}
+	return sendUntil(len(sizes))
+}
+
+// maxGSOSegments 是一批 GSO 最多几个段（≈ 16 × 1.2KB ≈ 20KB，安全地低于
+// 默认发送缓冲）。
+const maxGSOSegments = 16
+
+// longestEqualRun 找 sizes 里最长的一段"长度都一样"的连续区间 [i, j)。
+func longestEqualRun(sizes []int) (int, int) {
+	bi, bj := 0, 0
+	for i := 0; i < len(sizes); {
+		j := i + 1
+		for j < len(sizes) && sizes[j] == sizes[i] {
+			j++
+		}
+		if j-i > bj-bi {
+			bi, bj = i, j
+		}
+		i = j
+	}
+	return bi, bj
 }
 
 // closeWith 关掉这条连接。

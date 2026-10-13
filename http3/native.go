@@ -429,8 +429,18 @@ func (s *NativeServer) serveConn(qc *quic.Conn, h StreamHandler) {
 	}
 
 	if lanes <= 1 {
-		return
+		// 单通道：accept 循环里就地处理，不经过队列（也就没有那条 lane 的
+		// goroutine 切换）
+		l := &lane{h: h, st: newStreamState()}
+		for {
+			str, err := qc.AcceptStream()
+			if err != nil {
+				return
+			}
+			c.handleStream(l, str, str.StreamID())
+		}
 	}
+
 	for {
 		str, err := qc.AcceptStream()
 		if err != nil {
@@ -440,25 +450,27 @@ func (s *NativeServer) serveConn(qc *quic.Conn, h StreamHandler) {
 	}
 }
 
-// h3Lanes 是每条连接的并行通道数。环境变量是为了能在 lab 上扫一遍
-// （不改代码就能试 1/2/4/8），默认 4。
+// h3Lanes 是每条连接的并行通道数（>1 时每条通道一个 handler 实例 + 一套
+// 缓冲，见 lane）。环境变量是为了能在 lab 上扫一遍（不改代码就能试 1/2/4/8）。
 //
-// **4 是量出来的**（lab，服务端 0-11 / 客户端 12-23 / MTU 1500）：
+// **默认 1**（lab，服务端 0-11 / 客户端 12-23 / MTU 1500，-c 64 -m 64）：
 //
-//	              1        4        8      quic-go(http3.Server)
-//	baseline-h3  2.51M    2.41M    2.34M        0.67M
-//	static-h3    199K     235K     233K         215K
+//	              1        2        4
+//	baseline-h3  4.09M    3.90M    3.85M
 //
-// baseline-h3 是"小响应、高并发"，串行最快；static-h3 是"16KB 响应、64 条
-// 并发流"，一条流写大响应时会被 QUIC 流控挡住，串行就把同连接后面几十条流
-// 一起堵住——4 条通道刚好，再多（8）反而回到锁竞争上。
+// 换自建传输之前默认是 4（那时候 16KB 的静态响应会被 quic-go 的流控挡住，
+// 串行会把同连接后面几十条流一起堵住，需要几条通道并行）。现在流控不再是
+// 障碍（fio/quic 的发送不看对端窗口），而每多一条通道就多一个 goroutine
+// 参与调度：64 连接 × 4 通道 = 256 个 goroutine 在 12 个 P 上抢，
+// 唤醒延迟就是这么堆起来的。所以取 1：每条连接只有一个处理 goroutine，
+// 请求在它上面串行处理（实测比 4 快 6%）。
 var h3Lanes = func() int {
 	if v := os.Getenv("FIO_H3_LANES"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil && n > 0 {
 			return n
 		}
 	}
-	return 4
+	return 1
 }()
 
 // lane 是一条并行通道：自己的 handler 实例 + 自己的那套缓冲。
