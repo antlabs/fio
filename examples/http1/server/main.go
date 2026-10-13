@@ -71,22 +71,20 @@ func main() {
 	select {}
 }
 
-// serveHTTP 是业务。形状和 net/http 的 handler 一样，只是这里的
-// Request/ResponseWriter 是 fio 自己的（解析器攒出来的）。
+// serveHTTP 是业务。形状是 fiber 那种：一个 Ctx 参数，返回 error
+// （Ctx 包着 fio 自己的 Request/ResponseWriter，解析器攒出来的）。
 //
 // **跑在事件循环上，不能阻塞**——要等什么东西得自己记状态、让出，
 // 等下一次回调。
-func serveHTTP(w *http.ResponseWriter, r *http.Request) {
-	body := fmt.Sprintf("hello, %s %s\n", r.Method, r.Target)
-	if r.Target == "/echo" {
-		body = string(r.Body)
+func serveHTTP(c *http.Ctx) error {
+	body := fmt.Sprintf("hello, %s %s\n", c.Method(), c.Target())
+	if c.Path() == "/echo" {
+		body = string(c.Body())
 	}
 
 	// 设了 Content-Length 就不会走 chunked（RFC 9112 6.3）。
 	// 两个都不给的话体的边界就没了，客户端会一直等——所以这里必须设。
-	w.Header()["Content-Type"] = []string{"text/plain; charset=utf-8"}
-	w.Header()["Content-Length"] = []string{strconv.Itoa(len(body))}
-	if _, err := w.Write([]byte(body)); err != nil {
-		log.Printf("write: %v", err)
-	}
+	c.Set("Content-Type", "text/plain; charset=utf-8")
+	c.Set("Content-Length", strconv.Itoa(len(body)))
+	return c.String(body)
 }
