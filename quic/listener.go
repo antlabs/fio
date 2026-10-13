@@ -35,6 +35,9 @@ type Listener struct {
 	byCID  map[string]*Conn
 	accept chan *Conn
 	err    error
+
+	// serveOnce 保证收包循环只起一个（见 Serve）。
+	serveOnce sync.Once
 }
 
 // Listen 起一个 UDP 监听。addr 形如 ":8443"。
@@ -70,8 +73,12 @@ func (l *Listener) Close() error {
 	return l.pc.Close()
 }
 
-// Accept 取一条新连接（阻塞）。返回的连接需要调用方自己起 ReadLoop。
+// Accept 取一条新连接（阻塞）。
+//
+// 它顺手把收包循环起起来（Serve 是幂等的）——忘了起的话症状是"客户端
+// 一直重传、服务端一个包都不读"，不该让调用方自己记住这件事。
 func (l *Listener) Accept() (*Conn, error) {
+	l.Serve()
 	c, ok := <-l.accept
 	if !ok {
 		l.mu.Lock()
@@ -85,8 +92,18 @@ func (l *Listener) Accept() (*Conn, error) {
 	return c, nil
 }
 
-// Serve 收数据报并分派。阻塞到监听关掉。
+// Serve 起收包循环：第一次调用真的起一个 goroutine，之后是空操作。
+//
+// （以前它是"阻塞到监听关掉"的，调用方都写 go ln.Serve()；做成幂等的
+// 起步函数之后两种写法等价。）
 func (l *Listener) Serve() {
+	l.serveOnce.Do(func() {
+		go l.serveLoop()
+	})
+}
+
+// serveLoop 收数据报并分派。跑在自己的 goroutine 上，直到监听关掉。
+func (l *Listener) serveLoop() {
 	buf := make([]byte, 2048)
 	for {
 		n, addr, err := l.pc.ReadFrom(buf)

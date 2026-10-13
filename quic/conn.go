@@ -553,6 +553,12 @@ func (c *Conn) flushLocked() error {
 			c.cryptoOut[lvl] = nil
 		}
 		if lvl == lvlApp {
+			// 还没有 1-RTT 的写密钥（握手没完）就先别动队列：**帧留在
+			// 里面等密钥**。这里要是把 appOut 清了，握手没完就写进来的
+			// 东西（HTTP/3 的 SETTINGS 就是）会静静地丢掉，对端一直等它。
+			if c.send[lvlApp] == nil {
+				continue
+			}
 			if c.handshakeDone && !c.sentHandshakeDone {
 				payload = appendVarint(payload, frHandshakeDone)
 				c.sentHandshakeDone = true

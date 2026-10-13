@@ -24,13 +24,17 @@ import (
 	"sync"
 	"syscall"
 
+	"github.com/antlabs/fio/quic"
 	"github.com/quic-go/qpack"
-	"github.com/quic-go/quic-go"
 	"golang.org/x/sys/unix"
 )
 
-// 自建的 HTTP/3 服务端：**只借 quic-go 的 QUIC 传输**，HTTP/3 这一层
-// （帧、QPACK、流分类、请求生命周期）全在这里，不经过 net/http。
+// 自建的 HTTP/3 服务端：**传输用 fio/quic**（自建的 QUIC），HTTP/3 这一层
+// （帧、QPACK、流分类、请求生命周期）也在这里，不经过 net/http，
+// **整条路上没有 quic-go**。
+//
+// （历史上这里借的是 quic-go 的 QUIC 传输，见 quic/doc.go 里换掉它的原因：
+// 每个请求建一条流的分配 + 那份 h3 适配层的开销。）
 //
 // **对外的形状和 http2 那套一致**——一样的 StreamHandler 接口、一样的
 // Conn.WriteHeaders/WriteData(streamID, ...)、一样把 HeaderField 做成
@@ -278,8 +282,8 @@ type NativeServer struct {
 	Addr string
 	// TLSConfig 至少要带证书。QUIC 强制 TLS 1.3。
 	TLSConfig *tls.Config
-	// QUICConfig 是 QUIC 那层的参数。
-	QUICConfig *quic.Config
+	// MaxStreams 一条连接上最多接受多少条对端发起的双向流（0 用默认 4096）。
+	MaxStreams uint64
 	// NewHandler 每条连接建一个流事件接收者。
 	//
 	// **是工厂不是单个实例**：Handler 是每条连接一份的有状态对象（攒流的
@@ -299,21 +303,21 @@ func (s *NativeServer) ListenAndServe() error {
 	if addr == "" {
 		addr = ":443"
 	}
+	cfg := quic.Config{TLSConfig: s.TLSConfig, MaxStreams: s.MaxStreams}
 	var ln *quic.Listener
-	var err error
 	if s.ReusePort {
-		// 自己建 socket 才能带 SO_REUSEPORT：quic.ListenAddr 内部用
-		// net.ListenUDP，没有开这个选项的口子。
-		pc, perr := reusePortPacketConn(addr)
-		if perr != nil {
-			return perr
+		// 自己建 socket 才能带 SO_REUSEPORT
+		pc, err := reusePortPacketConn(addr)
+		if err != nil {
+			return err
 		}
-		ln, err = quic.Listen(pc, s.TLSConfig, s.QUICConfig)
+		ln = quic.ListenPacket(pc, cfg)
 	} else {
-		ln, err = quic.ListenAddr(addr, s.TLSConfig, s.QUICConfig)
-	}
-	if err != nil {
-		return err
+		var err error
+		ln, err = quic.Listen(addr, cfg)
+		if err != nil {
+			return err
+		}
 	}
 	return s.Serve(ln)
 }
@@ -334,9 +338,12 @@ func reusePortPacketConn(addr string) (net.PacketConn, error) {
 }
 
 // Serve 在一个 QUIC listener 上服务。
+//
+// 第一次 Accept 会顺手把 listener 的收包循环起起来（quic.Listener.Serve
+// 是幂等的），所以这里只负责取连接。
 func (s *NativeServer) Serve(ln *quic.Listener) error {
 	for {
-		qc, err := ln.Accept(context.Background())
+		qc, err := ln.Accept()
 		if err != nil {
 			return err
 		}
@@ -357,11 +364,11 @@ func (s *NativeServer) serveConn(qc *quic.Conn, h StreamHandler) {
 
 	ctx := context.Background()
 	if err := c.sendSettings(ctx); err != nil {
-		qc.CloseWithError(quic.ApplicationErrorCode(ErrCodeInternalError), "")
+		qc.CloseWithError(uint64(ErrCodeInternalError), "")
 		return
 	}
-	// 对端的单向流（控制流、QPACK 编/解码器流）要收，不然 quic-go
-	// 那边的流配额会被占住。单开一个 goroutine 收它们。
+	// 对端的单向流（控制流、QPACK 编/解码器流）要收，不然对端的单向流
+	// 配额会被占住。单开一个 goroutine 收它们。
 	go c.recvUniStreams(ctx)
 
 	// **每条连接的并行通道数**。
@@ -382,11 +389,11 @@ func (s *NativeServer) serveConn(qc *quic.Conn, h StreamHandler) {
 	if lanes <= 1 {
 		l := &lane{h: h, st: newStreamState()}
 		for {
-			str, err := qc.AcceptStream(ctx)
+			str, err := qc.AcceptStream()
 			if err != nil {
 				return
 			}
-			c.handleStream(l, str, uint64(str.StreamID()))
+			c.handleStream(l, str, str.StreamID())
 		}
 	}
 
@@ -404,12 +411,12 @@ func (s *NativeServer) serveConn(qc *quic.Conn, h StreamHandler) {
 		}()
 	}
 	for {
-		str, err := qc.AcceptStream(ctx)
+		str, err := qc.AcceptStream()
 		if err != nil {
 			close(ch)
 			return
 		}
-		ch <- streamItem{str, uint64(str.StreamID())}
+		ch <- streamItem{str, str.StreamID()}
 	}
 }
 
@@ -452,10 +459,7 @@ func newStreamState() *streamState {
 // 这样头块里出现的只可能是静态表引用和字面量，解码器不需要任何跨流的
 // 状态（也就不需要处理 QPACK 编解码器单向流上的指令）。
 func (c *Conn) sendSettings(ctx context.Context) error {
-	str, err := c.qc.OpenUniStreamSync(ctx)
-	if err != nil {
-		return err
-	}
+	str := c.qc.OpenUniStream()
 	var buf []byte
 	buf = AppendVarint(buf, StreamControl)
 	buf = AppendSettings(buf,
@@ -476,7 +480,7 @@ func (c *Conn) sendSettings(ctx context.Context) error {
 func (c *Conn) recvUniStreams(ctx context.Context) {
 	buf := make([]byte, 4096)
 	for {
-		str, err := c.qc.AcceptUniStream(ctx)
+		str, err := c.qc.AcceptUniStream()
 		if err != nil {
 			return
 		}
@@ -559,7 +563,7 @@ func (st *streamState) readAndDispatch(c *Conn, h StreamHandler, streamID uint64
 
 	if cbErr != nil {
 		h.OnRSTStream(c, streamID, ErrCodeGeneralProtocolError)
-		st.str.CancelRead(quic.StreamErrorCode(ErrCodeGeneralProtocolError))
+		st.str.CancelRead(uint64(ErrCodeGeneralProtocolError))
 		return cbErr
 	}
 

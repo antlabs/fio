@@ -24,8 +24,8 @@ import (
 	"testing"
 	"time"
 
+	fioquic "github.com/antlabs/fio/quic"
 	fiotls "github.com/antlabs/fio/tls"
-	"github.com/quic-go/quic-go"
 )
 
 // testStream 是按 http2 那套写法拼一个请求所需的状态。
@@ -106,7 +106,8 @@ func startNativeServer(t *testing.T, fn func(method, path, query string, body []
 		TLSConfig:  &tls.Config{Certificates: []tls.Certificate{cert}, NextProtos: []string{"h3"}},
 		NewHandler: func() StreamHandler { return newTestH3Handler(fn) },
 	}
-	ln, err := quic.ListenAddr(srv.Addr, srv.TLSConfig, nil)
+	// 传输是自建的 fio/quic（不是 quic-go）
+	ln, err := fioquic.Listen(srv.Addr, fioquic.Config{TLSConfig: srv.TLSConfig})
 	if err != nil {
 		t.Fatal(err)
 	}
