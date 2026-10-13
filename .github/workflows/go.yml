@@ -8,44 +8,45 @@ jobs:
 
   build:
     runs-on: ubuntu-latest
+    # **多个 Go 版本一起跑**：有些问题是版本相关的（实测：http2 的发送
+    # 流控/帧解析那两条 bug 只在 Go 1.26.0 的调度时序下复现，1.27.x 上
+    # 跑多少遍都过），单版本 CI 会漏掉；而且下面每一条都要在"go.mod 要求
+    # 的版本"和"最新稳定版"之间都能过——go.mod 改版本时这里跟着改。
     strategy:
+      # 一个版本挂了也把其他版本跑完，好看清是哪个版本的问题
+      fail-fast: false
       matrix:
-        go: [ '1.20']
-    name: Go ${{ matrix.go }} sample
+        go: ['1.26.0', 'stable']
+    name: go ${{ matrix.go }}
 
     steps:
 
-    - name: Set up Go 1.20
-      uses: actions/setup-go@v1
+    - name: Check out code
+      uses: actions/checkout@v4
+
+    - name: Set up Go
+      uses: actions/setup-go@v5
       with:
-        go-version: 1.20
-      id: go
+        go-version: ${{ matrix.go }}
+        cache: true
 
-    - name: Check out code into the Go module directory
-      uses: actions/checkout@v1
-
-    - name: Get dependencies
-      run: |
-        go get -v -t -d ./...
-        if [ -f Gopkg.toml ]; then
-            curl https://raw.githubusercontent.com/golang/dep/master/install.sh | sh
-            dep ensure
-        fi
+    # ./... 而不是 .：仓库根目录没有 .go 文件，包全在子目录
+    # （engine/ websocket/ http/ ...）。
     - name: Build
-      run: go build -v .
+      run: go build -v ./...
 
-    # - name: Test-386
-    #   run: env GOARCH=386 go test -test.run=Test_Retry_sleep -v 
-      #run: env GOARCH=386 go test -v -coverprofile='coverage.out' -covermode=count ./...
-      
     - name: Test-Race
       run: env GOARCH=amd64 go test -v -race ./...
 
     - name: Test-amd64
       run: env GOARCH=amd64 go test -v -coverprofile='coverage.out' -covermode=count ./...
 
+    # 上传失败不挂 job：公开仓库没有 token 也能上传，失败了也别把
+    # 测试结果盖掉。多版本矩阵里只传一次（覆盖率和版本无关）。
     - name: Upload Coverage report
-      uses: codecov/codecov-action@v1
+      if: matrix.go == 'stable'
+      uses: codecov/codecov-action@v4
       with:
-        token: ${{secrets.CODECOV_TOKEN}}
-        file: ./coverage.out
+        token: ${{ secrets.CODECOV_TOKEN }}
+        files: ./coverage.out
+        fail_ci_if_error: false

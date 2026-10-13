@@ -38,6 +38,7 @@ import (
 	"time"
 
 	"github.com/antlabs/fio/engine"
+	fiohttp "github.com/antlabs/fio/http"
 	fiotls "github.com/antlabs/fio/tls"
 	xhttp2 "golang.org/x/net/http2"
 )
@@ -55,7 +56,7 @@ func startH2C(t *testing.T, h StreamHandler) (string, func()) {
 		t.Fatal(err)
 	}
 	ln, err := engine.ListenAndServe(m, "127.0.0.1:0", func() engine.Handler {
-		return NewConnHandler(h)
+		return NewStreamConnHandler(h)
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -333,7 +334,7 @@ func TestRealClientOverTLS(t *testing.T) {
 		return fiotls.NewConnHandler(&fiotls.Config{
 			Certificates: []tls.Certificate{cert},
 			NextProtos:   []string{fiotls.ALPNProtoH2},
-		}, NewConnHandler(&echoPathStream{}))
+		}, NewStreamConnHandler(&echoPathStream{}))
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -372,4 +373,50 @@ func itoa(n int) string {
 		n /= 10
 	}
 	return string(b[i:])
+}
+
+// 请求级 handler（http.Handler / http.HandlerFunc，和 http1 一个形状）
+// 服务真实客户端：HEADERS/DATA 要拼成一个 *http.Request，响应要编回帧。
+func TestRealClientHandlerLevel(t *testing.T) {
+	m, err := engine.NewAndStart(engine.WithEventLoops(2))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.Free()
+
+	// 和 http1 的 http.NewConnHandler(http.HandlerFunc(serveHTTP), 0)
+	// 是一个形状
+	ln, err := engine.ListenAndServe(m, "127.0.0.1:0", func() engine.Handler {
+		return NewConnHandler(fiohttp.HandlerFunc(func(c *fiohttp.Ctx) error {
+			if c.Path() == "/echo" {
+				return c.Bytes(c.Body())
+			}
+			return c.String("hello, " + c.Method() + " " + c.Target())
+		}), 0)
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+
+	resp, err := newTransport(ln.Addr()).do(t, "GET", "/hello", nil)
+	if err != nil {
+		t.Fatalf("GET: %v", err)
+	}
+	got, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if string(got) != "hello, GET /hello" {
+		t.Errorf("GET body = %q", got)
+	}
+
+	// POST：请求体（一个 HEADERS + 若干 DATA 帧）要原样拼出来
+	resp, err = newTransport(ln.Addr()).do(t, "POST", "/echo", strings.NewReader("echo-me-256k"))
+	if err != nil {
+		t.Fatalf("POST: %v", err)
+	}
+	got, _ = io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if string(got) != "echo-me-256k" {
+		t.Errorf("POST body = %q", got)
+	}
 }

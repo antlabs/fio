@@ -201,11 +201,23 @@ func (c *Conn) SetUserData(v any) {
 // 里建好的连接对象（握手才知道的 pd、用户的 Callback 都得在拿到对象之后
 // 才能装上去，而 Add 本身只保证"投递了"）。
 //
-// **不能在事件循环自己的 goroutine 上调**——那是自己等自己，直接死锁。
-// 只在 Dial 这种连接刚建好、还没开始跑数据的路径上用。
+// **不能在处理这条连接的 goroutine 上调**——没开 worker 池时是事件循环的
+// goroutine，开了之后是这条连接归属的 worker（见 worker.go）；那是自己等
+// 自己，直接死锁。只在 Dial 这种连接刚建好、还没开始跑数据的路径上用。
 func (c *Conn) SyncOnLoop(f func()) {
 	if c.parent == nil {
 		f()
+		return
+	}
+	// 开了 worker 池：投给这条连接归属的 worker（OnOpen/OnData 都在那一个
+	// goroutine 上），"返回时之前投的任务都跑完了"的语义不变。
+	if pool := c.parent.parent.pool; pool != nil {
+		done := make(chan struct{})
+		pool.nodeFor(c.Fd()).push(task{c: c, fn: func() {
+			f()
+			close(done)
+		}})
+		<-done
 		return
 	}
 	done := make(chan struct{})
@@ -226,12 +238,19 @@ func (c *Conn) SyncOnLoop(f func()) {
 // 换成它之后，casgstatus + chanrecv + closechan + gopark + SyncOnLoop 这一
 // 串 goroutine 机制的开销明显下来了，见那一档的数字。
 //
-// **安全前提和 SyncOnLoop 一样**：f 迟早会在这条连接的循环上跑，但
-// 在这之前连接可能已经关了、循环可能已经 Free 了，所以 f 里要对这两种
-// 情况有准备（IsClosed 那类检查）。**不要**在 f 里假设调用方的栈还活着。
+// **安全前提和 SyncOnLoop 一样**：f 迟早会在"处理这条连接的 goroutine"
+// 上跑（没开 worker 池时是事件循环，开了之后是这条连接归属的 worker——
+// 和 OnOpen/OnData 同一个），但在这之前连接可能已经关了、循环可能已经
+// Free 了，所以 f 里要对这两种情况有准备（IsClosed 那类检查）。**不要**
+// 在 f 里假设调用方的栈还活着。
 func (c *Conn) PostOnLoop(f func()) {
 	if c.parent == nil {
 		f()
+		return
+	}
+	// 同 SyncOnLoop：池化之后"这条连接的 goroutine"是 worker。
+	if pool := c.parent.parent.pool; pool != nil {
+		pool.nodeFor(c.Fd()).push(task{c: c, fn: f})
 		return
 	}
 	c.parent.runOnLoop(f)

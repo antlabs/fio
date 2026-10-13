@@ -690,7 +690,9 @@ func (w *ResponseWriter) reset(c *engine.Conn, proto string) {
 const maxSpareHeaderSlices = 32
 
 // putString 给一个新设的头弄一个单元素切片，优先复用上一个请求留下的底层数组。
-func (w *ResponseWriter) putString(value string) []string {
+// PutString 把值包成单元素切片，尽量复用上一次的（见下面那段说明）。
+// 导出是因为 Ctx 的 Writer 接口需要一个方法名（http2 的实现是新建一个）。
+func (w *ResponseWriter) PutString(value string) []string {
 	if n := len(w.spare); n > 0 {
 		s := w.spare[n-1]
 		w.spare = w.spare[:n-1]

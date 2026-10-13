@@ -31,7 +31,7 @@ import (
 //	Handler（业务）
 //
 // **ServerHandler 实现的是 http2.StreamHandler**，所以只要把它交给
-// http2.NewConnHandler 再挂到 engine 上，gRPC 就跑在事件循环里了——
+// http2.NewStreamConnHandler 再挂到 engine 上，gRPC 就跑在事件循环里了——
 // 读写全在 epoll 的线程上，没有 per-connection 的 goroutine。
 
 // Handler 是 gRPC 服务端的业务接口。

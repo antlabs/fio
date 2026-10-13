@@ -18,6 +18,8 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+
+	"github.com/antlabs/fio/engine"
 )
 
 // 连接级的状态。
@@ -139,7 +141,36 @@ type Conn struct {
 	// 新流，也不能重复用一个已经关掉的 ID。不用这个记账的话，"重复
 	// 使用旧 ID"会被当成新请求——两边的理解就此分叉。
 	maxPeerStreamID uint32
+
+	// ec 是挂着的那条 engine 连接（OnData 喂进来的时候记下）。
+	//
+	// 请求级的 Writer.Conn() 要拿它（见 handler.go）——h2c 是跑在 engine
+	// 上的，所以 handler 拿得到底层连接。
+	ec *engine.Conn
+
+	// maxLocalStreamID 我们这边开过的最大流 ID（和 maxPeerStreamID 对称）。
+	//
+	// **用来区分"关掉的流"和"从没开过的流"**：流关了以后会从 c.streams
+	// 里删掉（见 forgetStream），之后表里查不到。但"查不到"有两种：真
+	// idle（双方都没建过）和已经关掉。对 WINDOW_UPDATE/RST_STREAM 这两个，
+	// RFC 9113 5.1/6.9 只对前者要求报连接错误，对后者要忽略——WINDOW_UPDATE
+	// 是对端对我们之前发的 DATA 的反馈，完全可能在我们发完 END_STREAM、
+	// 把流忘掉之后才到（实测：真实客户端读 256KB 响应偶发被判
+	// "WINDOW_UPDATE on idle stream"，我们主动 GOAWAY，连接被 RST，客户端
+	// 读 body 报 connection reset）。
+	maxLocalStreamID uint32
 }
+
+// peerParity / localParity：RFC 9113 5.1——客户端开的流用奇数号，服务端
+// 用偶数号。这两个返回对应对端/本端那一侧的奇偶。
+func (c *Conn) peerParity() uint32 {
+	if c.isClient {
+		return 0
+	}
+	return 1
+}
+
+func (c *Conn) localParity() uint32 { return 1 - c.peerParity() }
 
 // NewConn 建一条 HTTP/2 连接。
 func NewConn(isClient bool, h StreamHandler) *Conn {
@@ -222,24 +253,41 @@ func (c *Conn) feed(data []byte) (int, error) {
 	// 早先这里是"不够 24 字节就直接 return"——那等于把读到的几个字节
 	// 丢了，客户端永远握不上手。
 	if c.state == statePreface {
-		c.prefaceBuf = append(c.prefaceBuf, data...)
-		consumed = len(data)
+		// 这次喂进来的字节里，有多少是补进序言的（剩下的都是帧）。
+		need := len(clientPreface) - len(c.prefaceBuf)
+		if need > len(data) {
+			need = len(data)
+		}
+		c.prefaceBuf = append(c.prefaceBuf, data[:need]...)
 
 		if len(c.prefaceBuf) < len(clientPreface) {
 			// 还没凑全，等下一次
-			return consumed, nil
+			return need, nil
 		}
 		if string(c.prefaceBuf[:len(clientPreface)]) != string(clientPreface) {
-			return consumed, fmt.Errorf("%w: bad client preface", ErrBadFrameHeader)
+			return need, fmt.Errorf("%w: bad client preface", ErrBadFrameHeader)
 		}
-		// 序言之后可能还跟着帧数据（同一个 TCP 段里）
-		rest := c.prefaceBuf[len(clientPreface):]
 		c.prefaceBuf = c.prefaceBuf[:0]
 		c.state = stateSettings
 
+		// 序言之后可能还跟着帧数据（同一个 TCP 段里）。
+		//
+		// **只报"真正消化掉的"**：解析器切不完一个帧时会停下来，剩下的
+		// （半个帧）要留给下一次 feed——以前这里一律报 len(data) 全消费，
+		// 那半个帧的字节就被吞了，下一次从帧中间开始解析，读到的是
+		// body 内容当帧头（实测：客户端发 256KB 请求体时偶发，我们这边
+		// 报 "frame exceeds max size: 7895160 > 16384"、主动 GOAWAY，
+		// 7895160 就是 'xxx' 那三个字节）。解析器不吃"留着"这套，尾巴
+		// 必须留在引擎的读缓冲区里，由引擎下次再喂。
+		consumed = need
+		rest := data[need:]
 		if len(rest) > 0 {
-			n, _ := c.parser.Parse(rest, c.onFrame)
-			_ = n
+			n, err := c.parser.Parse(rest, c.onFrame)
+			consumed += n
+			if err != nil {
+				c.handleErrorKeep(err)
+				return consumed, err
+			}
 		}
 		return consumed, nil
 	}
@@ -387,7 +435,27 @@ func (c *Conn) onSettings(f *Frame) error {
 			if val > 1<<31-1 {
 				return fmt.Errorf("%w: INITIAL_WINDOW_SIZE too large", ErrBadFrameLength)
 			}
+			// **已经存在的流要按差值调**（RFC 9113 6.5.2）：不是把每条流的
+			// 窗口重置成新值——重置会把"这条流已经用掉的额度"抹掉，窗口
+			// 凭空变大，对端就收到超过它声明窗口的数据（判违规、断连接）。
+			// 窗口允许调到负数（规范明确写了），所以下面不做下限检查。
+			delta := int32(val) - int32(c.peerInitialWindow)
 			c.peerInitialWindow = val
+			if delta != 0 {
+				c.mu.Lock()
+				for _, s := range c.streams {
+					if delta > 0 && s.sendWindow > (1<<31-1)-delta {
+						s.sendWindow = 1<<31 - 1
+						continue
+					}
+					s.sendWindow += delta
+				}
+				c.mu.Unlock()
+				// 窗口调大之后攒着的数据要续发（和收到 WINDOW_UPDATE 一样）
+				if err := c.flushPending(); err != nil {
+					return err
+				}
+			}
 		case 0x5: // SETTINGS_MAX_FRAME_SIZE
 			if val < defaultMaxFrameSize || val > MaxFrameSize {
 				return fmt.Errorf("%w: MAX_FRAME_SIZE %d", ErrBadFrameLength, val)
@@ -774,7 +842,19 @@ func (c *Conn) checkStreamRecv(streamID uint32, kind frameKind) error {
 		c.maxPeerStreamID = streamID
 	}
 
-	// 流不存在 = idle 状态
+	// 流不在表里：**可能是 idle（双方都没建过），也可能是建过、已经关掉
+	// 并被 forgetStream 从表里删掉的**。靠两个"开过的最大 ID"区分。
+	//
+	// 区别在哪（RFC 9113 5.1/6.9）：idle 上收 WINDOW_UPDATE/RST_STREAM 是
+	// 连接级 PROTOCOL_ERROR；但**已经关掉的流上收这两个要忽略**——
+	// WINDOW_UPDATE 本来就是"对端收到我们的 DATA 之后的反馈"，它可能在我们
+	// 发完 END_STREAM（对端也已经 END_STREAM → 流进 Closed 并被删掉）之后
+	// 才到。一律当 idle 报错的话，正常的一次大响应都会被自己判死。
+	openedBefore := false
+	if s == nil {
+		openedBefore = (streamID <= c.maxPeerStreamID && streamID&1 == c.peerParity()) ||
+			(streamID <= c.maxLocalStreamID && streamID&1 == c.localParity())
+	}
 	if s == nil {
 		switch kind {
 		case frameKindHeaders:
@@ -784,6 +864,10 @@ func (c *Conn) checkStreamRecv(streamID uint32, kind frameKind) error {
 			// 优先级可以在 idle 流上发（RFC 9113 5.3.1），我们不做优先级
 			return nil
 		case frameKindWindowUpdate, frameKindRSTStream:
+			if openedBefore {
+				// 已经关掉的流：忽略（RFC 9113 6.9 / 6.4）
+				return nil
+			}
 			// **idle 上不能发这两个**（RFC 9113 5.1）——那是在操作一个
 			// 双方都还没建的流，属于连接级 PROTOCOL_ERROR
 			return connError(ErrCodeProtocol, "stream %d: %s on idle stream",
@@ -889,7 +973,14 @@ func (c *Conn) onData(f *Frame) error {
 	}
 
 	s.recvBodyLen += int64(len(payload))
-	if c.handler != nil && len(payload) > 0 {
+
+	// **空载荷也要回调**（只要带 END_STREAM）：一个空的 DATA + END_STREAM 是
+	// "这段没有，流到此结束"的合法写法——bodyless 的 POST、以及"只写响应头
+	// 不写体"的响应都这么收尾。只按 len(payload) > 0 回调的话，
+	// END_STREAM 这件事就传不上去：协议的上面那层永远等不到"结束了"
+	// （实测：请求级 handler 的响应收尾、examples/http2/client 都卡在这；
+	// 真实客户端发的空体请求同理）。
+	if c.handler != nil && (len(payload) > 0 || endStream) {
 		c.handler.OnData(c, f.StreamID, payload, endStream)
 	}
 	if endStream {
@@ -990,6 +1081,11 @@ func (c *Conn) onRSTStream(f *Frame) error {
 
 // stream 取一个流，没有就建（对端发起的就是这样）。
 func (c *Conn) stream(id uint32) *Stream {
+	// 按奇偶记下"我们这边开过的最大 ID"，关流之后还要靠它区分
+	// "已关闭"和"从没开过"（见 maxLocalStreamID 的说明）。
+	if id&1 == c.localParity() && id > c.maxLocalStreamID {
+		c.maxLocalStreamID = id
+	}
 	s := c.streams[id]
 	if s == nil {
 		s = &Stream{
@@ -1182,13 +1278,28 @@ func (c *Conn) writeDataLocked(streamID uint32, data []byte, endStream bool) err
 	// 实测（static 8KB over h2c）：GC 扫描占 CPU 的 30%，这一处是两个大头
 	// 之一（另一个是 takeOutput 每次把 outBuf 数组丢掉）。
 	//
-	// 语义和原来的快路径完全一致：**快路径不动窗口**（只有下面拆帧那条
-	// 慢路径才动）。
+	// 一次装得下就走快路径（一帧发完），装不下走下面的拆帧那条。
+	//
+	// **快路径也要看两个窗口、也要记账**：流级窗口（s.sendWindow）不比
+	// 连接级的大，只看连接级窗口的话，一个 ≤16KB 的块在流窗口快用完时
+	// 会照发不误 —— 对端收到超过它声明的窗口就判流控违规，整条连接断掉
+	// （实测：真实客户端读 256KB 响应偶发 unexpected EOF，就是响应按块写
+	// 时某一块走了快路径）。
 	max := int(c.peerMaxFrameSize)
-	if len(data) <= max && int32(len(data)) <= c.sendWindow {
+	s := c.streams[streamID]
+	avail := c.sendWindow
+	if s != nil && s.sendWindow < avail {
+		avail = s.sendWindow
+	}
+	if len(data) <= max && int32(len(data)) <= avail {
+		n := len(data)
 		c.outBuf = AppendData(c.outBuf, streamID, data, endStream)
 		if endStream {
-			c.applyLocalEndStreamLocked(c.streams[streamID])
+			c.applyLocalEndStreamLocked(s)
+		}
+		c.sendWindow -= int32(n)
+		if s != nil {
+			s.sendWindow -= int32(n)
 		}
 		return nil
 	}

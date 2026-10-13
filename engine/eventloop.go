@@ -125,6 +125,15 @@ func (el *EventLoop) Loop() {
 			}
 
 			if eof {
+				// 开了 worker 池就把这条路也交给 worker：它要读数据、也会
+				// 激活连接（跑 OnOpen），而 OnOpen/OnData 必须落在同一个
+				// goroutine 上（见 worker.go 里 processOne 的说明）。
+				// fd 固定分片，这里投的和普通事件去的是同一个 worker。
+				if el.parent.pool != nil {
+					el.parent.pool.nodeFor(fd).push(task{c: c, eof: true})
+					return
+				}
+
 				// **必须先读**：kqueue 会把"对端最后一段数据 + FIN"合并成
 				// 一个事件报过来（而且状态是 WRITE，不是 READ），这时候
 				// 还没有任何人调过 Read()，ReadBuffer() 是空的——但内核

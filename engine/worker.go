@@ -15,6 +15,7 @@
 package engine
 
 import (
+	"io"
 	"runtime"
 	"sync"
 	"sync/atomic"
@@ -61,11 +62,20 @@ func defEventWorkers() int {
 // 比不开池子还高）。1024 格 -> 640KB。
 const taskRingSize = 1024
 
-// task 是"某条连接有一轮事件要处理"。
+// task 是"某条连接有一轮要做的事"。
+//
+// 三种形态（都由这条连接归属的那个 worker 执行）：
+//
+//	普通事件   isRead/isWrite 至少一个为真
+//	eof       对端关了：把最后一段数据读出来喂给协议再关（事件循环那条
+//	          EOF 路转过来的）
+//	fn        SyncOnLoop 投过来的函数（调用方在等它跑完）
 type task struct {
 	c       *Conn
 	isRead  bool
 	isWrite bool
+	eof     bool
+	fn      func()
 }
 
 // taskNode 是一个 worker 和它的队列。
@@ -200,10 +210,29 @@ func (n *taskNode) wakeIfWaiting() {
 func (n *taskNode) notifyIfIdle() { n.wakeIfWaiting() }
 
 // processOne 处理一条连接的一轮：读、喂给协议、写。
+//
+// **OnOpen 也在这一条路上**（见 processConn 里的 activateBusy）：协议的
+// 连接状态在 OnOpen 里建、在 OnData 里读，两者必须落在同一个 goroutine
+// 上，否则那些字段对 worker 来说没有 happens-before——-race 实测报
+// grpc 的 ConnHandler.conn 竞争，http2 那边表现为大响应的发送流控被
+// 违反（真实客户端读到 EOF）。
 func (n *taskNode) processOne(t task) {
 	c := t.c
+	el := c.parent
+
+	// SyncOnLoop 投来的函数：先补 OnOpen（同一个 goroutine，满足"返回时
+	// 之前投的任务都跑完了"），把 busy 让出去再跑 f。
+	if t.fn != nil {
+		if c.tryBusy() {
+			el.activateBusy(c)
+			c.unbusy()
+		}
+		t.fn()
+		return
+	}
+
 	if !c.tryBusy() {
-		// 别人正在处理这条连接（循环那条 EOF 路、或者上一轮还没跑完）：
+		// 别人正在处理这条连接（上一轮还没跑完、或者 Close 那条路）：
 		// 把事件记进 pending 位，处理完的那个会取走（见 processConn 的
 		// 循环）。fd 固定分片，正常情况下这里不会撞上。
 		if t.isRead {
@@ -214,6 +243,21 @@ func (n *taskNode) processOne(t task) {
 		}
 		return
 	}
-	// processConn 自己持有 busy，跑完负责 unbusy。
-	c.parent.processConn(c, t.isRead, t.isWrite)
+
+	if t.eof {
+		// 语义和事件循环里那条 EOF 路一致：**必须先读**，把对端最后一段
+		// 数据喂给协议（kqueue 会把数据和 FIN 合成一个事件报过来，直接
+		// close 就把它丢了），再关。
+		defer c.unbusy()
+		el.activateBusy(c)
+		if c.IsClosed() {
+			return
+		}
+		_ = el.readAndDispatch(c)
+		c.closeWith(io.EOF)
+		return
+	}
+
+	// 普通事件。processConn 自己持有 busy，跑完负责 unbusy。
+	el.processConn(c, t.isRead, t.isWrite)
 }

@@ -391,3 +391,199 @@ func TestDataSplit(t *testing.T) {
 		t.Errorf("拼回来的数据不对: %d 字节 vs %d", len(got), len(payload))
 	}
 }
+
+// 序言和它后面跟着的帧被切开喂进来时，**解析器没吃完的半个帧不能算成
+// 已消费**——算错了引擎就把那几个字节丢掉，下一次从帧中间开始解析。
+//
+// 实测症状（真实客户端发 256KB 请求体时偶发）：服务端把 body 里的
+// 'x'（0x78）读成帧长，报 "frame exceeds max size: 7895160 > 16384"，
+// 自己发 GOAWAY 把连接断了——7895160 就是 'xxx' 那三个字节。
+func TestPrefaceWithPartialFrame(t *testing.T) {
+	server := NewConn(false, &recorder{})
+
+	// 序言之后跟一个 SETTINGS 帧，切在帧头中间
+	stream := append([]byte(nil), clientPreface...)
+	stream = AppendSettings(stream, [2]uint32{0x3, 100})
+	cut := len(clientPreface) + 4
+
+	n1, _, err := server.Feed(stream[:cut])
+	if err != nil {
+		t.Fatalf("第一次 Feed: %v", err)
+	}
+	if n1 != len(clientPreface) {
+		t.Errorf("第一次 Feed 消费 %d 字节, want %d（后面 %d 字节是半截帧头，得留给下一次）",
+			n1, len(clientPreface), cut-len(clientPreface))
+	}
+
+	// 第二次喂的是**引擎真正会喂的那段**：上一次没消费的尾巴（n1 之后）
+	n2, _, err := server.Feed(stream[n1:])
+	if err != nil {
+		t.Fatalf("第二次 Feed: %v（半截帧被上一次吞掉的话，这里会从帧中间解析）", err)
+	}
+	if n1+n2 != len(stream) {
+		t.Errorf("两次一共消费 %d 字节, want %d", n1+n2, len(stream))
+	}
+}
+
+// 发送侧流控（确定性版本，不依赖网络时序）。
+//
+// 对端把 INITIAL_WINDOW_SIZE 声明成 20 字节：发 100 字节时只能先发 20，
+// 其余排队；每收到一次 WINDOW_UPDATE 就续发一段，最后一帧必须带
+// END_STREAM。多发一个字节对端就会判流控违规、整条连接断掉。
+func TestSendFlowControlWindow(t *testing.T) {
+	server := NewConn(false, &recorder{})
+
+	// 序言 + 客户端 SETTINGS（流窗口 20）+ 一个 GET
+	client := NewConn(true, &recorder{})
+	in := append([]byte(nil), clientPreface...)
+	in = AppendSettings(in, [2]uint32{0x4, 20}) // INITIAL_WINDOW_SIZE
+	in = append(in, client.MustHeaders(1, []HeaderField{
+		{Name: ":method", Value: "GET"},
+		{Name: ":path", Value: "/big"},
+		{Name: ":scheme", Value: "http"},
+		{Name: ":authority", Value: "x"},
+	}, true)...)
+	if _, _, err := server.Feed(in); err != nil {
+		t.Fatalf("Feed 请求: %v", err)
+	}
+	if err := server.WriteData(1, make([]byte, 100), true); err != nil {
+		t.Fatalf("WriteData: %v", err)
+	}
+
+	// 数一数服务端吐出来的 DATA 帧
+	dataFrames := func(t *testing.T, out []byte) (sent int, lastEnd bool, n int) {
+		t.Helper()
+		p := NewFrameParser()
+		if _, err := p.Parse(out, func(f *Frame) error {
+			if f.Type == FrameData {
+				sent += len(f.Payload)
+				lastEnd = f.EndStream()
+				n++
+			}
+			return nil
+		}); err != nil {
+			t.Fatalf("解析服务端输出: %v", err)
+		}
+		return
+	}
+
+	got, lastEnd, _ := dataFrames(t, server.takeOutput())
+	if got != 20 {
+		t.Fatalf("窗口 20 时先发了 %d 字节, want 20（多了就是对端会判违规）", got)
+	}
+	if lastEnd {
+		t.Error("还没发完就带了 END_STREAM")
+	}
+
+	// 续 30：应该再发 30（Feed 自己会把输出交出来，takeOutput 拿不到）
+	_, out, err := server.Feed(AppendWindowUpdate(nil, 1, 30))
+	if err != nil {
+		t.Fatalf("Feed WINDOW_UPDATE: %v", err)
+	}
+	got, lastEnd, _ = dataFrames(t, out)
+	if got != 30 {
+		t.Fatalf("收到 +30 之后发了 %d 字节, want 30", got)
+	}
+	if lastEnd {
+		t.Error("还剩 50 字节，不该带 END_STREAM")
+	}
+
+	// 再续 100：剩 50 全发完，最后一帧带 END_STREAM
+	_, out, err = server.Feed(AppendWindowUpdate(nil, 1, 100))
+	if err != nil {
+		t.Fatalf("Feed WINDOW_UPDATE: %v", err)
+	}
+	got, lastEnd, n := dataFrames(t, out)
+	if got != 50 || !lastEnd {
+		t.Fatalf("收尾发了 %d 字节 (END_STREAM=%v), want 50/true", got, lastEnd)
+	}
+	if n == 0 {
+		t.Error("收尾一个 DATA 帧都没有")
+	}
+}
+
+// 对端改 SETTINGS_INITIAL_WINDOW_SIZE 时，**已存在的流按差值调窗口**
+// （RFC 9113 6.5.2），不是重置成新值；调大之后攒着的数据要续发。
+func TestSettingsInitialWindowDelta(t *testing.T) {
+	server := NewConn(false, &recorder{})
+	client := NewConn(true, &recorder{})
+
+	in := append([]byte(nil), clientPreface...)
+	in = AppendSettings(in, [2]uint32{0x4, 20}) // 流窗口先给 20
+	in = append(in, client.MustHeaders(1, []HeaderField{
+		{Name: ":method", Value: "GET"},
+		{Name: ":path", Value: "/big"},
+		{Name: ":scheme", Value: "http"},
+		{Name: ":authority", Value: "x"},
+	}, true)...)
+	if _, _, err := server.Feed(in); err != nil {
+		t.Fatalf("Feed 请求: %v", err)
+	}
+	if err := server.WriteData(1, make([]byte, 60), true); err != nil {
+		t.Fatalf("WriteData: %v", err)
+	}
+	// 窗口 20 → 先发 20，剩 40 排队（把那 20 取走，后面只看新增的）
+	if _, out, _ := server.Feed(nil); len(out) == 0 {
+		t.Fatalf("窗口 20 时应该先发出去一段")
+	}
+
+	// 把 INITIAL_WINDOW_SIZE 从 20 改到 50：差值 +30，该再发 30
+	_, out, err := server.Feed(AppendSettings(nil, [2]uint32{0x4, 50}))
+	if err != nil {
+		t.Fatalf("Feed SETTINGS: %v", err)
+	}
+	sent := 0
+	p := NewFrameParser()
+	if _, err := p.Parse(out, func(f *Frame) error {
+		if f.Type == FrameData {
+			sent += len(f.Payload)
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("解析输出: %v", err)
+	}
+	if sent != 30 {
+		t.Fatalf("窗口按差值 +30 之后发了 %d 字节, want 30（重置成新值会多发）", sent)
+	}
+}
+
+// endStreamRecorder 记下 endStream 到过没有（recorder 只攒数据）。
+type endStreamRecorder struct {
+	recorder
+	gotEnd bool
+}
+
+func (r *endStreamRecorder) OnData(c *Conn, streamID uint32, data []byte, endStream bool) {
+	r.recorder.OnData(c, streamID, data, endStream)
+	if endStream {
+		r.gotEnd = true
+	}
+}
+
+// 空的 DATA + END_STREAM 也要把 endStream 交给上层。
+//
+// 这是"这段没有，流到此结束"的合法写法：bodyless 的 POST、只写响应头不写体
+// 的响应都这么收尾。按 len(payload) > 0 过滤的话 endStream 传不上去，上层
+// 永远等不到结束（实测：请求级 handler 的响应收尾、examples/http2/client
+// 全卡死在这）。
+func TestEmptyDataEndStream(t *testing.T) {
+	rec := &endStreamRecorder{}
+	server := NewConn(false, rec)
+	client := NewConn(true, &recorder{})
+
+	in := append([]byte(nil), clientPreface...)
+	in = AppendSettings(in, [2]uint32{0x3, 100})
+	in = append(in, client.MustHeaders(1, []HeaderField{
+		{Name: ":method", Value: "POST"},
+		{Name: ":path", Value: "/x"},
+		{Name: ":scheme", Value: "http"},
+		{Name: ":authority", Value: "a"},
+	}, false)...)
+	in = append(in, AppendData(nil, 1, nil, true)...) // 空的 DATA + END_STREAM
+	if _, _, err := server.Feed(in); err != nil {
+		t.Fatalf("Feed: %v", err)
+	}
+	if !rec.gotEnd {
+		t.Fatal("空的 DATA + END_STREAM 没把 endStream 交给上层")
+	}
+}
