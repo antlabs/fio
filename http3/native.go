@@ -25,7 +25,7 @@ import (
 	"syscall"
 
 	"github.com/antlabs/fio/quic"
-	"github.com/quic-go/qpack"
+	"github.com/antlabs/fio/qpack"
 	"golang.org/x/sys/unix"
 )
 
@@ -56,9 +56,9 @@ import (
 //
 // 几个取舍：
 //   - **不为每个请求起 goroutine**：请求流在连接的 goroutine 上就地处理。
-//   - **QPACK 只用静态表**：SETTINGS 里 MAX_TABLE_CAPACITY 和
-//     BLOCKED_STREAMS 都报 0，对端就只用静态表和字面量表示，解码器不需要
-//     任何跨流状态（quic-go/qpack 的 Decoder 正好只支持这一档）。
+//   - **QPACK 只用静态表**（fio/qpack，自己写的）：SETTINGS 里
+//     MAX_TABLE_CAPACITY 和 BLOCKED_STREAMS 都报 0，对端就只用静态表和
+//     字面量表示，解码器不需要任何跨流状态。
 //   - **一次响应一个 Write**：HEADERS 帧 + DATA 帧拼在同一个缓冲里。
 //   - **每条连接复用几块缓冲**，一个请求不分配（除非体长过现有容量）。
 
