@@ -547,3 +547,43 @@ func TestSettingsInitialWindowDelta(t *testing.T) {
 	}
 }
 
+// endStreamRecorder 记下 endStream 到过没有（recorder 只攒数据）。
+type endStreamRecorder struct {
+	recorder
+	gotEnd bool
+}
+
+func (r *endStreamRecorder) OnData(c *Conn, streamID uint32, data []byte, endStream bool) {
+	r.recorder.OnData(c, streamID, data, endStream)
+	if endStream {
+		r.gotEnd = true
+	}
+}
+
+// 空的 DATA + END_STREAM 也要把 endStream 交给上层。
+//
+// 这是"这段没有，流到此结束"的合法写法：bodyless 的 POST、只写响应头不写体
+// 的响应都这么收尾。按 len(payload) > 0 过滤的话 endStream 传不上去，上层
+// 永远等不到结束（实测：请求级 handler 的响应收尾、examples/http2/client
+// 全卡死在这）。
+func TestEmptyDataEndStream(t *testing.T) {
+	rec := &endStreamRecorder{}
+	server := NewConn(false, rec)
+	client := NewConn(true, &recorder{})
+
+	in := append([]byte(nil), clientPreface...)
+	in = AppendSettings(in, [2]uint32{0x3, 100})
+	in = append(in, client.MustHeaders(1, []HeaderField{
+		{Name: ":method", Value: "POST"},
+		{Name: ":path", Value: "/x"},
+		{Name: ":scheme", Value: "http"},
+		{Name: ":authority", Value: "a"},
+	}, false)...)
+	in = append(in, AppendData(nil, 1, nil, true)...) // 空的 DATA + END_STREAM
+	if _, _, err := server.Feed(in); err != nil {
+		t.Fatalf("Feed: %v", err)
+	}
+	if !rec.gotEnd {
+		t.Fatal("空的 DATA + END_STREAM 没把 endStream 交给上层")
+	}
+}

@@ -974,7 +974,13 @@ func (c *Conn) onData(f *Frame) error {
 
 	s.recvBodyLen += int64(len(payload))
 
-	if c.handler != nil && len(payload) > 0 {
+	// **空载荷也要回调**（只要带 END_STREAM）：一个空的 DATA + END_STREAM 是
+	// "这段没有，流到此结束"的合法写法——bodyless 的 POST、以及"只写响应头
+	// 不写体"的响应都这么收尾。只按 len(payload) > 0 回调的话，
+	// END_STREAM 这件事就传不上去：协议的上面那层永远等不到"结束了"
+	// （实测：请求级 handler 的响应收尾、examples/http2/client 都卡在这；
+	// 真实客户端发的空体请求同理）。
+	if c.handler != nil && (len(payload) > 0 || endStream) {
 		c.handler.OnData(c, f.StreamID, payload, endStream)
 	}
 	if endStream {
