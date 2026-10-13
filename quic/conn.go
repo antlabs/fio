@@ -21,7 +21,10 @@ import (
 	"encoding/binary"
 	"errors"
 	"net"
+	"os"
+	"strconv"
 	"sync"
+	"time"
 )
 
 // Conn 是一条 QUIC 连接（服务端一侧）。
@@ -91,6 +94,16 @@ type Conn struct {
 	retiredBidi retireSet
 	retiredUni  retireSet
 
+	// maxStreams 是我们允许对端开的双向流总数（和 initial_max_streams_bidi
+	// 一个值）。maxStreamsSent 是最后一次报给对端的 MAX_STREAMS_BIDI。
+	//
+	// **对端流关掉之后必须把额度还回去**（RFC 9000 4.6）：不还的话对端开到
+	// 4096 条就再也没有开流的额度，整个连接**静静地停在那里**。踩过：
+	// baseline-h3 的压测端每连接 64 条并发流，跑到 4096 条全部卡死，
+	// 吞吐从 5M 掉到 52k（那个 262144 = 64 连接 × 4096 就是它的指纹）。
+	maxStreams     uint64
+	maxStreamsSent uint64
+
 	// 1-RTT 的 Key Phase 位（RFC 9001 6）和我们当前这一代读密钥。
 	//
 	// **对端会主动换代**：quic-go 的客户端"握手之后不久就把第一次密钥
@@ -113,6 +126,14 @@ type Conn struct {
 	sentHandshakeDone bool
 	closed            bool
 	err               error
+
+	// flushSig 有 1-RTT 帧要发时响一下（非阻塞投递），runFlusher 攒一批再发。
+	// done 关掉时 flusher 退出。
+	flushSig chan struct{}
+	done     chan struct{}
+
+	// hook 是"对端的新流到了"的同步钩子（可选），见 SetStreamHook。
+	hook StreamHook
 
 	// appOut 是 1-RTT 上待发的帧（各流的 STREAM、控制帧）。攒起来一次发；
 	// appEnds 记每个帧的结束偏移——**帧不能跨包**，切包只能切在帧边界上
@@ -165,7 +186,12 @@ func newConn(pc net.PacketConn, remote net.Addr, odcid, peerCID []byte, cfg Conf
 		nextUni:     3,
 		retiredUni:  retireSet{next: 2, pend: make(map[uint64]struct{})},
 		retiredBidi: retireSet{next: 0, pend: make(map[uint64]struct{})},
+		maxStreams:  maxStreamsOf(cfg),
+		flushSig:    make(chan struct{}, 1),
+		done:        make(chan struct{}),
 	}
+	c.maxStreamsSent = c.maxStreams
+	go c.runFlusher()
 	for i := range c.cryptoGaps {
 		c.cryptoGaps[i] = make(map[uint64][]byte)
 	}
@@ -202,11 +228,16 @@ func newConn(pc net.PacketConn, remote net.Addr, odcid, peerCID []byte, cfg Conf
 	return c, nil
 }
 
-func (c *Conn) ourParams(cfg Config) transportParams {
-	maxStreams := cfg.MaxStreams
-	if maxStreams == 0 {
-		maxStreams = 4096
+// maxStreamsOf 是对端可以在一条连接上开的双向流总数。
+func maxStreamsOf(cfg Config) uint64 {
+	if cfg.MaxStreams > 0 {
+		return cfg.MaxStreams
 	}
+	return 4096
+}
+
+func (c *Conn) ourParams(cfg Config) transportParams {
+	maxStreams := maxStreamsOf(cfg)
 	return transportParams{
 		maxUDPPayload:         1472,
 		initialMaxData:        1 << 24,
@@ -222,6 +253,10 @@ func (c *Conn) ourParams(cfg Config) transportParams {
 // drainEvents 把 TLS 交出来的事件处理掉：密钥收下、握手字节攒起来、
 // 对端传输参数解出来。
 func (c *Conn) drainEvents() error {
+	// 整段在锁里：这里改的是密钥、待发 CRYPTO、对端参数，而 flusher 那边
+	// 同时在读它们（拿锁就发一个包）。
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	for {
 		ev := c.tls.NextEvent()
 		switch ev.Kind {
@@ -295,6 +330,14 @@ func levelOf(h *header) int {
 // 客户端把 Initial 和 Handshake 放在同一个数据报里发的情况要支持，所以
 // 循环解）。
 func (c *Conn) handlePacket(b []byte) error {
+	// 整个数据报里有没有"交给 lane 的流数据"（决定 ACK 是单独发还是让
+	// 响应捎出去，见下面的 streamData 分支）
+	var streamData bool
+	// 装了钩子的话请求是**就地**处理的（响应已经在 appOut 里），这一趟
+	// 就该把 ACK + 响应一起发出去，不用等 flusher
+	c.mu.Lock()
+	inlineDone := c.hook != nil
+	c.mu.Unlock()
 	for len(b) > 0 {
 		h, err := parseHeader(b, len(c.scid))
 		if err != nil {
@@ -344,14 +387,19 @@ func (c *Conn) handlePacket(b []byte) error {
 				return nil
 			}
 		}
-		// **验过了才记 ACK**：验不过的包等于没收到（记了会让对端以为
-		// 我们已经拿到、不再重传）。
-		c.mu.Lock()
-		c.ackDue[lvl] = true
-		c.recvSeen[lvl] = append(c.recvSeen[lvl], h.pn)
-		c.mu.Unlock()
-		if err := c.processFrames(lvl, payload); err != nil {
+		ackEliciting, gotStream, err := c.processFrames(lvl, payload)
+		if err != nil {
 			return err
+		}
+		streamData = streamData || gotStream
+		// **验过了、而且这包要确认，才记 ACK**：验不过的等于没收到；
+		// 只含 ACK/PADDING 的包按 RFC 9000 13.2.1 **不能回 ACK**——回的话
+		// 就是 ACK 放大（每请求多一个包，实测占了发送量的一大半）。
+		if ackEliciting {
+			c.mu.Lock()
+			c.ackDue[lvl] = true
+			c.recvSeen[lvl] = append(c.recvSeen[lvl], h.pn)
+			c.mu.Unlock()
 		}
 		// 短头没有长度字段：后面没有包了
 		if !h.long {
@@ -363,14 +411,34 @@ func (c *Conn) handlePacket(b []byte) error {
 		}
 		b = b[next:]
 	}
+	if streamData && !inlineDone {
+		// 这一包的数据已经交给某条 lane 了：**ACK 不单独发**，让响应
+		// 那个包捎出去（回环上响应就在几微秒之后）。单独发的话每请求
+		// 多一个 sendto，profile 里光系统调用就占 45%。
+		//
+		// 别的路径（PING、握手、控制帧）还是立刻回，不然对端会等我们。
+		return nil
+	}
 	return c.flush()
 }
 
 // processFrames 处理一个包里的帧。
-func (c *Conn) processFrames(lvl int, payload []byte) error {
+//
+// 两个回值都是给 handlePacket 决定"怎么回"用的：
+//
+//	ackEliciting 这包要不要确认（RFC 9000 13.2.1：只含 ACK/PADDING/
+//	             CONNECTION_CLOSE 的包**不能回 ACK**）
+//	streamData   这包里有交给 lane 的流数据（ACK 让响应捎出去）
+func (c *Conn) processFrames(lvl int, payload []byte) (ackEliciting, streamData bool, err error) {
 	var streamErr error
-	err := parseFrames(payload, func(kind uint64, raw []byte, _ int) error {
+	err = parseFrames(payload, func(kind uint64, raw []byte, _ int) error {
 		dbg("帧: kind=%#x lvl=%d %d 字节", kind, lvl, len(raw))
+		switch kind {
+		case frAck, frAckECN, frPadding, frConnClose, frConnCloseApp:
+			// 不算"要确认的"
+		default:
+			ackEliciting = true
+		}
 		switch {
 		case kind == frCrypto:
 			// CRYPTO：偏移 + 长度 + 数据
@@ -411,6 +479,7 @@ func (c *Conn) processFrames(lvl int, payload []byte) error {
 				l = uint64(len(raw) - off)
 			}
 			data := raw[off : off+int(l)]
+			streamData = true
 			streamErr = c.onStreamData(id, dataOff, data, kind&streamBitFin != 0)
 			return nil
 		case kind == frMaxData:
@@ -423,13 +492,27 @@ func (c *Conn) processFrames(lvl int, payload []byte) error {
 			c.closeWith(errors.New("quic: peer closed"))
 		case kind == frHandshakeDone:
 			c.handshakeDone = true
+		case kind == frPathChallenge:
+			// RFC 9000 8.2：必须把收到的 8 字节原样回一个 PATH_RESPONSE，
+			// 不然对端的路径校验过不去（PMTUD/迁移时用）
+			if len(raw) >= 9 {
+				c.mu.Lock()
+				c.appOut = appendVarint(c.appOut, frPathResponse)
+				c.appOut = append(c.appOut, raw[1:9]...)
+				c.appEnds = append(c.appEnds, len(c.appOut))
+				c.mu.Unlock()
+			}
 		}
 		return nil
 	})
 	if err != nil {
-		return err
+		// 帧解不动就把**整包**丢了（帧没有长度前缀，解偏了后面就没法接）。
+		// 这里一定要出声：这种错误在收包那条路上是被调用方忽略的，
+		// 不打日志就成了"客户端发了、服务端装死"。
+		dbg("processFrames: 解帧失败 lvl=%d: %v", lvl, err)
+		return ackEliciting, streamData, err
 	}
-	return streamErr
+	return ackEliciting, streamData, streamErr
 }
 
 // cryptoDeliver 把一个 CRYPTO 帧的数据按序交给 TLS：重传的整段/前半段丢掉，
@@ -521,6 +604,72 @@ func (c *Conn) updateKeys(h *header) (bool, []byte) {
 	return true, pt
 }
 
+// flushDelay 是"攒一批再发"的附加等待窗口，见 runFlusher。
+//
+// **默认 0**：flusher 光是把发送挪到自己的循环里、攒到它被调度为止，
+// 就已经拿到批量发送的全部好处（每请求 0.04 个报文，丢包归零）；
+// 再额外睡一个窗口只是给每个请求加延迟。lab 上扫过（baseline-h3，
+// 服务端 0-11、压测端 12-23、MTU 1500，5 秒一轮）：
+//
+//	窗口   0us     5us     15us    25us    50us
+//	rps    4.12M   4.13M   4.09M   4.00M   3.83M
+//
+// 也就是"睡多久就少多少"。留这个环境变量是为了以后换压测端/换档还能扫。
+var flushDelay = func() time.Duration {
+	if v := os.Getenv("FIO_QUIC_COALESCE_US"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n >= 0 {
+			return time.Duration(n) * time.Microsecond
+		}
+	}
+	return 0
+}()
+
+// runFlusher 攒一批 1-RTT 帧再发（每条连接一个 goroutine）。
+//
+// **为什么非攒不可**：压测端（h2load -m 64）一个 UDP 数据报里塞好几条请求，
+// 而我们原来每条响应的 Write 都立刻 sendto —— 实测每请求 2 个报文，
+// profile 里 47% 的 CPU 花在 sendto 上（一次系统调用 ~3.4us，比响应本身
+// 还贵）。攒一个窗口再发，一个包带上同一批的几条响应，sendto 少一个
+// 数量级。
+//
+// 握手、PING、ACK 那些不能等的不走这条路（handlePacket 里立刻 flush）。
+//
+// 兜底定时器 1ms：万一哪条路径忘了 signal，响应最晚 1ms 也会出去
+// ——"永远发不出去"比"晚 1ms"严重得多。
+func (c *Conn) runFlusher() {
+	timer := time.NewTimer(time.Millisecond)
+	defer timer.Stop()
+	for {
+		timer.Reset(time.Millisecond)
+		select {
+		case <-c.done:
+			return
+		case <-c.flushSig:
+		case <-timer.C:
+		}
+		if !timer.Stop() {
+			select {
+			case <-timer.C:
+			default:
+			}
+		}
+		if flushDelay > 0 {
+			time.Sleep(flushDelay)
+		}
+		if err := c.flush(); err != nil {
+			return
+		}
+	}
+}
+
+// flushSoon 告诉 flusher"有帧要发了"（非阻塞：已经响过就合并成一次）。
+func (c *Conn) flushSoon() {
+	select {
+	case c.flushSig <- struct{}{}:
+	default:
+	}
+}
+
 // flush 保证互斥（收包 goroutine 用），flushLocked 要求调用方已经拿着 c.mu。
 //
 // 写侧（lane 上的 Write/Close）都是在持锁状态下攒帧的，所以它们直接调
@@ -562,6 +711,16 @@ func (c *Conn) flushLocked() error {
 			if c.handshakeDone && !c.sentHandshakeDone {
 				payload = appendVarint(payload, frHandshakeDone)
 				c.sentHandshakeDone = true
+			}
+			// 把用掉的流额度还回去（MAX_STREAMS，RFC 9000 4.6）。
+			//
+			// 水位推过了多少就还多少：报给对端的是"总共能开多少条"，
+			// 对端取 max(旧值, 新值)，所以按四分之一额度分批报——每个
+			// 请求报一次太浪费（响应包里多 3 字节），报晚了对面会撞上限。
+			if c.retiredBidi.next+c.maxStreams > c.maxStreamsSent+c.maxStreams/4 {
+				c.maxStreamsSent = c.retiredBidi.next + c.maxStreams
+				payload = appendVarint(payload, frMaxStreamsBidi)
+				payload = appendVarint(payload, c.maxStreamsSent)
 			}
 			// 攒下的帧按帧边界装包：装得下就装，装不下先发掉当前这包。
 			start := 0
@@ -647,6 +806,7 @@ func (c *Conn) closeLocked(err error) {
 	c.err = err
 	close(c.accept)
 	close(c.acceptUni)
+	close(c.done) // 让 flusher 退出
 	// 等在 Read 上的全都醒一下：连接没了，它们各自看 c.closed 拿错误。
 	c.cond.Broadcast()
 }
@@ -691,6 +851,27 @@ func (c *Conn) OpenUniStream() *Stream {
 	s := newStream(c, c.nextUni)
 	c.nextUni += 4
 	return s
+}
+
+// StreamHook 是"对端开的流上有数据了"的同步钩子，见 SetStreamHook。
+type StreamHook func(s *Stream)
+
+// SetStreamHook 装一个流事件的同步钩子。
+//
+// 装了就**不再往 accept 队列投**：收包那条 goroutine 直接调它。这是给
+// HTTP/3 准备的快路——请求几乎都是"一个数据报里一条完整的流"，就地处理
+// 就地回，省掉"收包 -> lane -> flusher"两次 goroutine 切换。
+//
+// 实测（lab，baseline-h3，压测端每连接 64 条并发流）：走 lane 那条路时
+// 每连接的处理速度是 23.5us/请求（一条一条串着，latency 全堆在调度上），
+// 换成就地处理之后能到 5us 级——量出来的差距就是这个。
+//
+// **钩子里不能阻塞**：它跑在收包 goroutine 上，一堵整条连接的收包都停。
+// 所以调用方要先看 Stream.Finished()，没收完的流交回 accept 那条路。
+func (c *Conn) SetStreamHook(fn StreamHook) {
+	c.mu.Lock()
+	c.hook = fn
+	c.mu.Unlock()
 }
 
 // AcceptUniStream 取一条对端发起的单向流（阻塞）。

@@ -176,18 +176,38 @@ func parseFrames(payload []byte, fn func(kind uint64, b []byte, n int) error) er
 				off += n
 			}
 		case kind == frNewConnID:
-			// 序号 + 长度 + CID + 重置令牌（16 字节）
-			if _, n, err = readVarint(payload[off:]); err != nil {
+			// RFC 9000 19.15：序号 + **retire prior to** + 长度(8) + CID +
+			// 重置令牌（16 字节）。
+			//
+			// retire prior to 这一段最容易漏——漏了的话"长度"读到的是它的值，
+			// 帧边界整个错位，后面同一包里的帧全解不出来（**整包被丢**）。
+			// 踩过：ngtcp2 的客户端把 NEW_CONNECTION_ID 和请求的 STREAM 帧
+			// 放在同一个包里，我们只解出 ACK 和它，请求就没了，
+			// 表现成"客户端发了请求、服务端没反应"。
+			if _, n, err = readVarint(payload[off:]); err != nil { // 序号
 				return err
 			}
 			off += n
-			cl, n, err := readVarint(payload[off:])
+			if _, n, err = readVarint(payload[off:]); err != nil { // retire prior to
+				return err
+			}
+			off += n
+			cl, n, err := readVarint(payload[off:]) // 长度
 			if err != nil {
 				return err
 			}
 			off += n + int(cl) + 16
 			if off > len(payload) {
 				return errFrame
+			}
+		case kind == frStopSending:
+			// RFC 9000 19.5：流 ID + 错误码。h3 的客户端用它中止一条响应
+			// （比如客户端不想要了）。解出来跳过，别让整包跟着作废。
+			for i := 0; i < 2; i++ {
+				if _, n, err = readVarint(payload[off:]); err != nil {
+					return err
+				}
+				off += n
 			}
 		case kind == frRetireConnID:
 			if _, n, err = readVarint(payload[off:]); err != nil {

@@ -386,22 +386,12 @@ func (s *NativeServer) serveConn(qc *quic.Conn, h StreamHandler) {
 	// 注意 lanes > 1 时**同一个 StreamHandler 实例不再被串行调用**，
 	// 见 StreamHandler 的说明。
 	lanes := h3Lanes
-	if lanes <= 1 {
-		l := &lane{h: h, st: newStreamState()}
-		for {
-			str, err := qc.AcceptStream()
-			if err != nil {
-				return
-			}
-			c.handleStream(l, str, str.StreamID())
-		}
-	}
 
 	type streamItem struct {
 		str *quic.Stream
 		id  uint64
 	}
-	ch := make(chan streamItem, lanes*2)
+	ch := make(chan streamItem, 64)
 	for i := 0; i < lanes; i++ {
 		go func() {
 			l := &lane{h: c.newH(), st: newStreamState()}
@@ -410,10 +400,40 @@ func (s *NativeServer) serveConn(qc *quic.Conn, h StreamHandler) {
 			}
 		}()
 	}
+
+	// **快路**（FIO_H3_FASTPATH=1，默认关）：请求已经收完了（数据 + FIN
+	// 都在这一包/这一批里）就地处理——在收包那条 goroutine 上直接把响应
+	// 写进发送队列，和 ACK 一起发，省掉"唤醒 lane -> 处理 -> 唤醒 flusher"
+	// 两次 goroutine 切换。
+	//
+	// 实测（lab baseline-h3，-m 64）：**开着更慢**（3.50M vs 3.91M）——
+	// 就地处理把 handler 和 QPACK 编码也串到收包 goroutine 上了，收包
+	// 那条路一忙，整条连接的"收 -> 处理 -> 发"反而更慢。留成开关是为了
+	// 以后换压测端（比如每条流单独成包的那种）还能再试。
+	//
+	// 没收完的流一律交回 lane：快路上**不能阻塞**（它堵住的是整条连接的收包）。
+	if os.Getenv("FIO_H3_FASTPATH") == "1" {
+		fastLane := &lane{h: c.newH(), st: newStreamState()}
+		qc.SetStreamHook(func(str *quic.Stream) {
+			if !str.Finished() {
+				select {
+				case ch <- streamItem{str, str.StreamID()}:
+				default:
+					// 队列满了：这条流没人处理。真到这一步说明并发流远超
+					// 预期，宁可丢弃也不要堵住收包（对端会超时重试）。
+				}
+				return
+			}
+			c.handleStream(fastLane, str, str.StreamID())
+		})
+	}
+
+	if lanes <= 1 {
+		return
+	}
 	for {
 		str, err := qc.AcceptStream()
 		if err != nil {
-			close(ch)
 			return
 		}
 		ch <- streamItem{str, str.StreamID()}

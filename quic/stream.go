@@ -117,9 +117,9 @@ func (s *Stream) Write(p []byte) (int, error) {
 		s.writeOff += uint64(n)
 		p = p[n:]
 	}
-	if err := c.flushLocked(); err != nil {
-		return 0, err
-	}
+	// 不在这里 sendto：交给 flusher 攒一批再发（见 runFlusher）——
+	// 一个数据报里来的几条请求，响应应该并进一个包出去
+	c.flushSoon()
 	return total, nil
 }
 
@@ -135,7 +135,8 @@ func (s *Stream) Close() error {
 	c.appEnds = append(c.appEnds, len(c.appOut))
 	s.sentFin = true
 	c.finishIfDone(s)
-	return c.flushLocked()
+	c.flushSoon()
+	return nil
 }
 
 // CancelRead 告诉对端这条流的接收侧不要了（RESET_STREAM，RFC 9000 19.4），
@@ -167,6 +168,7 @@ func (s *Stream) CancelRead(code uint64) {
 func (c *Conn) onStreamData(id, offset uint64, data []byte, fin bool) error {
 	c.mu.Lock()
 	s := c.streams[id]
+	isNew := false
 	if s == nil {
 		if c.retired(id) {
 			// 这条流早就收完关掉了：帧是重传，丢
@@ -176,23 +178,44 @@ func (c *Conn) onStreamData(id, offset uint64, data []byte, fin bool) error {
 		}
 		s = newStream(c, id)
 		c.streams[id] = s
-		// 对端双向流（HTTP/3 的请求流）递给 AcceptStream，单向流
-		// （对端的控制流/QPACK）递给 AcceptUniStream。
-		if s.peerInitiated() && id&0x02 == 0 {
-			c.pushAccept(s)
-		} else {
-			c.pushAcceptUni(s)
-		}
+		isNew = true
 	}
 	s.append(offset, data)
 	if fin {
 		s.fin = true
 	}
+	hook := c.hook
 	c.mu.Unlock()
+
+	// 新流才需要交给上层：装了钩子就**就地调**（HTTP/3 的快路，省掉两次
+	// goroutine 切换），没装就投 accept 队列。
+	//
+	// 调用放在解锁之后：钩子要跑用户的 handler，不能攥着连接的锁。
+	if isNew {
+		switch {
+		case hook != nil && s.peerInitiated() && s.id&0x02 == 0:
+			hook(s)
+		case s.peerInitiated() && s.id&0x02 == 0:
+			c.pushAccept(s) // 对端双向流：HTTP/3 的请求流
+		default:
+			c.pushAcceptUni(s) // 对端单向流：控制流 / QPACK
+		}
+	}
+
 	// 等在 Read 上的（可能好几条流、好几个 goroutine）都醒一下：
 	// 它们起来各自看一眼自己的缓冲，没有数据的会接着睡。
 	c.cond.Broadcast()
 	return nil
+}
+
+// Finished 对端在这条流上发完了（FIN 到了）。
+//
+// 快路用它判断"这个请求已经完整了"，可以就地处理；没收完的得交给
+// 会阻塞的那条路（lane/goroutine），别把收包 goroutine 堵住。
+func (s *Stream) Finished() bool {
+	s.conn.mu.Lock()
+	defer s.conn.mu.Unlock()
+	return s.fin
 }
 
 // append 把一段数据按偏移接进接收缓冲。调用方持有 c.mu。
