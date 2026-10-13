@@ -37,13 +37,23 @@ import (
 // Ctx（重新绑到新的请求和响应上），所以别把它存起来——要留的东西自己拷。
 type Ctx struct {
 	req *Request
-	w   *ResponseWriter
+	w   Writer
 }
 
 // reset 把 Ctx 绑到这一轮的请求和响应上（连接级复用）。
-func (c *Ctx) reset(w *ResponseWriter, r *Request) {
+func (c *Ctx) reset(w Writer, r *Request) {
 	c.w = w
 	c.req = r
+}
+
+// NewCtx 把 Ctx 绑到一份请求和一个 Writer 上。
+//
+// http1 在自己包内用 reset 复用连接级的 Ctx；**http2 用这个**——它那边的
+// 响应不是 ResponseWriter，而是把帧编进流里。
+func NewCtx(w Writer, r *Request) *Ctx {
+	c := &Ctx{}
+	c.reset(w, r)
+	return c
 }
 
 // ── 请求 ────────────────────────────────────────────────────────────────────
@@ -117,7 +127,7 @@ func (c *Ctx) Set(name, value string) *Ctx {
 		h[name] = append(h[name][:0], value)
 		return c
 	}
-	h[name] = c.w.putString(value)
+	h[name] = c.w.PutString(value)
 	return c
 }
 
@@ -166,4 +176,11 @@ func (c *Ctx) Defer() { c.w.Defer() }
 // Resume 收尾一个被 Defer 挂起的请求。见 Resume。
 //
 // **要在这条连接的事件循环的 goroutine 上调**（engine.Conn.SyncOnLoop）。
-func (c *Ctx) Resume() error { return Resume(c.w.conn, c.req) }
+func (c *Ctx) Resume() error {
+	conn := c.w.Conn()
+	if conn == nil {
+		// 没有底层连接的 Writer：没有 http1 那套"挂起的响应"要收尾
+		return nil
+	}
+	return Resume(conn, c.req)
+}
