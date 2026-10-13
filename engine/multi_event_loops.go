@@ -282,6 +282,18 @@ func (m *MultiEventLoop) Add(fd int, h Handler) (*Conn, error) {
 		// 所以：任务里跑 OnOpen，跑完置 activated 位；事件处理那边看到
 		// 位没置就把事件记成 pending，由 OnOpen 跑完时自己取走（见
 		// activate 和 processConn）。
+		//
+		// **开了 worker 池就投给 worker，不投事件循环**：事件是在 worker
+		// 上处理的，OnOpen 必须落到同一个 worker 上——协议在 OnOpen 里建
+		// 的连接状态（http2 的发送窗口、grpc 的 conn……）worker 才看得见。
+		// 分成两个 goroutine 的话那些字段没有 happens-before：-race 报
+		// grpc 的 ConnHandler.conn 竞争，http2 表现为大响应违反发送流控、
+		// 真实客户端读到 EOF。fd 固定分片，这里投的和事件去的是同一个
+		// worker。
+		if m.pool != nil {
+			m.pool.nodeFor(fd).push(task{c: c})
+			return c, nil
+		}
 		el.runOnLoop(func() {
 			el.activate(c)
 		})
