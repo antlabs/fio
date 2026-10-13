@@ -139,7 +139,30 @@ type Conn struct {
 	// 新流，也不能重复用一个已经关掉的 ID。不用这个记账的话，"重复
 	// 使用旧 ID"会被当成新请求——两边的理解就此分叉。
 	maxPeerStreamID uint32
+
+	// maxLocalStreamID 我们这边开过的最大流 ID（和 maxPeerStreamID 对称）。
+	//
+	// **用来区分"关掉的流"和"从没开过的流"**：流关了以后会从 c.streams
+	// 里删掉（见 forgetStream），之后表里查不到。但"查不到"有两种：真
+	// idle（双方都没建过）和已经关掉。对 WINDOW_UPDATE/RST_STREAM 这两个，
+	// RFC 9113 5.1/6.9 只对前者要求报连接错误，对后者要忽略——WINDOW_UPDATE
+	// 是对端对我们之前发的 DATA 的反馈，完全可能在我们发完 END_STREAM、
+	// 把流忘掉之后才到（实测：真实客户端读 256KB 响应偶发被判
+	// "WINDOW_UPDATE on idle stream"，我们主动 GOAWAY，连接被 RST，客户端
+	// 读 body 报 connection reset）。
+	maxLocalStreamID uint32
 }
+
+// peerParity / localParity：RFC 9113 5.1——客户端开的流用奇数号，服务端
+// 用偶数号。这两个返回对应对端/本端那一侧的奇偶。
+func (c *Conn) peerParity() uint32 {
+	if c.isClient {
+		return 0
+	}
+	return 1
+}
+
+func (c *Conn) localParity() uint32 { return 1 - c.peerParity() }
 
 // NewConn 建一条 HTTP/2 连接。
 func NewConn(isClient bool, h StreamHandler) *Conn {
@@ -791,7 +814,19 @@ func (c *Conn) checkStreamRecv(streamID uint32, kind frameKind) error {
 		c.maxPeerStreamID = streamID
 	}
 
-	// 流不存在 = idle 状态
+	// 流不在表里：**可能是 idle（双方都没建过），也可能是建过、已经关掉
+	// 并被 forgetStream 从表里删掉的**。靠两个"开过的最大 ID"区分。
+	//
+	// 区别在哪（RFC 9113 5.1/6.9）：idle 上收 WINDOW_UPDATE/RST_STREAM 是
+	// 连接级 PROTOCOL_ERROR；但**已经关掉的流上收这两个要忽略**——
+	// WINDOW_UPDATE 本来就是"对端收到我们的 DATA 之后的反馈"，它可能在我们
+	// 发完 END_STREAM（对端也已经 END_STREAM → 流进 Closed 并被删掉）之后
+	// 才到。一律当 idle 报错的话，正常的一次大响应都会被自己判死。
+	openedBefore := false
+	if s == nil {
+		openedBefore = (streamID <= c.maxPeerStreamID && streamID&1 == c.peerParity()) ||
+			(streamID <= c.maxLocalStreamID && streamID&1 == c.localParity())
+	}
 	if s == nil {
 		switch kind {
 		case frameKindHeaders:
@@ -801,6 +836,10 @@ func (c *Conn) checkStreamRecv(streamID uint32, kind frameKind) error {
 			// 优先级可以在 idle 流上发（RFC 9113 5.3.1），我们不做优先级
 			return nil
 		case frameKindWindowUpdate, frameKindRSTStream:
+			if openedBefore {
+				// 已经关掉的流：忽略（RFC 9113 6.9 / 6.4）
+				return nil
+			}
 			// **idle 上不能发这两个**（RFC 9113 5.1）——那是在操作一个
 			// 双方都还没建的流，属于连接级 PROTOCOL_ERROR
 			return connError(ErrCodeProtocol, "stream %d: %s on idle stream",
@@ -1007,6 +1046,11 @@ func (c *Conn) onRSTStream(f *Frame) error {
 
 // stream 取一个流，没有就建（对端发起的就是这样）。
 func (c *Conn) stream(id uint32) *Stream {
+	// 按奇偶记下"我们这边开过的最大 ID"，关流之后还要靠它区分
+	// "已关闭"和"从没开过"（见 maxLocalStreamID 的说明）。
+	if id&1 == c.localParity() && id > c.maxLocalStreamID {
+		c.maxLocalStreamID = id
+	}
 	s := c.streams[id]
 	if s == nil {
 		s = &Stream{
