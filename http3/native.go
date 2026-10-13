@@ -196,6 +196,36 @@ func (c *Conn) WriteData(streamID uint64, data []byte, endStream bool) error {
 	return nil
 }
 
+// WriteDataPrepared 发一段**已经拼好的完整帧**（含帧头），不进中转缓冲。
+//
+// 静态文件那条路用它：DATA 帧的头（帧类型 + 长度 varint）对"给定文件 +
+// 给定压缩变体"是常量，可以和数据一起在缓存里拼好，这里直接交给 QUIC 流——
+// 省掉 AppendData 那遍整体拷贝。static-h3 是 16KB 响应 × 48 万/秒，那遍
+// 拷贝按字节算是 7.8GB/s。
+//
+// 契约：frame 是完整帧；调用前不该有没 flush 的缓冲数据（先 WriteHeaders，
+// 它会 flush）。endStream 时半关这一侧。
+func (c *Conn) WriteDataPrepared(streamID uint64, frame []byte, endStream bool) error {
+	st := c.streamState(streamID)
+	if st == nil {
+		return nil
+	}
+	if len(st.wbuf) > 0 {
+		if err := st.flush(false); err != nil {
+			return err
+		}
+	}
+	if len(frame) > 0 {
+		if _, err := st.str.Write(frame); err != nil {
+			return err
+		}
+	}
+	if endStream {
+		return st.str.Close()
+	}
+	return nil
+}
+
 // WriteTrailers 发 trailer：一个带 END_STREAM 的 HEADERS 帧。
 //
 // HTTP/3 和 h2 一样有 trailer（gRPC 用它送调用状态）。
