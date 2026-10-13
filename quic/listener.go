@@ -43,12 +43,20 @@ func Listen(addr string, cfg Config) (*Listener, error) {
 	if err != nil {
 		return nil, err
 	}
+	return ListenPacket(pc, cfg), nil
+}
+
+// ListenPacket 用一个已经建好的 UDP socket 起监听。
+//
+// 需要自己控制 socket 的时候用（比如带 SO_REUSEPORT 的预派生，
+// http3.NativeServer.ReusePort 走的就是这条路）。
+func ListenPacket(pc net.PacketConn, cfg Config) *Listener {
 	return &Listener{
 		pc:     pc,
 		cfg:    cfg,
 		byCID:  make(map[string]*Conn, 16),
 		accept: make(chan *Conn, 16),
-	}, nil
+	}
 }
 
 // Addr 实际监听的地址。

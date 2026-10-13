@@ -48,7 +48,7 @@ func TestPacketRoundTrip(t *testing.T) {
 			if tc.typ == pktInitial {
 				token = []byte("tok")
 			}
-			pkt := sealPacket(nil, tc.long, tc.typ, dcid, scid, token, 42, p, send)
+			pkt := sealPacket(nil, tc.long, tc.typ, dcid, scid, token, 42, p, send, 0)
 			h, err := parseHeader(pkt, len(dcid))
 			if err != nil {
 				t.Fatalf("%s: parseHeader: %v", tc.name, err)

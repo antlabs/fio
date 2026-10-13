@@ -69,10 +69,37 @@ type Conn struct {
 	cryptoNext [3]uint64
 	cryptoGaps [3]map[uint64][]byte
 
-	// 流
+	// 流。mu 保护从 streams 到 appOut 这一整片（收包 goroutine 和各个
+	// lane 上写响应的 goroutine 都会碰）。
 	mu      sync.Mutex
 	streams map[uint64]*Stream
 	accept  chan *Stream
+	// acceptUni 是对端开的单向流（HTTP/3 的控制流 / QPACK 流）。
+	acceptUni chan *Stream
+	// nextUni 是我们自己开的下一条单向流 ID（服务端单向流 3, 7, 11…）。
+	nextUni uint64
+
+	// cond 有新数据、或者连接关掉时广播。
+	//
+	// 原来是往一个 chan 里投一个信号——那个只能唤醒**一个**等待者。
+	// HTTP/3 起几条并行通道（h3Lanes）之后同一时刻有好几个 goroutine
+	// 等在各自的流上，投递式的信号会让其余的永远睡着（实测卡死在
+	// 并发请求上）。
+	cond *sync.Cond
+
+	// 对端流回收水位，见 retireSet。
+	retiredBidi retireSet
+	retiredUni  retireSet
+
+	// 1-RTT 的 Key Phase 位（RFC 9001 6）和我们当前这一代读密钥。
+	//
+	// **对端会主动换代**：quic-go 的客户端"握手之后不久就把第一次密钥
+	// 更新做了"（updatable_aead.go 里写得很直白，就是为了把这条机制跑通），
+	// 触发点是当前密钥下过了 100 个包。不跟着换的话，从那以后每个包都
+	// AEAD 验不过——症状是流数据一个劲"有洞"、请求挂死。
+	keyPhase uint8
+	// prevRecv 是上一代读密钥：换代的瞬间还有在途的旧包，留一代给它们。
+	prevRecv *keys
 
 	// 收下来的对端传输参数
 	peer peerParams
@@ -87,12 +114,21 @@ type Conn struct {
 	closed            bool
 	err               error
 
-	// appOut 是 1-RTT 上待发的帧（各流的 STREAM、控制帧）。攒起来一次发。
-	appOut []byte
-
-	// dataSig 收到新数据时报一下，唤醒等在 Read 上的 goroutine。
-	dataSig chan struct{}
+	// appOut 是 1-RTT 上待发的帧（各流的 STREAM、控制帧）。攒起来一次发；
+	// appEnds 记每个帧的结束偏移——**帧不能跨包**，切包只能切在帧边界上
+	// （见 flushLocked）。
+	appOut  []byte
+	appEnds []int
 }
+
+const (
+	// maxPacketPayload 一个 1-RTT 包载荷的上限。1500 的 MTU 减掉包头和
+	// AEAD 标签还剩 1400 多，取 1200（QUIC 的最小 MTU）对什么路径都安全。
+	maxPacketPayload = 1200
+	// maxStreamChunk 一个 STREAM 帧最多带多少字节。留出帧头和小控制帧
+	// （ACK/HANDSHAKE_DONE）的余量，让它们能和最后一个数据帧同包。
+	maxStreamChunk = 1100
+)
 
 // Config 是服务端的配置。
 type Config struct {
@@ -115,20 +151,25 @@ const (
 // 客户端的每个包的目标连接 ID 都得是它。
 func newConn(pc net.PacketConn, remote net.Addr, odcid, peerCID []byte, cfg Config) (*Conn, error) {
 	c := &Conn{
-		pc:      pc,
-		remote:  remote,
-		streams: make(map[uint64]*Stream),
-		accept:  make(chan *Stream, 64),
-		scid:    make([]byte, connIDLen),
-		dataSig: make(chan struct{}, 1),
-		dcid:    append([]byte(nil), peerCID...),
-		odcid:   append([]byte(nil), odcid...),
-		maxData: 1 << 20,
+		pc:        pc,
+		remote:    remote,
+		streams:   make(map[uint64]*Stream),
+		accept:    make(chan *Stream, 64),
+		acceptUni: make(chan *Stream, 8),
+		scid:      make([]byte, connIDLen),
+		dcid:      append([]byte(nil), peerCID...),
+		odcid:     append([]byte(nil), odcid...),
+		maxData:      1 << 20,
 		maxStreamData: 1 << 20,
+		// 服务端开的单向流从 3 开始（0x03：本端发起 + 单向）
+		nextUni:     3,
+		retiredUni:  retireSet{next: 2, pend: make(map[uint64]struct{})},
+		retiredBidi: retireSet{next: 0, pend: make(map[uint64]struct{})},
 	}
 	for i := range c.cryptoGaps {
 		c.cryptoGaps[i] = make(map[uint64][]byte)
 	}
+	c.cond = sync.NewCond(&c.mu)
 	if _, err := rand.Read(c.scid); err != nil {
 		return nil, err
 	}
@@ -271,20 +312,44 @@ func (c *Conn) handlePacket(b []byte) error {
 			dbg("handlePacket: 头保护解不开 lvl=%d: %v", lvl, err)
 			return err
 		}
-		dbg("handlePacket: lvl=%d pn=%d 密文 %d 字节", lvl, h.pn, len(h.payload))
+		dbg("handlePacket: lvl=%d pn=%d 密文 %d 字节 首字节=%#x", lvl, h.pn, len(h.payload), h.raw[0])
+		// 连接状态的操作都要在锁里：写侧（lane goroutine 上的
+		// Write/Close -> flushLocked）会同时读 ackDue/recvSeen/密钥。
+		c.mu.Lock()
 		if h.pn > c.largest[lvl] || !c.gotPN[lvl] {
 			c.largest[lvl] = h.pn
 			c.gotPN[lvl] = true
 		}
+		c.mu.Unlock()
 		payload, err := h.open(k)
 		if err != nil {
-			// AEAD 验不过：可能是同一数据报里我们解偏了，跳过这个包
-			return nil
+			// AEAD 验不过。1-RTT 上先看看是不是对端换代了（见 keyPhase）：
+			// 拿当前读密钥推下一代试试，解开了就跟着换。
+			if lvl == lvlApp && !h.long {
+				if h.keyPhase() != c.keyPhase {
+					if ok, pt := c.updateKeys(h); ok {
+						payload, err = pt, nil
+					}
+				}
+				// 还不行就试试上一代：换代瞬间在途的旧包
+				if err != nil && c.prevRecv != nil {
+					if pt, e := h.open(c.prevRecv); e == nil {
+						payload, err = pt, nil
+					}
+				}
+			}
+			if err != nil {
+				dbg("handlePacket: AEAD 验不过 lvl=%d pn=%d kp=%d 当前kp=%d（%d 字节密文）",
+					lvl, h.pn, h.keyPhase(), c.keyPhase, len(h.payload))
+				return nil
+			}
 		}
 		// **验过了才记 ACK**：验不过的包等于没收到（记了会让对端以为
 		// 我们已经拿到、不再重传）。
+		c.mu.Lock()
 		c.ackDue[lvl] = true
 		c.recvSeen[lvl] = append(c.recvSeen[lvl], h.pn)
+		c.mu.Unlock()
 		if err := c.processFrames(lvl, payload); err != nil {
 			return err
 		}
@@ -421,8 +486,57 @@ func quicLevel(lvl int) tls.QUICEncryptionLevel {
 	}
 }
 
-// flush 把三个级别上待发的东西各发一个包出去。
+// updateKeys 处理对端的密钥更新（RFC 9001 6）：拿当前读密钥推下一代，
+// 能解开 h 就把读写两侧都换过去。
+//
+// **两侧一起换**：Key Phase 是双向同步的——对端换代之后，它也会用新一代
+// 的密钥来读我们的包，所以我们的**写**密钥必须跟着换，而且之后发出的
+// 短头要标新相位（见 sendPacketLocked 的 kp）。
+//
+// 旧的读密钥留一代（prevRecv）：换代的瞬间还有在途的旧包。
+func (c *Conn) updateKeys(h *header) (bool, []byte) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	cur := c.recv[lvlApp]
+	if cur == nil || len(cur.secret) == 0 {
+		return false, nil
+	}
+	next, err := cur.next()
+	if err != nil {
+		return false, nil
+	}
+	pt, err := h.open(next)
+	if err != nil {
+		return false, nil
+	}
+	c.prevRecv = cur
+	c.recv[lvlApp] = next
+	c.keyPhase = h.keyPhase()
+	if w := c.send[lvlApp]; w != nil {
+		if nw, err := w.next(); err == nil {
+			c.send[lvlApp] = nw
+		}
+	}
+	dbg("密钥更新：key phase -> %d", c.keyPhase)
+	return true, pt
+}
+
+// flush 保证互斥（收包 goroutine 用），flushLocked 要求调用方已经拿着 c.mu。
+//
+// 写侧（lane 上的 Write/Close）都是在持锁状态下攒帧的，所以它们直接调
+// flushLocked；收包那条路是攒完 ACK 再进来。
 func (c *Conn) flush() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.flushLocked()
+}
+
+// flushLocked 把三个级别上待发的东西发出去。
+//
+// 1-RTT 那份可能不止一个包：appOut 里攒的帧按**帧边界**切成 ≤
+// maxPacketPayload 的载荷，一包一包发（QUIC 的帧不跨包，切分点只能落在
+// 帧与帧之间，而帧的结束位置在 appEnds 里）。
+func (c *Conn) flushLocked() error {
 	if c.closed {
 		return nil
 	}
@@ -439,66 +553,157 @@ func (c *Conn) flush() error {
 			c.cryptoOut[lvl] = nil
 		}
 		if lvl == lvlApp {
-			payload = c.appendStreamData(payload)
 			if c.handshakeDone && !c.sentHandshakeDone {
 				payload = appendVarint(payload, frHandshakeDone)
 				c.sentHandshakeDone = true
 			}
+			// 攒下的帧按帧边界装包：装得下就装，装不下先发掉当前这包。
+			start := 0
+			for _, end := range c.appEnds {
+				if len(payload) > 0 && len(payload)+end-start > maxPacketPayload {
+					if err := c.sendPacketLocked(lvl, payload); err != nil {
+						return err
+					}
+					payload = payload[:0]
+				}
+				payload = append(payload, c.appOut[start:end]...)
+				start = end
+			}
+			c.appOut = c.appOut[:0]
+			c.appEnds = c.appEnds[:0]
 		}
 		if len(payload) == 0 {
 			continue
 		}
-		k := c.send[lvl]
-		if k == nil {
-			dbg("flush: lvl=%d 有 %d 字节要发但没密钥", lvl, len(payload))
-			continue
-		}
-		pn := c.nextPN[lvl]
-		c.nextPN[lvl]++
-		var pkt []byte
-		if lvl == lvlApp {
-			pkt = sealPacket(nil, false, 0, c.dcid, nil, nil, pn, payload, k)
-		} else {
-			typ := byte(pktInitial)
-			if lvl == lvlHandshake {
-				typ = pktHandshake
-			}
-			if lvl == lvlInitial {
-				// RFC 9000 14.1：带 Initial 的数据报至少要 1200 字节（服务端
-				// 也适用），不够就补 PADDING 帧。补在明文里，不是密文外
-				// （见 sealPacket 那段注释）。长度字段本身可能跟着变长，
-				// 所以循环到真的够为止。
-				for {
-					pkt = sealPacket(nil, true, typ, c.dcid, c.scid, nil, pn, payload, k)
-					if len(pkt) >= 1200 {
-						break
-					}
-					payload = append(payload, make([]byte, 1200-len(pkt))...)
-				}
-			} else {
-				pkt = sealPacket(nil, true, typ, c.dcid, c.scid, nil, pn, payload, k)
-			}
-		}
-		if _, err := c.pc.WriteTo(pkt, c.remote); err != nil {
-			dbg("flush: lvl=%d 写 %d 字节失败: %v", lvl, len(pkt), err)
+		if err := c.sendPacketLocked(lvl, payload); err != nil {
 			return err
 		}
-		dbg("flush: lvl=%d pn=%d 发出 %d 字节（载荷 %d）", lvl, pn, len(pkt), len(payload))
 	}
+	return nil
+}
+
+// sendPacketLocked 封一个包发出去。调用方持有 c.mu。
+func (c *Conn) sendPacketLocked(lvl int, payload []byte) error {
+	k := c.send[lvl]
+	if k == nil {
+		dbg("flush: lvl=%d 有 %d 字节要发但没密钥", lvl, len(payload))
+		return nil
+	}
+	pn := c.nextPN[lvl]
+	c.nextPN[lvl]++
+	var pkt []byte
+	if lvl == lvlApp {
+		// 短头要带当前的 Key Phase（对端换代之后我们也得标新相位，
+		// 见 updateKeys）
+		pkt = sealPacket(nil, false, 0, c.dcid, nil, nil, pn, payload, k, c.keyPhase)
+	} else {
+		typ := byte(pktInitial)
+		if lvl == lvlHandshake {
+			typ = pktHandshake
+		}
+		if lvl == lvlInitial {
+			// RFC 9000 14.1：带 Initial 的数据报至少要 1200 字节（服务端
+			// 也适用），不够就补 PADDING 帧。补在明文里，不是密文外
+			// （见 sealPacket 那段注释）。长度字段本身可能跟着变长，
+			// 所以循环到真的够为止。
+			for {
+				pkt = sealPacket(nil, true, typ, c.dcid, c.scid, nil, pn, payload, k, 0)
+				if len(pkt) >= 1200 {
+					break
+				}
+				payload = append(payload, make([]byte, 1200-len(pkt))...)
+			}
+		} else {
+			pkt = sealPacket(nil, true, typ, c.dcid, c.scid, nil, pn, payload, k, 0)
+		}
+	}
+	if _, err := c.pc.WriteTo(pkt, c.remote); err != nil {
+		dbg("flush: lvl=%d 写 %d 字节失败: %v", lvl, len(pkt), err)
+		return err
+	}
+	dbg("flush: lvl=%d pn=%d 发出 %d 字节（载荷 %d）", lvl, pn, len(pkt), len(payload))
 	return nil
 }
 
 // closeWith 关掉这条连接。
 func (c *Conn) closeWith(err error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.closeLocked(err)
+}
+
+// closeLocked 见 closeWith。调用方持有 c.mu。
+func (c *Conn) closeLocked(err error) {
 	if c.closed {
 		return
 	}
 	c.closed = true
 	c.err = err
 	close(c.accept)
+	close(c.acceptUni)
+	// 等在 Read 上的全都醒一下：连接没了，它们各自看 c.closed 拿错误。
+	c.cond.Broadcast()
+}
+
+// CloseWithError 发一个 CONNECTION_CLOSE（应用层错误码）再关掉连接。
+//
+// 形状和 quic-go 的一样（http3 那层直接调），code 是应用错误码。
+func (c *Conn) CloseWithError(code uint64, msg string) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.closed {
+		return nil
+	}
+	if c.send[lvlApp] != nil {
+		var payload []byte
+		payload = appendVarint(payload, frConnCloseApp)
+		payload = appendVarint(payload, code)
+		payload = appendVarint(payload, uint64(len(msg)))
+		payload = append(payload, msg...)
+		// 发不出去也没关系（对端已经走了），关闭照做
+		_ = c.sendPacketLocked(lvlApp, payload)
+	}
+	if msg == "" {
+		msg = "closed"
+	}
+	c.closeLocked(errors.New("quic: " + msg))
+	return nil
+}
+
+// errOr 连接上有错误就用它，否则用 fallback。
+func (c *Conn) errOr(fallback error) error {
+	if c.err != nil {
+		return c.err
+	}
+	return fallback
+}
+
+// OpenUniStream 开一条我们自己发起的单向流（HTTP/3 的控制流就是它）。
+func (c *Conn) OpenUniStream() *Stream {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	s := newStream(c, c.nextUni)
+	c.nextUni += 4
+	return s
+}
+
+// AcceptUniStream 取一条对端发起的单向流（阻塞）。
+func (c *Conn) AcceptUniStream() (*Stream, error) {
+	s, ok := <-c.acceptUni
+	if !ok {
+		c.mu.Lock()
+		err := c.errOr(errors.New("quic: connection closed"))
+		c.mu.Unlock()
+		return nil, err
+	}
+	return s, nil
 }
 
 // ReadLoop 收数据报，直到连接关掉。
+//
+// **只给不挂在 Listener 上的连接用**：Listener 收上来的连接由 Serve 就地
+// 处理（收包和握手在同一个 goroutine 上串起来），再起一个 ReadLoop 就是
+// 两个读者抢同一个 socket，数据报会被随机分走。
 func (c *Conn) ReadLoop() {
 	buf := make([]byte, 2048)
 	for {

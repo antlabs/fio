@@ -53,6 +53,38 @@ type keys struct {
 	hp  cipher.Block
 	iv  []byte
 	hpK []byte
+	// secret 是推出这一代密钥的 traffic secret。只有它才能推出下一代
+	// （密钥更新，RFC 9001 6.1），所以存着。
+	secret []byte
+}
+
+// next 推下一代密钥（RFC 9001 6.1）：
+//
+//	secret_<n+1> = HKDF-Expand-Label(secret_<n>, "quic ku", "", Hash.length)
+//
+// **只换 AEAD 的 key/iv，头保护密钥（quic hp）不换。** RFC 9001 6 的原文：
+// "同一个头保护密钥在整个连接期间使用，密钥更新之后也不变"——Key Phase
+// 位本身也被头保护盖着，靠的就是这一点才能稳定地解出来。头保护跟着换的
+// 话，换代之后每个包解出来的首字节都是乱的（表现成 pnLen 变成 4、包序号
+// 大得离谱），对端一切正常、我们自己全崩。
+//
+// 只有 1-RTT 会换代（Initial/Handshake 的密钥跟着握手走，不存在更新）。
+func (k *keys) next() (*keys, error) {
+	if len(k.secret) == 0 {
+		return nil, errors.New("quic: no secret to update from")
+	}
+	secret := hkdfExpandLabel(k.secret, "quic ku", len(k.secret))
+	key := hkdfExpandLabel(secret, "quic key", 16)
+	iv := hkdfExpandLabel(secret, "quic iv", 12)
+	block, err := aes.NewCipher(key)
+	if err != nil {
+		return nil, err
+	}
+	aead, err := cipher.NewGCM(block)
+	if err != nil {
+		return nil, err
+	}
+	return &keys{aead: aead, hp: k.hp, iv: iv, hpK: k.hpK, secret: secret}, nil
 }
 
 var errNoKeys = errors.New("quic: no keys for this level")
@@ -93,7 +125,7 @@ func deriveKeys(secret []byte) (*keys, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &keys{aead: aead, hp: hpBlock, iv: iv, hpK: hp}, nil
+	return &keys{aead: aead, hp: hpBlock, iv: iv, hpK: hp, secret: append([]byte(nil), secret...)}, nil
 }
 
 // deriveInitial 推 Initial 级别的密钥（RFC 9001 5.2）。

@@ -280,6 +280,15 @@ func appendAck(dst []byte, pns []uint64, delay uint64) []byte {
 	return dst
 }
 
+// appendResetStream 拼一个 RESET_STREAM 帧（流 ID + 错误码 + 最终大小）。
+func appendResetStream(dst []byte, id, code, finalSize uint64) []byte {
+	dst = appendVarint(dst, frResetStream)
+	dst = appendVarint(dst, id)
+	dst = appendVarint(dst, code)
+	dst = appendVarint(dst, finalSize)
+	return dst
+}
+
 // appendCrypto 拼一个 CRYPTO 帧。
 func appendCrypto(dst []byte, offset uint64, data []byte) []byte {
 	dst = appendVarint(dst, frCrypto)

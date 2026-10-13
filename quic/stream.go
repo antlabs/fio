@@ -14,7 +14,10 @@
 
 package quic
 
-import "errors"
+import (
+	"errors"
+	"io"
+)
 
 // Stream 是一条 QUIC 流。
 //
@@ -26,10 +29,17 @@ type Stream struct {
 	conn *Conn
 	id   uint64
 
-	// 接收侧：已按序拿到的数据 + 结束标志
-	rbuf   []byte
-	readAt int
-	fin    bool
+	// 接收侧：还没读走的缓冲 + 结束标志。
+	//
+	// **recvd 是累计收到的字节数，不是缓冲长度**：Read 把读走的字节从
+	// rbuf 里丢掉，按缓冲长度算的话读一次之后就归零，下一帧的偏移看着
+	// 就像"跳了一大截"（有洞）——数据被拼错位。
+	rbuf     []byte
+	readAt   int
+	recvd    uint64
+	fin      bool // 对端的 FIN 到了
+	readDone bool // 读侧已经消费完（Read 返回过 EOF，或被取消）
+	readErr  error
 
 	// 发送侧：下一个字节的偏移 + 结束标志
 	writeOff uint64
@@ -43,11 +53,21 @@ func newStream(c *Conn, id uint64) *Stream {
 // StreamID 流 ID（HTTP/3 用它对应请求）。
 func (s *Stream) StreamID() uint64 { return s.id }
 
-// Read 读走已收到的数据（阻塞到有数据或流结束）。
+// peerInitiated 这条流是不是对端开的（低位见 RFC 9000 2.1：
+// 0x00 对端双向、0x01 本端双向、0x02 对端单向、0x03 本端单向）。
+func (s *Stream) peerInitiated() bool {
+	if s.id&0x01 == 0 {
+		return s.id&0x02 == 0 // 对端双向流：0, 4, 8…
+	}
+	return s.id&0x02 != 0 // 对端单向流：2, 6, 10…
+}
+
+// Read 读走已收到的数据（阻塞到有数据或流结束）。流结束返回 io.EOF。
 func (s *Stream) Read(p []byte) (int, error) {
 	c := s.conn
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	for {
-		c.mu.Lock()
 		if s.readAt < len(s.rbuf) {
 			n := copy(p, s.rbuf[s.readAt:])
 			s.readAt += n
@@ -55,38 +75,52 @@ func (s *Stream) Read(p []byte) (int, error) {
 				s.rbuf = s.rbuf[:0]
 				s.readAt = 0
 			}
-			c.mu.Unlock()
 			return n, nil
 		}
+		if s.readErr != nil {
+			return 0, s.readErr
+		}
 		if s.fin {
-			c.mu.Unlock()
-			return 0, errors.New("EOF")
+			// 读到 FIN：收侧结束（这条流要是也发完了就可以整个摘掉）
+			s.readDone = true
+			c.finishIfDone(s)
+			return 0, io.EOF
 		}
 		if c.closed {
-			err := c.err
-			c.mu.Unlock()
-			if err == nil {
-				err = errors.New("quic: stream closed")
-			}
-			return 0, err
+			return 0, c.errOr(errors.New("quic: connection closed"))
 		}
-		// 还没有数据：等下一次 ReadFrom 把数据递进来（回环上很快就到）
-		c.mu.Unlock()
-		<-c.dataSig
+		// 还没有数据：等对端的数据到（见 Conn.cond 的说明）
+		c.cond.Wait()
 	}
 }
 
 // Write 往流上写（按当前偏移，带长度）。
+//
+// 一次调用可以很大（静态文件是 16KB）：**按 maxStreamChunk 切成多个
+// STREAM 帧**放进待发队列，flush 再按帧边界切包。塞不进一个包的帧是发不
+// 出去的（QUIC 的帧不跨包），所以切分点必须在这里。
 func (s *Stream) Write(p []byte) (int, error) {
 	c := s.conn
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.closed {
-		return 0, errors.New("quic: connection closed")
+		return 0, c.errOr(errors.New("quic: connection closed"))
 	}
-	c.appOut = appendStream(c.appOut, s.id, s.writeOff, p, false)
-	s.writeOff += uint64(len(p))
-	return len(p), nil
+	total := len(p)
+	for len(p) > 0 {
+		n := len(p)
+		if n > maxStreamChunk {
+			n = maxStreamChunk
+		}
+		c.appOut = appendStream(c.appOut, s.id, s.writeOff, p[:n], false)
+		c.appEnds = append(c.appEnds, len(c.appOut))
+		s.writeOff += uint64(n)
+		p = p[n:]
+	}
+	if err := c.flushLocked(); err != nil {
+		return 0, err
+	}
+	return total, nil
 }
 
 // Close 半关这条流的发送侧（发一个带 FIN 的空 STREAM 帧）。
@@ -98,64 +132,164 @@ func (s *Stream) Close() error {
 		return nil
 	}
 	c.appOut = appendStream(c.appOut, s.id, s.writeOff, nil, true)
+	c.appEnds = append(c.appEnds, len(c.appOut))
 	s.sentFin = true
+	c.finishIfDone(s)
 	return c.flushLocked()
 }
 
-// onStreamData 收到一段流数据。
+// CancelRead 告诉对端这条流的接收侧不要了（RESET_STREAM，RFC 9000 19.4），
+// 等在 Read 上的调用会拿到错误。
+//
+// HTTP/3 在请求流上解出协议错误时用它（见 http3 的 readAndDispatch）。
+func (s *Stream) CancelRead(code uint64) {
+	c := s.conn
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if s.readDone || c.closed {
+		return
+	}
+	s.readErr = errors.New("quic: stream reset")
+	s.readDone = true
+	if !s.sentFin {
+		// final size 报我们**已经收到**的字节数（RFC 9000 19.4：对端据此
+		// 判断流控账目）
+		c.appOut = appendResetStream(c.appOut, s.id, code, s.received())
+		c.appEnds = append(c.appEnds, len(c.appOut))
+		s.sentFin = true
+	}
+	c.finishIfDone(s)
+	c.cond.Broadcast()
+	_ = c.flushLocked()
+}
+
+// onStreamData 收到一段流数据（在收包的那个 goroutine 上调）。
 func (c *Conn) onStreamData(id, offset uint64, data []byte, fin bool) error {
 	c.mu.Lock()
 	s := c.streams[id]
 	if s == nil {
+		if c.retired(id) {
+			// 这条流早就收完关掉了：帧是重传，丢
+			dbg("stream %d: 已回收，丢 %d 字节", id, len(data))
+			c.mu.Unlock()
+			return nil
+		}
 		s = newStream(c, id)
 		c.streams[id] = s
-		// 客户端发起的双向流（低位 0x00/0x01）要递出去给 h3 那层；
-		// 单向流（0x02/0x03）是 h3 自己的控制流/QPACK，交给上层同一批处理。
-		select {
-		case c.accept <- s:
-		default:
+		// 对端双向流（HTTP/3 的请求流）递给 AcceptStream，单向流
+		// （对端的控制流/QPACK）递给 AcceptUniStream。
+		if s.peerInitiated() && id&0x02 == 0 {
+			c.pushAccept(s)
+		} else {
+			c.pushAcceptUni(s)
 		}
 	}
-	// 回环上没有乱序，按偏移追加即可（真丢了包这里就不对了，见 doc.go 的范围）
-	if offset == uint64(len(s.rbuf)+s.readAt) || offset == uint64(s.received()) {
-		s.rbuf = append(s.rbuf, data...)
-	} else if offset < uint64(s.received()) {
-		// 重叠：丢掉已经有的部分
-		skip := s.received() - int(offset)
-		if skip < len(data) {
-			s.rbuf = append(s.rbuf, data[skip:]...)
-		}
-	}
+	s.append(offset, data)
 	if fin {
 		s.fin = true
 	}
 	c.mu.Unlock()
-	c.wakeData()
+	// 等在 Read 上的（可能好几条流、好几个 goroutine）都醒一下：
+	// 它们起来各自看一眼自己的缓冲，没有数据的会接着睡。
+	c.cond.Broadcast()
 	return nil
 }
 
-// received 已经按序收到的字节数。
-func (s *Stream) received() int { return s.readAt + len(s.rbuf) }
-
-// appendStreamData 把攒下来的 1-RTT 帧挂到本包的载荷上。
-func (c *Conn) appendStreamData(payload []byte) []byte {
-	if len(c.appOut) == 0 {
-		return payload
+// append 把一段数据按偏移接进接收缓冲。调用方持有 c.mu。
+//
+// 回环上没有乱序重传，绝大多数情况就是"接着尾巴追加"。真重传（对端没收到
+// 我们的 ACK）会整段重复，按偏移跳过已有部分即可，不做真正的重排。
+func (s *Stream) append(offset uint64, data []byte) {
+	have := s.recvd
+	switch {
+	case offset == have:
+		s.rbuf = append(s.rbuf, data...)
+		s.recvd += uint64(len(data))
+	case offset > have:
+		// 中间缺了：回环上不该发生（没有丢包），先把这段接在后面，
+		// 不装作有洞——真出现的话上面的数据会是错的，见 doc.go 的范围说明
+		dbg("stream %d: 偏移 %d 跳过了 %d 字节（有洞）", s.id, offset, offset-have)
+		s.rbuf = append(s.rbuf, data...)
+		s.recvd = offset + uint64(len(data))
+	case offset < have:
+		skip := have - offset
+		if skip < uint64(len(data)) {
+			s.rbuf = append(s.rbuf, data[skip:]...)
+			s.recvd += uint64(len(data)) - skip
+		}
 	}
-	payload = append(payload, c.appOut...)
-	c.appOut = c.appOut[:0]
-	return payload
 }
 
-// flushLocked 立刻发一个包（发流数据/控制帧用）。
-func (c *Conn) flushLocked() error {
-	return c.flush()
+// received 已经按序收到的字节数（含已经读走的）。
+func (s *Stream) received() uint64 { return s.recvd }
+
+// finishIfDone 一条对端流收发都结束了就从连接的表里摘掉，并把回收水位
+// 往前推（见 retireSet）。调用方持有 c.mu。
+func (c *Conn) finishIfDone(s *Stream) {
+	if !s.peerInitiated() || !s.fin || !s.readDone || !s.sentFin {
+		return
+	}
+	delete(c.streams, s.id)
+	if s.id&0x02 != 0 {
+		c.retiredUni.done(s.id)
+	} else {
+		c.retiredBidi.done(s.id)
+	}
 }
 
-// wakeData 收到新数据时报一下（非阻塞）。
-func (c *Conn) wakeData() {
+// pushAccept / pushAcceptUni 往接收队列里投一条新流（满了就丢：对端
+// 超过我们声明的流数上限时本来就该被流控挡住）。
+func (c *Conn) pushAccept(s *Stream) {
 	select {
-	case c.dataSig <- struct{}{}:
+	case c.accept <- s:
 	default:
 	}
+}
+
+func (c *Conn) pushAcceptUni(s *Stream) {
+	select {
+	case c.acceptUni <- s:
+	default:
+	}
+}
+
+// retireSet 跟踪"对端开的流都收完关到哪了"。
+//
+// 对端的流 ID 是单调的（0,4,8… 或 2,6,10…），所以一个水位就够了：
+// ID < next 的流都已经收完关掉，之后落在那下面的帧一律是重传。中间有
+// 没关完的（并发流里先关后面的）就先记在 pend 里，等低位补齐再一起推。
+//
+// 没有这个的话 streams 表只增不减——一个长连接跑几百万请求，收回来的
+// 全是不再用的流对象。
+type retireSet struct {
+	next uint64
+	pend map[uint64]struct{}
+}
+
+func (r *retireSet) done(id uint64) {
+	if id < r.next {
+		return
+	}
+	if id != r.next {
+		r.pend[id] = struct{}{}
+		return
+	}
+	r.next += 4
+	for {
+		if _, ok := r.pend[r.next]; !ok {
+			return
+		}
+		delete(r.pend, r.next)
+		r.next += 4
+	}
+}
+
+func (r *retireSet) retired(id uint64) bool { return id < r.next }
+
+// retired 这条流是不是已经收完关掉了。
+func (c *Conn) retired(id uint64) bool {
+	if id&0x02 != 0 {
+		return c.retiredUni.retired(id)
+	}
+	return c.retiredBidi.retired(id)
 }

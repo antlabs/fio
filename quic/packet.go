@@ -187,6 +187,15 @@ func (h *header) unprotect(k *keys, largestPN uint64) error {
 	return nil
 }
 
+// keyPhase 读短头的 Key Phase 位（RFC 9001 6）。**必须在 unprotect 之后调**
+// ——那个位和首字节其他位一起被掩码盖着。
+func (h *header) keyPhase() uint8 {
+	if h.long || len(h.raw) == 0 {
+		return 0
+	}
+	return (h.raw[0] >> 2) & 1
+}
+
 // decodePN 按"最大已收包序号"还原完整包序号（RFC 9000 A.3）。
 func decodePN(truncated uint64, pnLen int, largest uint64) uint64 {
 	expected := largest + 1
@@ -223,10 +232,12 @@ func (h *header) open(k *keys) ([]byte, error) {
 //
 // payloadLen 只有长头用得到：长度字段在包序号**之前**（RFC 9000 17.2 的顺序
 // 是 首字节|版本|DCID|SCID|Token|长度|包序号），写错位置解析就会错位。
-func sealHeader(dst []byte, long bool, typ byte, dcid, scid, token []byte, payloadLen, overhead int, pn uint64, pnLen int) (out []byte, pnOffset int) {
+func sealHeader(dst []byte, long bool, typ byte, dcid, scid, token []byte, payloadLen, overhead int, pn uint64, pnLen int, kp uint8) (out []byte, pnOffset int) {
 	first := byte(0x40 | (pnLen - 1)) // 定长包序号位（0x40）
 	if long {
 		first |= 0x80 | (typ << 4)
+	} else {
+		first |= (kp & 1) << 2 // Key Phase（RFC 9001 6）
 	}
 	out = append(dst, first)
 	if long {
@@ -254,7 +265,10 @@ func sealHeader(dst []byte, long bool, typ byte, dcid, scid, token []byte, paylo
 }
 
 // sealPacket 封一个完整的报文：包头 + AEAD 载荷 + 头保护。
-func sealPacket(dst []byte, long bool, typ byte, dcid, scid, token []byte, pn uint64, payload []byte, k *keys) []byte {
+//
+// kp 是 1-RTT 短头的 Key Phase 位（RFC 9001 6）：对端换代之后我们发的包
+// 也要标新的一代，长头用不到（传 0）。
+func sealPacket(dst []byte, long bool, typ byte, dcid, scid, token []byte, pn uint64, payload []byte, k *keys, kp uint8) []byte {
 	const pnLen = 2
 	// 取样要"包序号偏移 +4 起 16 字节"，即 密文长度 >= 20-pnLen。不够就在
 	// **明文**里补 PADDING 帧（0x00，RFC 9000 19.1）——补在密文外面的话
@@ -265,7 +279,7 @@ func sealPacket(dst []byte, long bool, typ byte, dcid, scid, token []byte, pn ui
 		payload = padded
 	}
 	start := len(dst)
-	dst, pnOffset := sealHeader(dst, long, typ, dcid, scid, token, len(payload), k.aead.Overhead(), pn, pnLen)
+	dst, pnOffset := sealHeader(dst, long, typ, dcid, scid, token, len(payload), k.aead.Overhead(), pn, pnLen, kp)
 	// 头（明文形态）就是 AD；AEAD 从包头后面接着写
 	ad := dst[start:]
 	var nb [12]byte
