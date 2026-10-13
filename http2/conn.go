@@ -1199,13 +1199,28 @@ func (c *Conn) writeDataLocked(streamID uint32, data []byte, endStream bool) err
 	// 实测（static 8KB over h2c）：GC 扫描占 CPU 的 30%，这一处是两个大头
 	// 之一（另一个是 takeOutput 每次把 outBuf 数组丢掉）。
 	//
-	// 语义和原来的快路径完全一致：**快路径不动窗口**（只有下面拆帧那条
-	// 慢路径才动）。
+	// 一次装得下就走快路径（一帧发完），装不下走下面的拆帧那条。
+	//
+	// **快路径也要看两个窗口、也要记账**：流级窗口（s.sendWindow）不比
+	// 连接级的大，只看连接级窗口的话，一个 ≤16KB 的块在流窗口快用完时
+	// 会照发不误 —— 对端收到超过它声明的窗口就判流控违规，整条连接断掉
+	// （实测：真实客户端读 256KB 响应偶发 unexpected EOF，就是响应按块写
+	// 时某一块走了快路径）。
 	max := int(c.peerMaxFrameSize)
-	if len(data) <= max && int32(len(data)) <= c.sendWindow {
+	s := c.streams[streamID]
+	avail := c.sendWindow
+	if s != nil && s.sendWindow < avail {
+		avail = s.sendWindow
+	}
+	if len(data) <= max && int32(len(data)) <= avail {
+		n := len(data)
 		c.outBuf = AppendData(c.outBuf, streamID, data, endStream)
 		if endStream {
-			c.applyLocalEndStreamLocked(c.streams[streamID])
+			c.applyLocalEndStreamLocked(s)
+		}
+		c.sendWindow -= int32(n)
+		if s != nil {
+			s.sendWindow -= int32(n)
 		}
 		return nil
 	}

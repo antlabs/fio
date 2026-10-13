@@ -424,3 +424,80 @@ func TestPrefaceWithPartialFrame(t *testing.T) {
 		t.Errorf("两次一共消费 %d 字节, want %d", n1+n2, len(stream))
 	}
 }
+
+// 发送侧流控（确定性版本，不依赖网络时序）。
+//
+// 对端把 INITIAL_WINDOW_SIZE 声明成 20 字节：发 100 字节时只能先发 20，
+// 其余排队；每收到一次 WINDOW_UPDATE 就续发一段，最后一帧必须带
+// END_STREAM。多发一个字节对端就会判流控违规、整条连接断掉。
+func TestSendFlowControlWindow(t *testing.T) {
+	server := NewConn(false, &recorder{})
+
+	// 序言 + 客户端 SETTINGS（流窗口 20）+ 一个 GET
+	client := NewConn(true, &recorder{})
+	in := append([]byte(nil), clientPreface...)
+	in = AppendSettings(in, [2]uint32{0x4, 20}) // INITIAL_WINDOW_SIZE
+	in = append(in, client.MustHeaders(1, []HeaderField{
+		{Name: ":method", Value: "GET"},
+		{Name: ":path", Value: "/big"},
+		{Name: ":scheme", Value: "http"},
+		{Name: ":authority", Value: "x"},
+	}, true)...)
+	if _, _, err := server.Feed(in); err != nil {
+		t.Fatalf("Feed 请求: %v", err)
+	}
+	if err := server.WriteData(1, make([]byte, 100), true); err != nil {
+		t.Fatalf("WriteData: %v", err)
+	}
+
+	// 数一数服务端吐出来的 DATA 帧
+	dataFrames := func(t *testing.T, out []byte) (sent int, lastEnd bool, n int) {
+		t.Helper()
+		p := NewFrameParser()
+		if _, err := p.Parse(out, func(f *Frame) error {
+			if f.Type == FrameData {
+				sent += len(f.Payload)
+				lastEnd = f.EndStream()
+				n++
+			}
+			return nil
+		}); err != nil {
+			t.Fatalf("解析服务端输出: %v", err)
+		}
+		return
+	}
+
+	got, lastEnd, _ := dataFrames(t, server.takeOutput())
+	if got != 20 {
+		t.Fatalf("窗口 20 时先发了 %d 字节, want 20（多了就是对端会判违规）", got)
+	}
+	if lastEnd {
+		t.Error("还没发完就带了 END_STREAM")
+	}
+
+	// 续 30：应该再发 30（Feed 自己会把输出交出来，takeOutput 拿不到）
+	_, out, err := server.Feed(AppendWindowUpdate(nil, 1, 30))
+	if err != nil {
+		t.Fatalf("Feed WINDOW_UPDATE: %v", err)
+	}
+	got, lastEnd, _ = dataFrames(t, out)
+	if got != 30 {
+		t.Fatalf("收到 +30 之后发了 %d 字节, want 30", got)
+	}
+	if lastEnd {
+		t.Error("还剩 50 字节，不该带 END_STREAM")
+	}
+
+	// 再续 100：剩 50 全发完，最后一帧带 END_STREAM
+	_, out, err = server.Feed(AppendWindowUpdate(nil, 1, 100))
+	if err != nil {
+		t.Fatalf("Feed WINDOW_UPDATE: %v", err)
+	}
+	got, lastEnd, n := dataFrames(t, out)
+	if got != 50 || !lastEnd {
+		t.Fatalf("收尾发了 %d 字节 (END_STREAM=%v), want 50/true", got, lastEnd)
+	}
+	if n == 0 {
+		t.Error("收尾一个 DATA 帧都没有")
+	}
+}
