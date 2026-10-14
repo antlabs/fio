@@ -41,6 +41,10 @@ type Stream struct {
 	readDone bool // 读侧已经消费完（Read 返回过 EOF，或被取消）
 	readErr  error
 
+	// maxDataSent 是这条流上我们最后报给对端的 MAX_STREAM_DATA（接收窗口）。
+	// 和连接级一个道理：不还额度，对端传大到窗口就停住。
+	maxDataSent uint64
+
 	// 发送侧：下一个字节的偏移 + 结束标志
 	writeOff uint64
 	sentFin  bool
@@ -49,7 +53,7 @@ type Stream struct {
 }
 
 func newStream(c *Conn, id uint64) *Stream {
-	return &Stream{conn: c, id: id}
+	return &Stream{conn: c, id: id, maxDataSent: recvStreamWindow}
 }
 
 // StreamID 流 ID（HTTP/3 用它对应请求）。
@@ -203,10 +207,13 @@ func (c *Conn) onStreamData(id, offset uint64, data []byte, fin bool) error {
 		c.streams[id] = s
 		isNew = true
 	}
+	before := s.recvd
 	s.append(offset, data)
 	if fin {
 		s.fin = true
 	}
+	// 收到新数据就把流控额度还回去（连接级 + 流级）。
+	c.ackRecvLocked(s, s.recvd-before)
 	hook := c.hook
 	c.mu.Unlock()
 
@@ -229,6 +236,32 @@ func (c *Conn) onStreamData(id, offset uint64, data []byte, fin bool) error {
 	// 它们起来各自看一眼自己的缓冲，没有数据的会接着睡。
 	c.cond.Broadcast()
 	return nil
+}
+
+// ackRecvLocked 收到 n 字节新数据之后，把流控额度还回去。
+//
+// 额度掉到一半以下才报一次（每个报文都报太浪费）；报的是"我到目前收了多少
+// + 一个完整窗口"，对端取 max(旧值, 新值)。调用方持有 c.mu。
+func (c *Conn) ackRecvLocked(s *Stream, n uint64) {
+	if n == 0 {
+		return
+	}
+	c.recvData += n
+	if c.maxDataSent-c.recvData < recvConnWindow/2 {
+		c.maxDataSent = c.recvData + recvConnWindow
+		c.appOut = appendVarint(c.appOut, frMaxData)
+		c.appOut = appendVarint(c.appOut, c.maxDataSent)
+		c.appEnds = append(c.appEnds, len(c.appOut))
+		c.flushSoon()
+	}
+	if s.maxDataSent-s.recvd < recvStreamWindow/2 {
+		s.maxDataSent = s.recvd + recvStreamWindow
+		c.appOut = appendVarint(c.appOut, frMaxStreamData)
+		c.appOut = appendVarint(c.appOut, s.id)
+		c.appOut = appendVarint(c.appOut, s.maxDataSent)
+		c.appEnds = append(c.appEnds, len(c.appOut))
+		c.flushSoon()
+	}
 }
 
 // Finished 对端在这条流上发完了（FIN 到了）。

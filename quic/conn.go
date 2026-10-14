@@ -108,6 +108,16 @@ type Conn struct {
 	maxStreams     uint64
 	maxStreamsSent uint64
 
+	// 连接级接收流控（RFC 9000 4.1）：recvData 是从对端流上收到的总字节数，
+	// maxDataSent 是报给对端的 MAX_DATA（初始值是传输参数里声明的那个窗口）。
+	//
+	// **这个额度同样必须还**：不还的话对端发满窗口就再也发不出数据。
+	// 踩过：baseline-h3 的 -D 20 跑到后半段吞吐掉到五分之一，客户端
+	// 0 错误 0 超时全在等——16MB ÷ 每请求约 50 字节 ≈ 33 万请求/连接，
+	// 64 连接恰好 2100 万，就是那个"总请求数封顶"的指纹。
+	recvData    uint64
+	maxDataSent uint64
+
 	// 1-RTT 的 Key Phase 位（RFC 9001 6）和我们当前这一代读密钥。
 	//
 	// **对端会主动换代**：quic-go 的客户端"握手之后不久就把第一次密钥
@@ -164,6 +174,11 @@ type Conn struct {
 }
 
 const (
+	// 接收窗口。和 ourParams 里声明的值**必须是同一个**：这里的 maxDataSent
+	// 就是"我们已经报给对端多少额度"的记账起点。
+	recvConnWindow   = 1 << 24 // 连接级（initial_max_data）
+	recvStreamWindow = 1 << 22 // 单流（initial_max_stream_data_*）
+
 	// maxPacketPayload 一个 1-RTT 包载荷的上限。1500 的 MTU 减掉包头和
 	// AEAD 标签还剩 1400 多，取 1200（QUIC 的最小 MTU）对什么路径都安全。
 	maxPacketPayload = 1200
@@ -208,6 +223,7 @@ func newConn(pc net.PacketConn, remote net.Addr, odcid, peerCID []byte, cfg Conf
 		retiredUni:  retireSet{next: 2, pend: make(map[uint64]struct{})},
 		retiredBidi: retireSet{next: 0, pend: make(map[uint64]struct{})},
 		maxStreams:  maxStreamsOf(cfg),
+		maxDataSent: recvConnWindow,
 		flushSig:    make(chan struct{}, 1),
 		done:        make(chan struct{}),
 		fd:          -1,
@@ -313,8 +329,8 @@ func (c *Conn) ourParams(cfg Config) transportParams {
 	maxStreams := maxStreamsOf(cfg)
 	return transportParams{
 		maxUDPPayload:         1472,
-		initialMaxData:        1 << 24,
-		initialMaxStreamData:  1 << 22,
+		initialMaxData:        recvConnWindow,
+		initialMaxStreamData:  recvStreamWindow,
 		initialMaxStreamsBidi: maxStreams,
 		initialMaxStreamsUni:  32,
 		idleTimeout:           30000,
@@ -816,6 +832,13 @@ func (c *Conn) flushLocked() error {
 				c.maxStreamsSent = c.retiredBidi.next + c.maxStreams
 				payload = appendVarint(payload, frMaxStreamsBidi)
 				payload = appendVarint(payload, c.maxStreamsSent)
+			}
+			// 把用掉的**连接级**接收窗口还回去（MAX_DATA，RFC 9000 4.1）。
+			// 见 recvData 那段说明：不还的话对端发满 16MB 就停住了。
+			if c.maxDataSent-c.recvData < recvConnWindow/2 {
+				c.maxDataSent = c.recvData + recvConnWindow
+				payload = appendVarint(payload, frMaxData)
+				payload = appendVarint(payload, c.maxDataSent)
 			}
 			// 攒下的帧按帧边界装包：装得下就装，装不下先封好这一包。
 			//
