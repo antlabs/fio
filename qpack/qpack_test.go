@@ -58,13 +58,13 @@ func encodeAll(t *testing.T, fields []HeaderField) []byte {
 
 func TestRoundTrip(t *testing.T) {
 	fields := []HeaderField{
-		{Name: ":method", Value: "GET"},       // 静态表完整匹配（18）
-		{Name: ":scheme", Value: "https"},     // 完整匹配（24）
-		{Name: ":authority", Value: "a.com"},  // 名字在表里、值不在
-		{Name: ":path", Value: "/x?y=1"},      // 同上
-		{Name: "x-custom", Value: "hello"},    // 名字也不在
-		{Name: "x-custom", Value: ""},         // 空值
-		{Name: "content-length", Value: "7"},  // 名字在表里
+		{Name: ":method", Value: "GET"},        // 静态表完整匹配（18）
+		{Name: ":scheme", Value: "https"},      // 完整匹配（24）
+		{Name: ":authority", Value: "a.com"},   // 名字在表里、值不在
+		{Name: ":path", Value: "/x?y=1"},       // 同上
+		{Name: "x-custom", Value: "hello"},     // 名字也不在
+		{Name: "x-custom", Value: ""},          // 空值
+		{Name: "content-length", Value: "7"},   // 名字在表里
 		{Name: "user-agent", Value: "fio/1.0"}, // 都不在
 	}
 	block := encodeAll(t, fields)
