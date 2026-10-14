@@ -170,9 +170,9 @@ type Config struct {
 }
 
 const (
-	lvlInitial = 0
+	lvlInitial   = 0
 	lvlHandshake = 1
-	lvlApp = 2
+	lvlApp       = 2
 )
 
 // newConn 建一条服务端连接。
@@ -182,15 +182,15 @@ const (
 // 客户端的每个包的目标连接 ID 都得是它。
 func newConn(pc net.PacketConn, remote net.Addr, odcid, peerCID []byte, cfg Config) (*Conn, error) {
 	c := &Conn{
-		pc:        pc,
-		remote:    remote,
-		streams:   make(map[uint64]*Stream),
-		accept:    make(chan *Stream, 64),
-		acceptUni: make(chan *Stream, 8),
-		scid:      make([]byte, connIDLen),
-		dcid:      append([]byte(nil), peerCID...),
-		odcid:     append([]byte(nil), odcid...),
-		maxData:      1 << 20,
+		pc:            pc,
+		remote:        remote,
+		streams:       make(map[uint64]*Stream),
+		accept:        make(chan *Stream, 64),
+		acceptUni:     make(chan *Stream, 8),
+		scid:          make([]byte, connIDLen),
+		dcid:          append([]byte(nil), peerCID...),
+		odcid:         append([]byte(nil), odcid...),
+		maxData:       1 << 20,
 		maxStreamData: 1 << 20,
 		// 服务端开的单向流从 3 开始（0x03：本端发起 + 单向）
 		nextUni:     3,

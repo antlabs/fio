@@ -24,8 +24,8 @@ import (
 	"sync"
 	"syscall"
 
-	"github.com/antlabs/fio/quic"
 	"github.com/antlabs/fio/qpack"
+	"github.com/antlabs/fio/quic"
 	"golang.org/x/sys/unix"
 )
 
@@ -36,9 +36,19 @@ import (
 // （历史上这里借的是 quic-go 的 QUIC 传输，见 quic/doc.go 里换掉它的原因：
 // 每个请求建一条流的分配 + 那份 h3 适配层的开销。）
 //
-// **对外的形状和 http2 那套一致**——一样的 StreamHandler 接口、一样的
+// **对外的形状和 http2/http1 那套一致**——一样的 StreamHandler 接口、一样的
 // Conn.WriteHeaders/WriteData(streamID, ...)、一样把 HeaderField 做成
-// 类型别名。协议层的实现者（比如 arena 的入口）两个协议用同一套写法。
+// 类型别名。协议层的实现者（比如 arena 的入口）三个协议用同一套写法。
+//
+// 入口也统一（见 handler.go）：
+//
+//	http.NewConnHandler(http.HandlerFunc(serve), 0)        h1
+//	http2.NewConnHandler(http.HandlerFunc(serve), 0)       h2
+//	http3.NewConnHandler(http.HandlerFunc(serve), 0)       h3（请求级）
+//
+// 要自己管流级事件（HEADERS/DATA/RST）就用 NewStreamConnHandler，和
+// http2.NewStreamConnHandler 同名同形——arena 那种按 streamID 写响应的
+// 代码走这条（省掉请求对象的拼装）。
 //
 // 为什么不直接用 quic-go/http3.Server：那一层把每条 QUIC 流适配成
 // net/http 的 Request/ResponseWriter，而且**每个请求起一个 goroutine**。
@@ -266,6 +276,19 @@ func (st *streamState) flush(close bool) error {
 		// 半关：响应发完这一侧就结束了，对端据此知道没有更多数据
 		return st.str.Close()
 	}
+	return nil
+}
+
+// ResetStream 中止一条流的响应（RESET_STREAM，HTTP/3 里就是 RST_STREAM
+// 那个位置）：响应发到一半出错时用，对端据此知道不用等了。
+//
+// 和 http2 的 RST_STREAM 一个语义、一个位置。
+func (c *Conn) ResetStream(streamID uint64, code ErrCode) error {
+	st := c.streamState(streamID)
+	if st == nil || st.str == nil {
+		return nil
+	}
+	st.str.Reset(uint64(code))
 	return nil
 }
 

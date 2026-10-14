@@ -21,20 +21,20 @@ package quic
 const (
 	// 0x00 是服务端必须发的 original_destination_connection_id：
 	// 客户端拿它和我们回的包对不上就直接 TRANSPORT_PARAMETER_ERROR。
-	tpOriginalDestinationConnID = 0x00
-	tpMaxIdleTimeout          = 0x01
-	tpMaxUDPPayloadSize       = 0x03
-	tpInitialMaxData          = 0x04
+	tpOriginalDestinationConnID      = 0x00
+	tpMaxIdleTimeout                 = 0x01
+	tpMaxUDPPayloadSize              = 0x03
+	tpInitialMaxData                 = 0x04
 	tpInitialMaxStreamDataBidiLocal  = 0x05
 	tpInitialMaxStreamDataBidiRemote = 0x06
 	tpInitialMaxStreamDataUni        = 0x07
-	tpInitialMaxStreamsBidi   = 0x08
-	tpInitialMaxStreamsUni    = 0x09
-	tpAckDelayExponent        = 0x0a
-	tpMaxAckDelay             = 0x0b
-	tpDisableActiveMigration  = 0x0c
-	tpActiveConnIDLimit       = 0x0e
-	tpInitialSourceConnID     = 0x0f
+	tpInitialMaxStreamsBidi          = 0x08
+	tpInitialMaxStreamsUni           = 0x09
+	tpAckDelayExponent               = 0x0a
+	tpMaxAckDelay                    = 0x0b
+	tpDisableActiveMigration         = 0x0c
+	tpActiveConnIDLimit              = 0x0e
+	tpInitialSourceConnID            = 0x0f
 )
 
 // transportParams 是我们（服务端）发出去的那一份。
@@ -42,12 +42,12 @@ const (
 // 窗口都给得很大：这两档跑在回环上，流控不该成为任何东西的瓶颈——
 // 流控帧本身也是每请求的开销。
 type transportParams struct {
-	maxUDPPayload       uint64
-	initialMaxData      uint64
-	initialMaxStreamData uint64
+	maxUDPPayload         uint64
+	initialMaxData        uint64
+	initialMaxStreamData  uint64
 	initialMaxStreamsBidi uint64
 	initialMaxStreamsUni  uint64
-	idleTimeout         uint64 // 毫秒
+	idleTimeout           uint64 // 毫秒
 
 	// 连接 ID 类的参数是**裸字节**（不是 varint）：
 	// odcid 客户端第一个 Initial 里的目标连接 ID，iscid 我们自己的源连接 ID。
@@ -107,12 +107,12 @@ func (p transportParams) appendTo(dst []byte) []byte {
 
 // peerParams 是对端给的那一份里我们用得到的字段。
 type peerParams struct {
-	maxUDPPayload          uint64
-	initialMaxData         uint64
-	initialMaxStreamData   uint64 // 对端允许我们发的单流上限
-	initialMaxStreamsBidi  uint64
-	initialMaxStreamsUni   uint64
-	idleTimeout            uint64
+	maxUDPPayload         uint64
+	initialMaxData        uint64
+	initialMaxStreamData  uint64 // 对端允许我们发的单流上限
+	initialMaxStreamsBidi uint64
+	initialMaxStreamsUni  uint64
+	idleTimeout           uint64
 }
 
 // parseTransportParams 解对端的传输参数。认识的记住，不认识的原样跳过

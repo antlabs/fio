@@ -26,30 +26,30 @@ import (
 // FRAME_ENCODING_ERROR，不能跳过（帧没有长度前缀，跳不了）。
 
 const (
-	frPadding        = 0x00
-	frPing           = 0x01
-	frAck            = 0x02
-	frAckECN         = 0x03
-	frResetStream    = 0x04
-	frStopSending    = 0x05
-	frCrypto         = 0x06
-	frNewToken       = 0x07
-	frStreamBase     = 0x08 // 0x08~0x0f：三个低位是 OFF/LEN/FIN
-	frMaxData        = 0x10
-	frMaxStreamData  = 0x11
-	frMaxStreamsBidi = 0x12
-	frMaxStreamsUni  = 0x13
-	frDataBlocked    = 0x14
-	frStreamDataBlocked = 0x15
+	frPadding            = 0x00
+	frPing               = 0x01
+	frAck                = 0x02
+	frAckECN             = 0x03
+	frResetStream        = 0x04
+	frStopSending        = 0x05
+	frCrypto             = 0x06
+	frNewToken           = 0x07
+	frStreamBase         = 0x08 // 0x08~0x0f：三个低位是 OFF/LEN/FIN
+	frMaxData            = 0x10
+	frMaxStreamData      = 0x11
+	frMaxStreamsBidi     = 0x12
+	frMaxStreamsUni      = 0x13
+	frDataBlocked        = 0x14
+	frStreamDataBlocked  = 0x15
 	frStreamsBlockedBidi = 0x16
 	frStreamsBlockedUni  = 0x17
-	frNewConnID      = 0x18
-	frRetireConnID   = 0x19
-	frPathChallenge  = 0x1a
-	frPathResponse   = 0x1b
-	frConnClose      = 0x1c
-	frConnCloseApp   = 0x1d
-	frHandshakeDone  = 0x1e
+	frNewConnID          = 0x18
+	frRetireConnID       = 0x19
+	frPathChallenge      = 0x1a
+	frPathResponse       = 0x1b
+	frConnClose          = 0x1c
+	frConnCloseApp       = 0x1d
+	frHandshakeDone      = 0x1e
 )
 
 // 流的三种状态位（STREAM 帧的低三位）

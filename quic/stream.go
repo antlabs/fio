@@ -44,6 +44,8 @@ type Stream struct {
 	// 发送侧：下一个字节的偏移 + 结束标志
 	writeOff uint64
 	sentFin  bool
+	// sentReset 发送侧是"重置"掉的（RESET_STREAM），不是正常结束（FIN）
+	sentReset bool
 }
 
 func newStream(c *Conn, id uint64) *Stream {
@@ -162,6 +164,27 @@ func (s *Stream) CancelRead(code uint64) {
 	c.finishIfDone(s)
 	c.cond.Broadcast()
 	_ = c.flushLocked()
+}
+
+// Reset 中止这条流的**发送侧**（RESET_STREAM，RFC 9000 19.4）：对端应该
+// 丢弃已经收到的部分（字节数按 final size 记账）。
+//
+// 和 Close 的区别就是"发完了"和"不发了"：Close 发 FIN（对端认为这条流
+// 的响应是完整的），Reset 明确告诉对端不用等了。HTTP/3 的请求级 handler
+// 在响应发到一半报错时用它（和 h2 的 RST_STREAM 一个位置）。
+func (s *Stream) Reset(code uint64) {
+	c := s.conn
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.closed || s.sentFin || s.sentReset {
+		return
+	}
+	// final size 是"我本来会发多少"（已经写出去的字节数）
+	c.appOut = appendResetStream(c.appOut, s.id, code, s.writeOff)
+	c.appEnds = append(c.appEnds, len(c.appOut))
+	s.sentFin = true
+	s.sentReset = true
+	c.flushSoon()
 }
 
 // onStreamData 收到一段流数据（在收包的那个 goroutine 上调）。
