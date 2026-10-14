@@ -38,6 +38,11 @@ type Listener struct {
 
 	// serveOnce 保证收包循环只起一个（见 Serve）。
 	serveOnce sync.Once
+
+	// dirty 是"这一轮收到了数据、有待发帧"的连接，由收包循环在每轮末尾
+	// 统一 flush（见 flushDirty 和 loopFlush 的说明）。
+	dirtyMu sync.Mutex
+	dirty   []*Conn
 }
 
 // Listen 起一个 UDP 监听。addr 形如 ":8443"。
@@ -117,6 +122,43 @@ func (l *Listener) serveLoop() {
 			return
 		}
 		l.dispatch(buf[:n], addr)
+		// loopFlush 模式：这一轮处理出来的响应在这里一起发出去。
+		// **收 -> 解 -> 处理 -> 发 全在这一条 goroutine 上**，不像以前那样
+		// 每条连接各有一个 flusher goroutine 等着被唤醒（见 Conn.flushSoon）。
+		l.flushDirty()
+	}
+}
+
+// markDirty 把连接挂进"待 flush"表（loopFlush 模式）。
+// 调用方**可能握着 c.mu**（Stream.Write/Close 里调 flushSoon 的路），
+// 所以这里只能碰原子位和 listener 自己的锁。
+func (l *Listener) markDirty(c *Conn) {
+	if !c.dirtyQueued.CompareAndSwap(false, true) {
+		return
+	}
+	l.dirtyMu.Lock()
+	l.dirty = append(l.dirty, c)
+	l.dirtyMu.Unlock()
+}
+
+// flushDirty 把这一轮攒下的连接都发一遍。
+//
+// 线上一个连接的数据报进来、它的响应也跟着就绪（请求级/快路都是就地
+// 处理的），所以"每轮末尾统一发"既省掉了每连接一个 flusher goroutine
+// 的唤醒，也天然攒了批（一次轮询里几条连接的帧一起走）。
+func (l *Listener) flushDirty() {
+	l.dirtyMu.Lock()
+	if len(l.dirty) == 0 {
+		l.dirtyMu.Unlock()
+		return
+	}
+	list := l.dirty
+	l.dirty = nil
+	l.dirtyMu.Unlock()
+
+	for _, c := range list {
+		c.dirtyQueued.Store(false)
+		_ = c.flush()
 	}
 }
 
@@ -138,6 +180,9 @@ func (l *Listener) dispatch(b []byte, addr net.Addr) {
 			l.mu.Unlock()
 			return
 		}
+		// loopFlush：发送由收包循环统一做（见 Listener.flushDirty）
+		nc.l = l
+		nc.loopFlush = loopFlushOn
 		l.byCID[string(nc.scid)] = nc
 		l.byCID[string(h.dcid)] = nc
 		select {

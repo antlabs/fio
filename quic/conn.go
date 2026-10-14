@@ -24,6 +24,7 @@ import (
 	"os"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -137,6 +138,16 @@ type Conn struct {
 
 	// hook 是"对端的新流到了"的同步钩子（可选），见 SetStreamHook。
 	hook StreamHook
+
+	// l 是收上来的那个 listener（loopFlush 模式下要往它的待发表里挂），
+	// loopFlush 决定发送走哪条路（见 flushSoon），dirtyQueued 是挂表标记。
+	l         *Listener
+	loopFlush bool
+	// dirtyQueued 是"已经挂在 listener 的待发表里"的标记。
+	// **必须是原子的**：markDirty 是握着 c.mu 调的（Stream.Write/Close 里
+	// 就是这么调的），再去抢 c.mu 就是自己锁自己（踩过：整个连接停住，
+	// 收包那条路一直拿不到锁）。
+	dirtyQueued atomic.Bool
 
 	// 发送侧攒包用：txBuf 里是封好的若干包，txSizes 是各包长度。
 	// fd/remoteSA 是 GSO 那条路要的（一次 sendmsg 发一批），见 writePackets。
@@ -728,8 +739,26 @@ func (c *Conn) runFlusher() {
 	}
 }
 
-// flushSoon 告诉 flusher"有帧要发了"（非阻塞：已经响过就合并成一次）。
+// loopFlushOn：发送交给收包循环（见 Listener.flushDirty），而不是每条
+// 连接一个 flusher goroutine。
+//
+// **这是"把 HTTP/3 做成事件循环"那件事的核心开关**：开了之后一条 goroutine
+// 走完 收 -> 解 -> 处理 -> 发，和 fib 的结构一致；关着的话每连接有一个
+// flusher goroutine 等着被唤醒（64 条连接 × 4 个子进程就是几百个 goroutine
+// 在抢 P，唤醒延迟随连接数堆）。
+//
+// 留成开关是因为要 A/B：唤醒延迟省下来 vs 攒批的机会变少。
+var loopFlushOn = os.Getenv("FIO_QUIC_LOOP_FLUSH") == "1"
+
+// flushSoon 告诉"发送方"有帧要发了。
+//
+//	loopFlush 模式：把自己挂进 listener 的待发表，收包循环这一轮末尾发
+//	默认模式：往 flusher 的 channel 里投一个信号（非阻塞，合并成一次）
 func (c *Conn) flushSoon() {
+	if c.l != nil && c.loopFlush {
+		c.l.markDirty(c)
+		return
+	}
 	select {
 	case c.flushSig <- struct{}{}:
 	default:
