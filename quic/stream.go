@@ -167,7 +167,7 @@ func (s *Stream) CancelRead(code uint64) {
 	}
 	c.finishIfDone(s)
 	c.cond.Broadcast()
-	_ = c.flushLocked()
+	_ = c.flushLocked(true)
 }
 
 // Reset 中止这条流的**发送侧**（RESET_STREAM，RFC 9000 19.4）：对端应该

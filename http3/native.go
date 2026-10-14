@@ -327,23 +327,45 @@ func (s *NativeServer) ListenAndServe() error {
 		addr = ":443"
 	}
 	cfg := quic.Config{TLSConfig: s.TLSConfig, MaxStreams: s.MaxStreams}
-	var ln *quic.Listener
-	if s.ReusePort {
-		// 自己建 socket 才能带 SO_REUSEPORT
+	if !s.ReusePort {
+		ln, err := quic.Listen(addr, cfg)
+		if err != nil {
+			return err
+		}
+		return s.Serve(ln)
+	}
+
+	// **每个 CPU 一条收包循环**：开 quicReaders 个带 SO_REUSEPORT 的 socket，
+	// 每个 socket 一条收包 goroutine。
+	//
+	// 为什么：一条收包循环上串着"这条进程里所有连接"的收包处理，实测
+	// 每子进程的连接数一多单连接吞吐就掉（1 条 80.7k/秒、4 条 76.1k、
+	// 11 条 64k）。内核按四元组哈希把连接分给各个 socket，**同一条连接的
+	// 数据报永远落同一个 socket**，所以每条连接仍然只有一条 goroutine 碰它
+	// 的状态，不用加锁。
+	for i := 0; i < quicReaders; i++ {
 		pc, err := reusePortPacketConn(addr)
 		if err != nil {
 			return err
 		}
-		ln = quic.ListenPacket(pc, cfg)
-	} else {
-		var err error
-		ln, err = quic.Listen(addr, cfg)
-		if err != nil {
-			return err
+		ln := quic.ListenPacket(pc, cfg)
+		go func() {
+			_ = s.Serve(ln)
+		}()
+	}
+	select {}
+}
+
+// quicReaders 每个子进程起几条收包循环（socket）。实测见 ListenAndServe 里
+// 的说明：一条循环串所有连接，连接一多就互相等。
+var quicReaders = func() int {
+	if v := os.Getenv("FIO_QUIC_READERS"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			return n
 		}
 	}
-	return s.Serve(ln)
-}
+	return 1
+}()
 
 // reusePortPacketConn 建一个带 SO_REUSEPORT 的 UDP socket。
 func reusePortPacketConn(addr string) (net.PacketConn, error) {

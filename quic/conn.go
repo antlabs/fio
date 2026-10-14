@@ -512,7 +512,7 @@ func (c *Conn) handlePacket(b []byte) error {
 		// 别的路径（PING、握手、控制帧）还是立刻回，不然对端会等我们。
 		return nil
 	}
-	return c.flush()
+	return c.flushForce(true)
 }
 
 // processFrames 处理一个包里的帧。
@@ -785,10 +785,16 @@ func (c *Conn) flushSoon() {
 //
 // 写侧（lane 上的 Write/Close）都是在持锁状态下攒帧的，所以它们直接调
 // flushLocked；收包那条路是攒完 ACK 再进来。
-func (c *Conn) flush() error {
+// flush 是"攒批"那条路（flusher / loopFlush）：**只有 ACK 的时候先不发**，
+// 等这一批的响应一起捎（见 flushLocked 的 ackOnly 分支）。
+func (c *Conn) flush() error { return c.flushForce(false) }
+
+// flushForce 是收包那条路用的：ACK 该走就走（PING、握手这类没有后续
+// 响应的包，不能等）。
+func (c *Conn) flushForce(force bool) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	return c.flushLocked()
+	return c.flushLocked(force)
 }
 
 // flushLocked 把三个级别上待发的东西发出去。
@@ -796,13 +802,15 @@ func (c *Conn) flush() error {
 // 1-RTT 那份可能不止一个包：appOut 里攒的帧按**帧边界**切成 ≤
 // maxPacketPayload 的载荷，一包一包发（QUIC 的帧不跨包，切分点只能落在
 // 帧与帧之间，而帧的结束位置在 appEnds 里）。
-func (c *Conn) flushLocked() error {
+func (c *Conn) flushLocked(force bool) error {
 	if c.closed {
 		return nil
 	}
 	for _, lvl := range []int{lvlInitial, lvlHandshake, lvlApp} {
 		var payload []byte
-		if c.ackDue[lvl] {
+		// 1-RTT 的 ACK/控制帧先攒着，等这个级别的数据也攒完再决定发不发
+		// （见下面 ackOnly）。别的级别没有这个问题：ACK 和 CRYPTO 一起走。
+		if lvl != lvlApp && c.ackDue[lvl] {
 			payload = appendAck(payload, c.recvSeen[lvl], 0)
 			c.recvSeen[lvl] = c.recvSeen[lvl][:0]
 			c.ackDue[lvl] = false
@@ -819,26 +827,60 @@ func (c *Conn) flushLocked() error {
 			if c.send[lvlApp] == nil {
 				continue
 			}
+			// 这个级别待发的 ACK（先攒着，见下面的 ackOnly）
+			var ack []byte
+			if c.ackDue[lvl] {
+				ack = appendAck(ack, c.recvSeen[lvl], 0)
+			}
+			// 控制帧也先攒着（和 ACK 一样，发的时候才提交状态）
+			var ctl []byte
 			if c.handshakeDone && !c.sentHandshakeDone {
-				payload = appendVarint(payload, frHandshakeDone)
-				c.sentHandshakeDone = true
+				ctl = appendVarint(ctl, frHandshakeDone)
 			}
 			// 把用掉的流额度还回去（MAX_STREAMS，RFC 9000 4.6）。
 			//
 			// 水位推过了多少就还多少：报给对端的是"总共能开多少条"，
 			// 对端取 max(旧值, 新值)，所以按四分之一额度分批报——每个
 			// 请求报一次太浪费（响应包里多 3 字节），报晚了对面会撞上限。
+			maxStreamsNew := uint64(0)
 			if c.retiredBidi.next+c.maxStreams > c.maxStreamsSent+c.maxStreams/4 {
-				c.maxStreamsSent = c.retiredBidi.next + c.maxStreams
-				payload = appendVarint(payload, frMaxStreamsBidi)
-				payload = appendVarint(payload, c.maxStreamsSent)
+				maxStreamsNew = c.retiredBidi.next + c.maxStreams
+				ctl = appendVarint(ctl, frMaxStreamsBidi)
+				ctl = appendVarint(ctl, maxStreamsNew)
 			}
 			// 把用掉的**连接级**接收窗口还回去（MAX_DATA，RFC 9000 4.1）。
 			// 见 recvData 那段说明：不还的话对端发满 16MB 就停住了。
+			maxDataNew := uint64(0)
 			if c.maxDataSent-c.recvData < recvConnWindow/2 {
-				c.maxDataSent = c.recvData + recvConnWindow
-				payload = appendVarint(payload, frMaxData)
-				payload = appendVarint(payload, c.maxDataSent)
+				maxDataNew = c.recvData + recvConnWindow
+				ctl = appendVarint(ctl, frMaxData)
+				ctl = appendVarint(ctl, maxDataNew)
+			}
+			// **只有 ACK、没有数据和别的控制帧**：先不发。
+			//
+			// static-h3 上这是个大头：16KB 的响应在 lane 上写着，同一批请求
+			// 的 ACK 会被 1ms 定时器单独发出去——每个响应配一个 37 字节的小
+			// 包（实测 2 秒里 98 万次 sendto 都是这种）。ACK 拖到下一批
+			// 响应一起走完全没问题（响应就在几微秒/几百微秒之后）。
+			// force 那条路（收包循环里 PING、握手之类的）不等。
+			if len(ack) > 0 && len(ctl) == 0 && len(c.appEnds) == 0 && !force {
+				continue
+			}
+			// 决定要发了，这时候才提交状态
+			if len(ack) > 0 {
+				c.ackDue[lvl] = false
+				c.recvSeen[lvl] = c.recvSeen[lvl][:0]
+				payload = append(payload, ack...)
+			}
+			if len(ctl) > 0 {
+				c.sentHandshakeDone = true
+				if maxStreamsNew > 0 {
+					c.maxStreamsSent = maxStreamsNew
+				}
+				if maxDataNew > 0 {
+					c.maxDataSent = maxDataNew
+				}
+				payload = append(payload, ctl...)
 			}
 			// 攒下的帧按帧边界装包：装得下就装，装不下先封好这一包。
 			//
