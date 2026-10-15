@@ -15,8 +15,10 @@
 package http3
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
+	"fmt"
 	"io"
 	"net"
 	"os"
@@ -71,6 +73,13 @@ import (
 //     字面量表示，解码器不需要任何跨流状态。
 //   - **一次响应一个 Write**：HEADERS 帧 + DATA 帧拼在同一个缓冲里。
 //   - **每条连接复用几块缓冲**，一个请求不分配（除非体长过现有容量）。
+
+// debugf 是调试输出（FIO_QUIC_DEBUG=1 打开，和 quic 包共用一个开关）。
+func debugf(format string, args ...any) {
+	if os.Getenv("FIO_QUIC_DEBUG") != "" {
+		fmt.Fprintf(os.Stderr, "[h3] "+format+"\n", args...)
+	}
+}
 
 // HeaderField 和 http2 那边一样是个别名——两边的用法完全相同。
 type HeaderField = qpack.HeaderField
@@ -143,6 +152,12 @@ type streamState struct {
 	wbuf  []byte
 	hb    []HeaderField
 	body  []byte
+
+	// 头块解码缓存（见 decodeHeaders）：cachedBlock 是上一次的头块字节，
+	// cachedFields 是它的解码结果。压测端每个请求发的头块一模一样，命中
+	// 就把整条 Huffman 解码（profile 里 15%）全省了。
+	cachedBlock  []byte
+	cachedFields []HeaderField
 
 	fp FrameParser
 }
@@ -595,6 +610,41 @@ func (c *Conn) handleStream(l *lane, str *quic.Stream, streamID uint64) {
 	_ = cbErr
 }
 
+// decodeHeaders 解一块请求头，带"同一块只解一次"的缓存。
+//
+// 为什么能缓存：我们的 QPACK 只用静态表、拒绝动态表引用（SETTINGS 里
+// 容量报 0），所以**同样的字节永远解出同样的字段**——解码是纯函数。
+// 压测端（ngtcp2 的 h2load）每个请求发的头块字节完全相同，命中率接近 100%；
+// 一次 memcmp（几十字节）换掉一次完整的 Huffman 解码（baseline-h3 的
+// profile 里占 15.5%，是最大的一项）。
+//
+// 缓存按 lane 放（st 是每条通道自己的），解码出来的字符串都是新分配的
+// （[]byte -> string 的转换必然拷贝），不会指向会被复用的读缓冲。
+func (c *Conn) decodeHeaders(st *streamState, block []byte) error {
+	if len(st.cachedBlock) == len(block) && bytes.Equal(st.cachedBlock, block) {
+		st.hb = append(st.hb, st.cachedFields...)
+		return nil
+	}
+	debugf("头块缓存未命中：新 %d 字节 旧 %d 字节", len(block), len(st.cachedBlock))
+
+	dec := c.dec.Decode(block)
+	start := len(st.hb)
+	for {
+		hf, derr := dec()
+		if derr == io.EOF {
+			break
+		}
+		if derr != nil {
+			return derr
+		}
+		st.hb = append(st.hb, hf)
+	}
+	// 记住这一块（拷一份字节，字段本身是只读的字符串）
+	st.cachedBlock = append(st.cachedBlock[:0], block...)
+	st.cachedFields = append(st.cachedFields[:0], st.hb[start:]...)
+	return nil
+}
+
 // readAndDispatch 把一条流读完并交给 Handler。
 func (st *streamState) readAndDispatch(c *Conn, h StreamHandler, streamID uint64) error {
 	// 头帧里攒下的头块：载荷指向解析器的内部缓冲，不能留到 Parse 返回之后
@@ -608,16 +658,8 @@ func (st *streamState) readAndDispatch(c *Conn, h StreamHandler, streamID uint64
 				switch f.Type {
 				case FrameHeaders:
 					raw = append(raw[:0], f.Payload...)
-					dec := c.dec.Decode(raw)
-					for {
-						hf, derr := dec()
-						if derr == io.EOF {
-							return nil
-						}
-						if derr != nil {
-							return derr
-						}
-						st.hb = append(st.hb, hf)
+					if err := c.decodeHeaders(st, raw); err != nil {
+						return err
 					}
 				case FrameData:
 					st.body = append(st.body, f.Payload...)
