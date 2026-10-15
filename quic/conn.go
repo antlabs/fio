@@ -166,6 +166,9 @@ type Conn struct {
 	fd       int
 	remoteSA unix.Sockaddr
 
+	// pktAvg 见 notePkt/padBulk：最近发出的包的平均载荷大小（判断在不在推大响应）
+	pktAvg int
+
 	// appOut 是 1-RTT 上待发的帧（各流的 STREAM、控制帧）。攒起来一次发；
 	// appEnds 记每个帧的结束偏移——**帧不能跨包**，切包只能切在帧边界上
 	// （见 flushLocked）。
@@ -892,7 +895,8 @@ func (c *Conn) flushLocked(force bool) error {
 			for _, end := range c.appEnds {
 				if len(payload) > 0 && len(payload)+end-start > maxPacketPayload {
 					off := len(buf)
-					buf = c.sealPacketLocked(lvl, payload, buf)
+					buf = c.sealPacketLocked(lvl, c.padBulk(payload), buf)
+					c.notePkt(len(buf) - off)
 					sizes = append(sizes, len(buf)-off)
 					payload = payload[:0]
 				}
@@ -903,7 +907,8 @@ func (c *Conn) flushLocked(force bool) error {
 			c.appEnds = c.appEnds[:0]
 			if len(payload) > 0 {
 				off := len(buf)
-				buf = c.sealPacketLocked(lvl, payload, buf)
+				buf = c.sealPacketLocked(lvl, c.padBulk(payload), buf)
+				c.notePkt(len(buf) - off)
 				sizes = append(sizes, len(buf)-off)
 			}
 			c.txBuf, c.txSizes = buf, sizes
@@ -974,6 +979,39 @@ func (c *Conn) sealPacketLocked(lvl int, payload, dst []byte) []byte {
 		return dst
 	}
 	return sealPacket(dst, true, typ, c.dcid, c.scid, nil, pn, payload, k, 0)
+}
+
+// pktAvg 是最近发出的包的平均载荷大小（指数平滑），用来判断这条连接是
+// 不是在推大响应（见 padBulk）。调用方持有 c.mu。
+func (c *Conn) notePkt(sealed int) {
+	// sealed 里含包头和 AEAD 标签，这里只想要"载荷"的量级，减个常数就行
+	load := sealed - 27
+	if load < 0 {
+		load = 0
+	}
+	c.pktAvg = (c.pktAvg*3 + load) / 4
+}
+
+// padBulk 把"大包模式"下的小包补到整包大小（补在明文里，用 PADDING 帧）。
+//
+// **为什么**：GSO 要求除最后一段外每段等长，而一条 16KB 响应在包里长这样：
+// [HEADERS 小帧][数据帧 ×14][尾部短帧]——中间夹着的小包（几十~两百字节）
+// 会把等长段切碎，一个响应要发 2~3 次（实测 static-h3 上 98 万次单发都是
+// 这种小包）。补成一样长之后整批一个 sendmsg 就走完了。
+//
+// **小响应不能补**：baseline-h3 的包只有 200 字节，补到 1200 会把回环带宽
+// 白烧 6 倍（那档已经领先，不能为了这个退）。所以用最近包的平均大小判断
+// "这条连接现在在推大东西"——大响应档会稳稳落在大包模式，小响应档不会。
+func (c *Conn) padBulk(payload []byte) []byte {
+	if c.pktAvg < 900 || len(payload) >= maxPacketPayload {
+		return payload
+	}
+	// 补 PADDING 帧（0x00）：和 Initial 那个"补到 1200"是一个办法，
+	// 而且必须补在**明文**里（补在密文外面 AEAD 直接验不过）
+	for len(payload) < maxPacketPayload {
+		payload = append(payload, 0)
+	}
+	return payload
 }
 
 // writePackets 把 c.txBuf 里攒好的包发出去（c.txSizes 是每个包的长度）。
