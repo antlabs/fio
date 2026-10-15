@@ -432,6 +432,18 @@ func AppendHeaders(dst []byte, streamID uint32, blockFragment []byte, endStream,
 }
 
 // AppendData 拼一个 DATA 帧。
+// AppendDataHeader 只写 DATA 帧的头（类型 + 流 ID + 长度），**不带体**。
+//
+// 给"体不进发送缓冲"那条路用（见 writeDataLocked 的 dataTrailMin）：
+// 头进 outBuf，体作为第二段直接交给 engine.Writev。
+func AppendDataHeader(dst []byte, streamID uint32, n int, endStream bool) []byte {
+	var flags uint8
+	if endStream {
+		flags |= FlagDataEndStream
+	}
+	return AppendFrameHeader(dst, FrameData, flags, streamID, n)
+}
+
 func AppendData(dst []byte, streamID uint32, data []byte, endStream bool) []byte {
 	var flags uint8
 	if endStream {
