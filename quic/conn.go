@@ -700,24 +700,30 @@ func (c *Conn) updateKeys(h *header) (bool, []byte) {
 	return true, pt
 }
 
-// flushDelay 是"攒一批再发"的附加等待窗口，见 runFlusher。
+// flushDelay 是"攒一批再发"的等待窗口（**只对小响应生效**，见 runFlusher
+// 里的 smallPending 门控）。
 //
-// **默认 0**：flusher 光是把发送挪到自己的循环里、攒到它被调度为止，
-// 就已经拿到批量发送的全部好处（每请求 0.04 个报文，丢包归零）；
-// 再额外睡一个窗口只是给每个请求加延迟。lab 上扫过（baseline-h3，
-// 服务端 0-11、压测端 12-23、MTU 1500，5 秒一轮）：
+// 为什么小响应要等：压测端（h2load/ngtcp2）每请求的开销里"每包 2.4us"
+// 是固定成本，包越少它越省。fib 是 0.022 包/请求、我们原来 0.054
+// （18.5 个响应一包，而包预算装得下 45+ 个），那 3% 的差就在这。
 //
-//	窗口   0us     5us     15us    25us    50us
-//	rps    4.12M   4.13M   4.09M   4.00M   3.83M
+// 大响应（static 那种 16KB）**不能等**：包本来就是满的，等只会白添延迟
+// （实测 static-h3 在固定窗口下 −1.3%，加了门控之后不动）。
 //
-// 也就是"睡多久就少多少"。留这个环境变量是为了以后换压测端/换档还能扫。
+// lab 实测（baseline-h3，服务端 0-11 / 压测端 12-23 / MTU 1500，两轮）：
+//
+//	窗口 0us    : 5.045M / 5.023M
+//	窗口 250us  : 5.175M / 5.149M   （fib 5.15M）
+//
+// 250us 是"等下一批响应"的量级：每连接 78k 请求/秒 ÷ 21 个一包 ≈ 270us
+// 一个数据报，所以等一次就能让一包带上两个数据报的响应。
 var flushDelay = func() time.Duration {
 	if v := os.Getenv("FIO_QUIC_COALESCE_US"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil && n >= 0 {
 			return time.Duration(n) * time.Microsecond
 		}
 	}
-	return 0
+	return 250 * time.Microsecond
 }()
 
 // runFlusher 攒一批 1-RTT 帧再发（每条连接一个 goroutine）。
@@ -749,7 +755,13 @@ func (c *Conn) runFlusher() {
 			default:
 			}
 		}
-		if flushDelay > 0 {
+		// 攒批窗口：**只在"这一轮攒的帧还不到半个包"的时候等一等**。
+		//
+		// 小响应（baseline-h3 那种每个 ~20 字节）值得等下一批一起走：
+		// 压测端每请求的开销里"每包 2.4us"是固定成本，包越少它越省
+		// （fib 是 0.022 包/请求，我们原来 0.054 → 那 3% 的差就在这）。
+		// 大响应（static 那种 16KB）包本来就是满的，等只会白添延迟。
+		if flushDelay > 0 && c.smallPending() {
 			time.Sleep(flushDelay)
 		}
 		if err := c.flush(); err != nil {
@@ -768,6 +780,14 @@ func (c *Conn) runFlusher() {
 //
 // 留成开关是因为要 A/B：唤醒延迟省下来 vs 攒批的机会变少。
 var loopFlushOn = os.Getenv("FIO_QUIC_LOOP_FLUSH") == "1"
+
+// smallPending 这一轮攒的帧还不到半个包（只有小响应才值得等一批再发）。
+func (c *Conn) smallPending() bool {
+	c.mu.Lock()
+	n := len(c.appOut)
+	c.mu.Unlock()
+	return n > 0 && n < maxPacketPayload/2
+}
 
 // flushSoon 告诉"发送方"有帧要发了。
 //
