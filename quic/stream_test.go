@@ -20,6 +20,7 @@ import (
 	"crypto/tls"
 	"fmt"
 	"io"
+	"os"
 	"sync"
 	"testing"
 	"time"
@@ -81,17 +82,20 @@ func TestConcurrentStreamsLargeWrites(t *testing.T) {
 			defer wg.Done()
 			str, err := cc.OpenStreamSync(ctx)
 			if err != nil {
+				fmt.Fprintf(os.Stderr, "!!! 客户端开流失败: %v\n", err)
 				errs <- err
 				return
 			}
 			body := bytes.Repeat([]byte{byte('A' + i)}, bodyLen)
 			if _, err := str.Write(body); err != nil {
+				fmt.Fprintf(os.Stderr, "!!! 客户端写失败: %v\n", err)
 				errs <- err
 				return
 			}
 			str.Close() // 半关：写侧结束，读侧还开着等回显
 			got, err := io.ReadAll(str)
 			if err != nil {
+				fmt.Fprintf(os.Stderr, "!!! 客户端读回显失败: %v\n", err)
 				errs <- fmt.Errorf("客户端读回显失败: %w", err)
 				return
 			}

@@ -64,6 +64,12 @@ type Conn struct {
 	// （攒到下次 flush 一起 ACK，通常就一两个）。
 	ackDue   [3]bool
 	recvSeen [3][]uint64
+	// ackSince 是这一批待确认包里**最早**那个的到达时间。ACK 最多拖
+	// ackMaxDelay（见 flusher 的检查）：**不能无限拖**——发送方靠 ACK 涨
+	// 拥塞窗口，拖久了它 cwnd 用完就不再发，而我们要等它的数据才回包，
+	// 两边双向死等（实测：16 条并发 8KB 上传时偶发挂死，客户端 5 秒后报
+	// "no recent network activity"；8gbit 那种 100KB 请求体是同一类风险）。
+	ackSince [3]time.Time
 
 	// 每个级别待发的 CRYPTO 数据（TLS 交出来的握手字节）
 	cryptoOut [3][]byte
@@ -169,6 +175,10 @@ type Conn struct {
 	// pktAvg 见 notePkt/padBulk：最近发出的包的平均载荷大小（判断在不在推大响应）
 	pktAvg int
 
+	// outstanding 是"已经发出去、还没被 ACK 确认"的控制帧载荷，见
+	// retransmitLocked 和 outstanding 的说明。
+	outstanding []outstanding
+
 	// appOut 是 1-RTT 上待发的帧（各流的 STREAM、控制帧）。攒起来一次发；
 	// appEnds 记每个帧的结束偏移——**帧不能跨包**，切包只能切在帧边界上
 	// （见 flushLocked）。
@@ -176,7 +186,39 @@ type Conn struct {
 	appEnds []int
 }
 
+// outstanding 是"已经发出去、还没被确认"的控制帧载荷（重传用）。
+//
+// **回环上也会丢**：对端（压测端/客户端）一忙，它的收包缓冲就可能溢出——
+// 而本实现不做丢包重传（见 doc.go 的范围）。流数据丢了没关系（对端会
+// 重发请求），但**控制帧丢一次就是死等**：Handshake 的 CRYPTO 丢了握手
+// 完不成、HANDSHAKE_DONE 丢了客户端（quic-go）一直卡在"等握手确认"
+// 开不了流，5 秒后报 "no recent network activity"。CI 上那个偶发失败
+// （TestConcurrentStreamsLargeWrites 挂住）就是这么来的。
+//
+// 所以只给控制帧做最小重传：发的时候把载荷留一份，收到对端 ACK 就丢掉，
+// 超时没确认就用**新的包序号**重发一份（QUIC 的重传就是这个语义）。
+type outstanding struct {
+	pn    uint64
+	lvl   int
+	data  []byte // 载荷（不含包头），重传时重新封
+	sent  time.Time
+	rto   time.Duration // 下次重传的等待（每次翻倍）
+	tries int
+}
+
 const (
+	// ackMaxDelay 是 ACK 最多拖多久。压测端的 cwnd 只有十几 KB，ACK 拖过
+	// 这个量级它就没额度继续发了。1ms 足够让同一批的响应把 ACK 捎走
+	// （回环上响应就在几微秒之后），又不会卡住对端。
+	ackMaxDelay = time.Millisecond
+
+	// minRTO 是最小重传超时。回环上丢包是"对端缓冲溢出"这种瞬时情况，
+	// 200ms 重发一次足够；翻倍退避到 maxRTO，试满 maxRTTries 次就放弃
+	// （真等不到的连接，让对端的 idle timeout 收场）。
+	minRTO     = 200 * time.Millisecond
+	maxRTO     = 2 * time.Second
+	maxRTTries = 6
+
 	// 接收窗口。和 ourParams 里声明的值**必须是同一个**：这里的 maxDataSent
 	// 就是"我们已经报给对端多少额度"的记账起点。
 	recvConnWindow   = 1 << 24 // 连接级（initial_max_data）
@@ -384,6 +426,7 @@ func (c *Conn) drainEvents() error {
 			return errors.New("quic: server was asked for transport parameters")
 		case tls.QUICHandshakeDone:
 			c.handshakeDone = true
+			dbg("TLS 握手完成（服务端）")
 		case tls.QUICErrorEvent:
 			if ev.Err != nil {
 				return ev.Err
@@ -493,6 +536,9 @@ func (c *Conn) handlePacket(b []byte) error {
 		// 就是 ACK 放大（每请求多一个包，实测占了发送量的一大半）。
 		if ackEliciting {
 			c.mu.Lock()
+			if !c.ackDue[lvl] {
+				c.ackSince[lvl] = time.Now()
+			}
 			c.ackDue[lvl] = true
 			c.recvSeen[lvl] = append(c.recvSeen[lvl], h.pn)
 			c.mu.Unlock()
@@ -578,6 +624,13 @@ func (c *Conn) processFrames(lvl int, payload []byte) (ackEliciting, streamData 
 			streamData = true
 			streamErr = c.onStreamData(id, dataOff, data, kind&streamBitFin != 0)
 			return nil
+		case kind == frAck || kind == frAckECN:
+			// 对端确认了我们哪些包：把对应的控制帧从重传表里去掉
+			if largest, ranges, ok := parseAck(raw[1:]); ok {
+				c.mu.Lock()
+				c.ackSentLocked(largest, ranges)
+				c.mu.Unlock()
+			}
 		case kind == frMaxData:
 			if v, _, err := readVarint(raw[1:]); err == nil {
 				c.maxData = v
@@ -767,6 +820,14 @@ func (c *Conn) runFlusher() {
 		if err := c.flush(); err != nil {
 			return
 		}
+		// ACK 最多拖 ackMaxDelay：发送方要靠它涨拥塞窗口，无限拖会双向死等
+		c.mu.Lock()
+		if c.ackDue[lvlApp] && time.Since(c.ackSince[lvlApp]) >= ackMaxDelay {
+			_ = c.flushLocked(true)
+		}
+		// 超时没被确认的控制帧（握手的 CRYPTO / HANDSHAKE_DONE）重发
+		c.retransmitLocked()
+		c.mu.Unlock()
 	}
 }
 
@@ -857,9 +918,6 @@ func (c *Conn) flushLocked(force bool) error {
 			}
 			// 控制帧也先攒着（和 ACK 一样，发的时候才提交状态）
 			var ctl []byte
-			if c.handshakeDone && !c.sentHandshakeDone {
-				ctl = appendVarint(ctl, frHandshakeDone)
-			}
 			// 把用掉的流额度还回去（MAX_STREAMS，RFC 9000 4.6）。
 			//
 			// 水位推过了多少就还多少：报给对端的是"总共能开多少条"，
@@ -889,6 +947,21 @@ func (c *Conn) flushLocked(force bool) error {
 			if len(ack) > 0 && len(ctl) == 0 && len(c.appEnds) == 0 && !force {
 				continue
 			}
+			// HANDSHAKE_DONE 单独一个包发，而且要能重传：它丢了客户端
+			// 就一直开不了流（见 outstanding）。混进数据包的话重传会把
+			// 流数据也重发一遍（合法但浪费）。
+			if c.handshakeDone && !c.sentHandshakeDone {
+				hp := append([]byte(nil), ack...)
+				hp = appendVarint(hp, frHandshakeDone)
+				if err := c.sendTrackedLocked(lvlApp, hp); err != nil {
+					return err
+				}
+				dbg("发出 HANDSHAKE_DONE（pn=%d）", c.nextPN[lvlApp]-1)
+				c.sentHandshakeDone = true
+				c.ackDue[lvl] = false
+				c.recvSeen[lvl] = c.recvSeen[lvl][:0]
+				ack = nil
+			}
 			// 决定要发了，这时候才提交状态
 			if len(ack) > 0 {
 				c.ackDue[lvl] = false
@@ -896,7 +969,6 @@ func (c *Conn) flushLocked(force bool) error {
 				payload = append(payload, ack...)
 			}
 			if len(ctl) > 0 {
-				c.sentHandshakeDone = true
 				if maxStreamsNew > 0 {
 					c.maxStreamsSent = maxStreamsNew
 				}
@@ -940,6 +1012,14 @@ func (c *Conn) flushLocked(force bool) error {
 			continue
 		}
 		if len(payload) == 0 {
+			continue
+		}
+		if lvl != lvlApp {
+			// 握手的 CRYPTO（还有捎着的 ACK）要能被重传：丢了的话
+			// 握手就永远完不成，而对面不会替我们补
+			if err := c.sendTrackedLocked(lvl, payload); err != nil {
+				return err
+			}
 			continue
 		}
 		if err := c.sendPacketLocked(lvl, payload); err != nil {
@@ -1032,6 +1112,81 @@ func (c *Conn) padBulk(payload []byte) []byte {
 		payload = append(payload, 0)
 	}
 	return payload
+}
+
+// sendTrackedLocked 和 sendPacketLocked 一样，但发出去的载荷记一份，
+// 等对端 ACK 确认；超时没确认就重发（见 outstanding 的说明）。
+func (c *Conn) sendTrackedLocked(lvl int, payload []byte) error {
+	pn := c.nextPN[lvl]
+	if err := c.sendPacketLocked(lvl, payload); err != nil {
+		return err
+	}
+	c.outstanding = append(c.outstanding, outstanding{
+		pn:   pn,
+		lvl:  lvl,
+		data: append([]byte(nil), payload...),
+		sent: time.Now(),
+		rto:  minRTO,
+	})
+	return nil
+}
+
+// ackSentLocked 对端 ACK 了 largest 和之后的区间，把确认掉的控制帧丢掉。
+// 调用方持有 c.mu。
+func (c *Conn) ackSentLocked(largest uint64, ranges []ackRange) {
+	if len(c.outstanding) == 0 {
+		return
+	}
+	acked := func(pn uint64) bool {
+		if pn > largest {
+			return false
+		}
+		for _, r := range ranges {
+			if pn <= r.hi && pn >= r.lo {
+				return true
+			}
+		}
+		return false
+	}
+	keep := c.outstanding[:0]
+	for _, o := range c.outstanding {
+		if !acked(o.pn) {
+			keep = append(keep, o)
+		}
+	}
+	c.outstanding = keep
+}
+
+// retransmitLocked 看看有没有超时没确认的控制帧，有就用**新的包序号**重发。
+// flusher 的 1ms 心跳里调（调用方持有 c.mu）。
+func (c *Conn) retransmitLocked() {
+	if len(c.outstanding) == 0 || c.closed {
+		return
+	}
+	now := time.Now()
+	keep := c.outstanding[:0]
+	for _, o := range c.outstanding {
+		if now.Sub(o.sent) < o.rto {
+			keep = append(keep, o)
+			continue
+		}
+		if o.tries >= maxRTTries {
+			// 试够了：多半是对端已经走了（idle timeout 收场）
+			continue
+		}
+		dbg("重传控制帧 lvl=%d 旧pn=%d（第 %d 次）", o.lvl, o.pn, o.tries+1)
+		o.tries++
+		o.rto *= 2
+		if o.rto > maxRTO {
+			o.rto = maxRTO
+		}
+		o.sent = now
+		o.pn = c.nextPN[o.lvl]
+		if err := c.sendPacketLocked(o.lvl, o.data); err == nil {
+			keep = append(keep, o)
+		}
+	}
+	c.outstanding = keep
 }
 
 // writePackets 把 c.txBuf 里攒好的包发出去（c.txSizes 是每个包的长度）。

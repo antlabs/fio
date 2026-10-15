@@ -61,6 +61,53 @@ const (
 
 var errFrame = errors.New("quic: malformed frame")
 
+// ackRange 是一个确认区间 [lo, hi]（两端都含）。
+type ackRange struct{ hi, lo uint64 }
+
+// parseAck 解一个 ACK 帧的载荷（type 字节之后），返回最大已确认和区间列表。
+// ACK 帧的格式见 RFC 9000 19.3.1：最大已确认、延迟、区间数、首个区间长，
+// 之后每段是"和前一段空了几个 + 本段长度"。
+func parseAck(b []byte) (largest uint64, ranges []ackRange, ok bool) {
+	largest, n, err := readVarint(b)
+	if err != nil {
+		return 0, nil, false
+	}
+	b = b[n:]
+	if _, n, err = readVarint(b); err != nil { // 延迟
+		return 0, nil, false
+	}
+	b = b[n:]
+	cnt, n, err := readVarint(b)
+	if err != nil {
+		return 0, nil, false
+	}
+	b = b[n:]
+	first, n, err := readVarint(b)
+	if err != nil {
+		return 0, nil, false
+	}
+	b = b[n:]
+	hi := largest
+	lo := hi - first
+	ranges = append(ranges, ackRange{hi: hi, lo: lo})
+	for i := uint64(0); i < cnt; i++ {
+		gap, n, err := readVarint(b)
+		if err != nil {
+			return 0, nil, false
+		}
+		b = b[n:]
+		length, n, err := readVarint(b)
+		if err != nil {
+			return 0, nil, false
+		}
+		b = b[n:]
+		hi = lo - gap - 2
+		lo = hi - length
+		ranges = append(ranges, ackRange{hi: hi, lo: lo})
+	}
+	return largest, ranges, true
+}
+
 // streamFrame 是解析出来的 STREAM 帧（载荷指向包内，不拷贝）。
 type streamFrame struct {
 	id     uint64
@@ -271,7 +318,6 @@ func appendAck(dst []byte, pns []uint64, delay uint64) []byte {
 	sort.Slice(pns, func(i, j int) bool { return pns[i] > pns[j] })
 
 	// 从大到小扫成区间（同一区间里包序号连续）。
-	type ackRange struct{ hi, lo uint64 }
 	ranges := make([]ackRange, 0, 2)
 	hi, lo := pns[0], pns[0]
 	for _, pn := range pns[1:] {
