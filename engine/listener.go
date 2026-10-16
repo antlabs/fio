@@ -93,6 +93,19 @@ func Listen(m *MultiEventLoop, addr string, newHandler func() Handler) (*Listene
 		unix.Close(lfd)
 		return nil, err
 	}
+	// 关掉 Nagle（TCP_NODELAY），**在监听 socket 上设一次**：accept 出来的
+	// 连接会继承这个选项（Linux/BSD 都是；lab 上实测：监听上设了，
+	// accept 出来的连接 getsockopt 读回 1）。这样每条连接不用多一次
+	// setsockopt——limited-conn 那种 18 万连接/秒的档，一次就是 18 万次
+	// 系统调用/秒。
+	//
+	// 为什么需要：响应常在 MSS 之上（MTU 1500 时 15KB 就是 11 段），Nagle
+	// 会把最后那段不足 MSS 的压着等前一段的 ACK，每个请求多一个来回。
+	// HttpArena 的 static-tls 档（回环 MTU 1500，平均 15KB 响应）实测差
+	// 1.3% 左右；MTU 65536 时（一个响应一段）看不出来。fib 在 accept 后
+	// 逐连接设它，Go 的 net 包也是默认设的；我们走裸 syscall，之前一直
+	// 没设。设不上（unix domain 之类的监听）就算了，不是错误。
+	_ = unix.SetsockoptInt(lfd, unix.IPPROTO_TCP, unix.TCP_NODELAY, 1)
 	// **非阻塞**：accept 循环要能在没连接时立刻返回、去看停止标志
 	// （见 Listener 的说明）。
 	if err := unix.SetNonblock(lfd, true); err != nil {
