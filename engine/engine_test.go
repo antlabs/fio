@@ -172,6 +172,67 @@ func TestEchoBatch(t *testing.T) {
 	}
 }
 
+// 对端一次灌进来一大片数据时，读缓冲区不能为了"一次把 socket 读空"
+// 一路翻倍——每批最多 batchReadBufferSize，协议消费完再读下一批。
+//
+// 这是 Pipeline 内存的回归测试：改之前 10000 连接、客户端 send-ahead
+// 几十 KB 时，每条连接的读缓冲区会长到 128KB，堆上 1GB；这里用一次
+// 256KB 的写入复现"socket 里有一大片"的条件。
+type burstHandler struct {
+	want   int
+	got    int
+	maxBuf int
+	done   chan struct{}
+	once   sync.Once
+}
+
+func (h *burstHandler) OnOpen(*Conn) {}
+
+func (h *burstHandler) OnData(_ *Conn, buf []byte) (int, error) {
+	if len(buf) > h.maxBuf {
+		h.maxBuf = len(buf)
+	}
+	h.got += len(buf)
+	if h.got >= h.want {
+		h.once.Do(func() { close(h.done) })
+	}
+	return len(buf), nil
+}
+
+func (h *burstHandler) OnClose(*Conn, error) {}
+
+func TestReadBatchStaysBounded(t *testing.T) {
+	const want = 256 * 1024
+	h := &burstHandler{want: want, done: make(chan struct{})}
+	addr, stop := startServer(t, h)
+	defer stop()
+
+	conn, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+
+	// 一次写一大片，让服务端的 socket 接收队列里同时躺着多批数据。
+	if _, err := conn.Write(make([]byte, want)); err != nil {
+		t.Fatal(err)
+	}
+
+	select {
+	case <-h.done:
+	case <-time.After(5 * time.Second):
+		t.Fatalf("只收到 %d/%d 字节，maxBuf=%d", h.got, want, h.maxBuf)
+	}
+	if h.got != want {
+		t.Fatalf("收到 %d 字节，want %d", h.got, want)
+	}
+	// 池按 1KB 分档、每档多带一个帧头的余量（16KB 档实际 16398），
+	// 这里留一点余量；要抓的是 32KB/128KB 那种翻倍增长。
+	if h.maxBuf > batchReadBufferSize+64 {
+		t.Fatalf("单次交给协议的缓冲区 %d 字节，超过一批 %d", h.maxBuf, batchReadBufferSize)
+	}
+}
+
 // 协议说"还不够"时数据要留着：一行一行地喂，每行到齐才回调一次。
 //
 // 这是 Handler 契约的核心——OnData 返回 0 不是错误，是"再给我点"。

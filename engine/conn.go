@@ -419,15 +419,30 @@ func (c *Conn) WriteRaw(data []byte) error {
 //
 // 这个方法由引擎在读事件里调, 协议不直接调它——协议实现 OnData 拿到的
 // 就是这里读进来的数据。
+//
+// 注意：它会把 fd 读到 EAGAIN 才返回。读事件那条路不用它，用
+// beginRead/readBatch，让协议每消费一批就接着读一批（见 readAndDispatch）。
 func (c *Conn) Read() (int, error) {
 	if c.IsClosed() {
 		return 0, ErrClosed
 	}
+	c.beginRead()
 
-	// 上一轮消费完、但当时还没法安全释放的读缓冲区，在这里还掉。
-	//
-	// 时机是安全的：调用方（事件循环）跑完上一轮 OnData 才回到这里，
-	// 上一轮指向那块内存的 buf 已经没人用了。
+	total := 0
+	for {
+		n, more, err := c.readBatch()
+		total += n
+		if err != nil || !more {
+			return total, err
+		}
+	}
+}
+
+// beginRead 准备一轮读：释放上一轮该还的缓冲区、复位索引、取缓冲区。
+//
+// 释放的时机是安全的：调用方（事件循环）跑完上一轮 OnData 才回到这里，
+// 上一轮指向那块内存的 buf 已经没人用了。
+func (c *Conn) beginRead() {
 	c.mu.Lock()
 	if c.releaseReadBuf && c.rbuf != nil {
 		bytespool.PutBytes(c.rbuf)
@@ -453,98 +468,125 @@ func (c *Conn) Read() (int, error) {
 		}
 		c.rbuf = bytespool.GetBytes(size)
 	}
+}
 
-	total := 0
-	for {
-		buf := (*c.rbuf)[c.rw:]
-		if len(buf) == 0 {
-			// 缓冲区满了, 协议还没消费完。**先试着把前面消费掉的那段
-			// 收回来**(compact), 收不动再扩容。
+// readBatch 从 fd 读一次（最多填满当前这块缓冲区），返回是否可能还有数据。
+//
+// **关键区别**：缓冲区读满时不为了"一次把 socket 读空"继续扩容，而是
+// 返回 more=true，让调用方先把这一批交给协议消费，消费完再读下一批。
+//
+// 为什么：Pipeline 压测里客户端一次 send-ahead 好几批（每批 15KB），
+// 旧的 Read 会一路读满、读满就翻倍，直到把 socket 里那 100KB 全装进
+// 读缓冲区才交给协议解析。10000 连接就是每条一块 128KB、堆上 1GB
+// （pprof: bytespool.GetBytes <- Conn.Read <- growReadBuffer）。
+// 现在缓冲区最多长到 batchReadBufferSize，剩下的数据等协议消费完再读。
+//
+// 大报文不会因此卡住：缓冲区满、协议又没消费完，说明剩下的是一条
+// 装不下的报文，走 compact / growToNextMessage / growReadBuffer 扩到
+// 报文那么大，和以前一样。
+func (c *Conn) readBatch() (total int, more bool, err error) {
+	if c.IsClosed() {
+		return 0, false, ErrClosed
+	}
+
+	// 本轮里的上一批已经全消费完：复位索引，接着用同一块，不还池
+	// （轮末统一还，见 ReleaseReadBuf）。
+	if c.rr == c.rw && c.rr > 0 {
+		c.rr, c.rw = 0, 0
+	}
+
+	buf := (*c.rbuf)[c.rw:]
+	if len(buf) == 0 {
+		// 缓冲区满了, 协议还没消费完。**先试着把前面消费掉的那段
+		// 收回来**(compact), 收不动再扩容。
+		//
+		// 为什么先 compact: 协议处理半个大报文时(比如 1MB 的分片),
+		// rr 停在报文开头、rw 一路往后推。不回收 rr 前面那段的话,
+		// 缓冲区每次填满就翻倍, 最后为一条报文吃到 4MB(上限)——
+		// 而实际上"还没解析的数据"可能只有几十 KB。
+		//
+		// 实测(websocket 大分片场景): 加了这一步之后, 内存占用从
+		// "报文大小 × 2" 降到 "报文大小 + 一个读批次"。
+		if !c.compactReadBuffer() {
+			// 缓冲区满了、协议还没凑齐一条报文：**先问协议整条
+			// 多大**，一次长到最终大小。不问就只能翻倍——1MB 的
+			// 报文要经历 16K→32K→…→1MB 六次翻倍，每次都要把已经
+			// 读到的整块数据 memcpy 一遍。
 			//
-			// 为什么先 compact: 协议处理半个大报文时(比如 1MB 的分片),
-			// rr 停在报文开头、rw 一路往后推。不回收 rr 前面那段的话,
-			// 缓冲区每次填满就翻倍, 最后为一条报文吃到 4MB(上限)——
-			// 而实际上"还没解析的数据"可能只有几十 KB。
-			//
-			// 实测(websocket 大分片场景): 加了这一步之后, 内存占用从
-			// "报文大小 × 2" 降到 "报文大小 + 一个读批次"。
-			if !c.compactReadBuffer() {
-				// 缓冲区满了、协议还没凑齐一条报文：**先问协议整条
-				// 多大**，一次长到最终大小。不问就只能翻倍——1MB 的
-				// 报文要经历 16K→32K→…→1MB 六次翻倍，每次都要把已经
-				// 读到的整块数据 memcpy 一遍。
+			// 只有这个点能问：在两次 OnData 之间，协议手上没有活
+			// 的缓冲区别名（见 MessageSizeHinter）。协议在 OnData
+			// 里让引擎搬家就会把正在读的数据挪走/换掉。
+			if !c.growToNextMessage() && !c.growReadBuffer() {
+				// 长不动了（到 maxReadBufferSize，协议又还差着
+				// 数据）。**只能关连接**：再待着就是永久卡死——
+				// ET 下"缓冲区还是满的"不会再给边缘，这条连接不会
+				// 再有任何进展，白白占着 fd 和内存（4MB 上限那版
+				// 就是这么卡住的）。
 				//
-				// 只有这个点能问：在两次 OnData 之间，协议手上没有活
-				// 的缓冲区别名（见 MessageSizeHinter）。协议在 OnData
-				// 里让引擎搬家就会把正在读的数据挪走/换掉。
-				if !c.growToNextMessage() && !c.growReadBuffer() {
-					// 长不动了（到 maxReadBufferSize，协议又还差着
-					// 数据）。**只能关连接**：再待着就是永久卡死——
-					// ET 下"缓冲区还是满的"不会再给边缘，这条连接不会
-					// 再有任何进展，白白占着 fd 和内存（4MB 上限那版
-					// 就是这么卡住的）。
-					//
-					// 协议那边的表现是收到一个关闭（websocket 报
-					// OnClose），比静默挂死好诊断。
-					return total, ErrMessageTooBig
-				}
+				// 协议那边的表现是收到一个关闭（websocket 报
+				// OnClose），比静默挂死好诊断。
+				return 0, false, ErrMessageTooBig
 			}
-			continue
 		}
+		buf = (*c.rbuf)[c.rw:]
+	}
 
+	for {
 		// 这把锁要拿着: Close 可能从任意 goroutine 来, 它会在锁里关掉
 		// fd、释放读缓冲区。不拿锁读就会读到已关闭的 fd。
 		c.mu.Lock()
 		fd := int(atomic.LoadInt64(&c.fd))
-		n, err := socketRead(fd, buf)
+		n, rerr := socketRead(fd, buf)
 		c.mu.Unlock()
 		if c.parent != nil {
 			c.parent.addReadSyscall()
 		}
 
-		if err != nil {
-			if errno, ok := err.(syscall.Errno); ok {
+		if rerr != nil {
+			if errno, ok := rerr.(syscall.Errno); ok {
 				if errno == syscall.EINTR {
 					continue
 				}
 				if errno == syscall.EAGAIN || errno == syscall.EWOULDBLOCK {
-					return total, nil
+					return total, false, nil
 				}
-				return total, err
 			}
-			return total, err
+			return total, false, rerr
 		}
 		if n == 0 {
 			// 对端关了(FIN)。缓冲区里还有没消费的数据的话, 先让协议
 			// 消费完再报 EOF——协议那边可能还有半条报文要处理。全消费
 			// 完了就直接报 io.EOF, 让引擎关连接。
+			//
+			// **FIN 不会因此丢**：pulse 注册的 epoll 事件带 EPOLLRDHUP，
+			// 对端关闭会单独回调一次（api_epoll.go 里
+			// rev&(EPOLLHUP|EPOLLRDHUP) 时直接 cb(fd, READ|WRITE, io.EOF)），
+			// 不靠"读到 0"来发现。拿"发几个字节立刻 close"的用例在
+			// Linux 上反复验过（50 轮）。
 			if c.rw > c.rr {
-				return total, nil
+				return total, false, nil
 			}
-			return total, io.EOF
+			return total, false, io.EOF
 		}
 
 		c.rw += n
 		total += n
 
-		// 一次读满了说明后面还有, 换块大的, 免得下一条报文只读到一半。
-		if c.rw == len(*c.rbuf) && len(*c.rbuf) < batchReadBufferSize {
+		// 起始档读满了：升到"一批"那一档，接着读这一批剩下的数据。
+		// 再大就不长了——先把这批交给协议消费，避免为了读空 socket
+		// 把缓冲区涨到 128KB（见上面的说明）。
+		if n == len(buf) && len(*c.rbuf) < batchReadBufferSize {
 			c.growReadBuffer()
+			return total, true, nil
 		}
 
 		// **短读就返回**：这次已经把可读的读干了，再读一次必然 EAGAIN。
 		// 省掉的正是"每消息多一次系统调用"——strace 实测 recvfrom 从
 		// 2.02 次/消息降到 1.02 次/消息（基线 1.0 次），CPU 跟着降。
 		//
-		// **FIN 不会因此丢**：pulse 注册的 epoll 事件带 EPOLLRDHUP，对端
-		// 关闭会单独回调一次（api_epoll.go 里 rev&(EPOLLHUP|EPOLLRDHUP) 时
-		// 直接 cb(fd, READ|WRITE, io.EOF)），不靠"读到 0"来发现。拿"发几个
-		// 字节立刻 close"的用例在 Linux 上反复验过（50 轮）。
-		//
-		// 只有"刚好读满一整块、后面可能还有"才接着循环（上面会先把块换大）。
-		if n < len(buf) {
-			return total, nil
-		}
+		// 只有"刚好读满一整块、后面可能还有"才返回 more=true，让调用方
+		// 消费完再读下一批。
+		return total, n == len(buf), nil
 	}
 }
 

@@ -260,33 +260,53 @@ func (el *EventLoop) processConn(c *Conn, isRead, isWrite bool) {
 	}
 }
 
-// readAndDispatch 读一次，把数据喂给协议的 OnData。
+// readAndDispatch 读一批，喂给协议的 OnData，消费完再读下一批，直到
+// fd 被读空（EAGAIN）。
+//
+// 为什么不是"一次读空、一次解析"：Pipeline 压测里客户端一次 send-ahead
+// 好几批，旧实现会一路扩容把 socket 里那 100KB 全装进读缓冲区再解析，
+// 10000 连接就是堆上 1GB 的读缓冲区。这里每批最多读一块
+// （batchReadBufferSize），协议消费完再读下一批：系统调用次数基本不变
+// （少一次扩容和 memcpy），但当轮占用的缓冲区有界。
 //
 // 协议返回消化了多少，引擎调 ConsumeRead；返回 0 表示"还不够凑一条报文"，
 // 数据留在缓冲区里，下次读到再喂——这不是错误。
 func (el *EventLoop) readAndDispatch(c *Conn) error {
-	_, readErr := c.Read()
+	c.beginRead()
 
-	// 读到的东西全部喂给协议，直到协议不再消费。
-	// 注意要先喂再处理 readErr：FIN 到的时候缓冲区里可能还有数据
-	// （Read 里"先让协议消费完"那条契约），先把它们交出去。
+	var readErr error
 	for {
-		buf := c.ReadBuffer()
-		if len(buf) == 0 {
-			break
-		}
-		n, err := c.handler.OnData(c, buf)
+		_, more, err := c.readBatch()
 		if err != nil {
-			return err
+			readErr = err
 		}
-		if n <= 0 {
-			// 协议说这段还不够，等下次读
-			break
+
+		// 读到的东西全部喂给协议，直到协议不再消费。
+		// 注意要先喂再处理 readErr：FIN 到的时候缓冲区里可能还有数据
+		// （Read 里"先让协议消费完"那条契约），先把它们交出去。
+		for {
+			buf := c.ReadBuffer()
+			if len(buf) == 0 {
+				break
+			}
+			n, err := c.handler.OnData(c, buf)
+			if err != nil {
+				return err
+			}
+			if n <= 0 {
+				// 协议说这段还不够，等下次读
+				break
+			}
+			c.ConsumeRead(n)
+			if n < len(buf) {
+				// 协议没吃完这一整段，说明它自己知道后面还有（一条报文
+				// 结束、后面那条不完整）。缓冲满了下一批会 compact/扩容，
+				// 没满就是 socket 已经读空，交给下一次事件。
+				break
+			}
 		}
-		c.ConsumeRead(n)
-		if n < len(buf) {
-			// 协议没吃完这一整段，说明它自己知道后面还有（一条报文
-			// 结束、后面那条不完整），交给下一次事件
+
+		if readErr != nil || !more {
 			break
 		}
 	}
