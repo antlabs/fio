@@ -299,11 +299,21 @@ func (el *EventLoop) readAndDispatch(c *Conn) error {
 			}
 			c.ConsumeRead(n)
 			if n < len(buf) {
+				// 协议换了 handler（HTTP/1.1 升级成 WebSocket）：缓冲区里
+				// 剩下的字节属于新协议，**立刻接着喂**。等下一次读事件的话，
+				// 如果内核里没有新数据（客户端把握手和第一帧拼在一次 write
+				// 里），ET 不会再给边缘，那几帧就永远卡住了。
+				if c.handlerChanged {
+					c.handlerChanged = false
+					continue
+				}
 				// 协议没吃完这一整段，说明它自己知道后面还有（一条报文
 				// 结束、后面那条不完整）。缓冲满了下一批会 compact/扩容，
 				// 没满就是 socket 已经读空，交给下一次事件。
 				break
 			}
+			// 这一批全吃完了，handler 换过也不用再记着。
+			c.handlerChanged = false
 		}
 
 		if readErr != nil || !more {
@@ -314,6 +324,7 @@ func (el *EventLoop) readAndDispatch(c *Conn) error {
 	// 轮末把读缓冲区还回池子（见 ReleaseReadBuf）。不还的话连接会在
 	// "两批之间"攥着它——10000 连接的 Pipeline 负载下就是每连接 15KB
 	// 常驻（实测堆上 180MB）。
+	c.handlerChanged = false
 	c.ReleaseReadBuf()
 
 	// 读出错（含对端关了）：缓冲区已经空了，可以把错误交给上层了

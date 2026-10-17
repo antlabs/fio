@@ -21,7 +21,6 @@ import (
 	"net"
 	"strconv"
 	"sync"
-	"time"
 
 	"golang.org/x/sys/unix"
 )
@@ -136,54 +135,55 @@ func ListenAndServe(m *MultiEventLoop, addr string, newHandler func() Handler) (
 	return ln, nil
 }
 
-// Serve 开始 accept 循环（跑在自己的 goroutine 上）。
-// acceptIdleSleep 是空转时的轮询间隔上限。
+// acceptPollTimeoutMs 是 accept 循环等连接的超时，只用来定期看停止标志。
 //
-// 原来固定 1ms：每个监听器每秒 1000 次 accept4（EAGAIN）+ 1000 次定时唤醒。
-// prefork 之后 6 个子进程 × 4 个监听器 = 每秒 2.4 万次系统调用加 2.4 万次
-// 唤醒——**空转量出来占 20.6% 核**（latency-10k 那种几乎没流量的档里这笔
-// 账是纯支出）。
+// 以前是"非阻塞 accept + 空转 sleep"：没连接时睡 1ms（连续空转 16 次后
+// 睡 50ms）。连接风暴里 accept 队列常会在两批 dial 之间空一下，这 1ms
+// 就直接加在下一批连接的延迟上——Connections 压测的尾延迟里有它。
 //
-// 退避之后空转只剩每秒 20 次；一收到连接立刻恢复 1ms，所以连接风暴
-// （async 32000 连接那种）还是 1ms 的粒度。代价：空闲之后的第一条连接最多
-// 多等这个间隔（50ms）——各档的连接都是开头一次性建好（reconnects = 0），
-// 这一下在测量窗口里只发生一次。
-const (
-	acceptActiveSleep = time.Millisecond
-	acceptIdleSleep   = 50 * time.Millisecond
-	// 连续空转多少次之后进省电档。16 次 1ms ≈ 16ms 的"还在忙"余量，
-	// 短促的连接间隙不会被当成空闲。
-	acceptIdleAfter = 16
-)
+// 改成 poll(listen fd)：有连接立刻醒，空闲时在核里等（不占 CPU），停止
+// 检查的粒度就是下面这个超时。
+const acceptPollTimeoutMs = 100
 
+// Serve 开始 accept 循环（跑在自己的 goroutine 上）。
 func (l *Listener) Serve() {
 	go func() {
 		defer close(l.done)
-		idle := 0
+
+		fds := []unix.PollFd{{Fd: int32(l.lfd), Events: unix.POLLIN}}
 		for {
-			nfd, err := acceptNonblock(l.lfd)
-			if err != nil {
-				select {
-				case <-l.stop:
-					return
-				default:
-				}
-				if err == unix.EAGAIN || err == unix.EINTR {
-					idle++
-					if idle > acceptIdleAfter {
-						time.Sleep(acceptIdleSleep)
-					} else {
-						time.Sleep(acceptActiveSleep)
-					}
+			fds[0].Revents = 0
+			if _, err := unix.Poll(fds, acceptPollTimeoutMs); err != nil {
+				if err == unix.EINTR {
 					continue
 				}
 				return
 			}
-			idle = 0
-			h := l.newFn()
-			if _, err := l.m.Add(nfd, h); err != nil {
-				// 引擎已经 Free 了之类的：关了走人
-				unix.Close(nfd)
+			select {
+			case <-l.stop:
+				return
+			default:
+			}
+			if fds[0].Revents == 0 {
+				continue
+			}
+
+			// 一次醒来到 accept 队列空为止：poll 的次数跟"连接批次"走，
+			// 不跟连接数走。队列空之前不回去 poll，免得错过已经排队的
+			// 连接。
+			for {
+				nfd, err := acceptNonblock(l.lfd)
+				if err != nil {
+					if err == unix.EAGAIN || err == unix.EINTR {
+						break
+					}
+					return
+				}
+				h := l.newFn()
+				if _, err := l.m.Add(nfd, h); err != nil {
+					// 引擎已经 Free 了之类的：关了走人
+					unix.Close(nfd)
+				}
 			}
 		}
 	}()

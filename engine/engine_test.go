@@ -233,6 +233,58 @@ func TestReadBatchStaysBounded(t *testing.T) {
 	}
 }
 
+// 处理到一半换 handler（协议升级）时，缓冲区里剩下的字节要立刻交给新
+// handler，而不是等下一次读事件——ET 下可能根本没有下一次。
+type takeoverHandler struct {
+	got chan string
+}
+
+func (h *takeoverHandler) OnOpen(*Conn) {}
+
+func (h *takeoverHandler) OnData(_ *Conn, buf []byte) (int, error) {
+	h.got <- string(buf)
+	return len(buf), nil
+}
+
+func (h *takeoverHandler) OnClose(*Conn, error) {}
+
+type switchHandler struct {
+	next *takeoverHandler
+}
+
+func (h *switchHandler) OnOpen(*Conn) {}
+
+func (h *switchHandler) OnData(c *Conn, _ []byte) (int, error) {
+	c.SetHandler(h.next)
+	return 3, nil
+}
+
+func (h *switchHandler) OnClose(*Conn, error) {}
+
+func TestSetHandlerTakesOverLeftover(t *testing.T) {
+	next := &takeoverHandler{got: make(chan string, 1)}
+	addr, stop := startServer(t, &switchHandler{next: next})
+	defer stop()
+
+	conn, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+
+	if _, err := conn.Write([]byte("abcdefgh")); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case got := <-next.got:
+		if got != "defgh" {
+			t.Fatalf("新 handler 收到 %q, want %q", got, "defgh")
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("新 handler 没拿到剩下的字节")
+	}
+}
+
 // 协议说"还不够"时数据要留着：一行一行地喂，每行到齐才回调一次。
 //
 // 这是 Handler 契约的核心——OnData 返回 0 不是错误，是"再给我点"。

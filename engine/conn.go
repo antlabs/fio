@@ -118,6 +118,14 @@ type Conn struct {
 	// releaseReadBuf 上一轮读缓冲区已经消费完、等着下次 Read 时释放。
 	// 见 ConsumeRead 里"为什么不能马上还"的说明。
 	releaseReadBuf bool
+
+	// handlerChanged 表示协议层在处理这一批数据的时候换了 handler（协议
+	// 升级：HTTP/1.1 -> WebSocket）。readAndDispatch 看到它就不把"协议没
+	// 吃完这一批"当成"等下次读"，而是接着用新 handler 处理缓冲区里剩下的
+	// 字节——那些字节可能是和握手拼在同一批里的第一帧。
+	//
+	// 只在处理这条连接的 goroutine 上碰，不需要原子操作。
+	handlerChanged bool
 }
 
 const (
@@ -191,6 +199,32 @@ func (c *Conn) SetUserData(v any) {
 		return
 	}
 	c.userData.Store(&v)
+}
+
+// SetHandler 换掉这条连接的协议处理器。
+//
+// **只能在处理这条连接的 goroutine 上调**（OnOpen/OnData/OnClose 里）：
+// handler 是普通字段，事件循环读它时不加锁。调用时这条连接必须正被
+// 处理（busy），所以不会有另一个 goroutine 同时读。
+//
+// 用途是协议升级。比如 HTTP/1.1 的 Upgrade 请求：同一个 read 里可能
+// 紧跟着 WebSocket 的第一帧，HTTP handler 消费掉请求头之后，剩下的字节
+// 要立刻交给 WebSocket handler，而不是等下一次读事件——ET 下如果内核
+// 里没有新数据，就不会有下一次事件，那几帧会永远卡在缓冲区里。
+func (c *Conn) SetHandler(h Handler) {
+	c.handler = h
+	c.handlerChanged = true
+
+	// 新协议可能有自己的起始读缓冲区大小。HTTP 的 handler 没实现
+	// ReadBufferSizer（引擎默认 8KB），而升级后的 WebSocket 要 2KB 档：
+	// 不更新的话，这条连接之后每一轮都按 8KB 取块，池子里的块大 4 倍，
+	// echo 这种一条消息一轮的场景每消息都多背 6KB 的池往返和缓存压力。
+	c.initRbSize = 0
+	if s, ok := h.(ReadBufferSizer); ok && s != nil {
+		c.initRbSize = s.InitialReadBufferSize()
+	}
+	// 这一轮手上的还是旧 handler 的缓冲区，轮末照常还掉；下一轮按新
+	// handler 的起始大小重新取。
 }
 
 // SyncOnLoop 把 f 投到这条连接所属的事件循环的 goroutine 上跑，等它跑完
