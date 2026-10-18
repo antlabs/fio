@@ -36,14 +36,33 @@ import (
 // 字段和以前 multiEventLoopOption 里能映射到 engine 的那几个一一对应:
 // numLoops/level/maxEventNum。剩下的(业务协程池、解析池、gosched……)engine
 // 现在没有对应的开关, 收在这里但不往下传。
+
+// 默认事件循环数，见 toEngineOptions。
+//
+// 2 核以上统一 192 个：2/4/8/12 核实测都在 96~384 这个平台期里，
+// 192 是 TPS 和内存的折中。单核上 192 个循环挤一个 P，Pipeline 反而
+// 掉 33%，实测 64 个最好（Echo 也还在高位）。
+const (
+	defaultEventLoops          = 192
+	defaultEventLoopsSingleCPU = 64
+)
+
+// eventWorkersPoolAuto 是 "显式要 worker 池、worker 数按核数算" 的哨兵值。
+// 0 留给了 "没填 = 默认 inline"。
+const eventWorkersPoolAuto = -2
+
 type evOptionConfig struct {
 	numLoops    int        // 起多少个 event loop
 	level       slog.Level // 日志级别
 	maxEventNum int        // 一次 epoll/kqueue 最多处理多少事件
 
 	// eventWorkers 是解析池（engine 那边叫事件移交: event loop 只分发,
-	// 读/解析/回调交给一组 worker）。0 = 没填，用 engine 的默认（和
-	// 迁移前一样，NumCPU*5/3）；负数 = 就地执行。
+	// 读/解析/回调交给一组 worker）。
+	//
+	//	0                     默认：就地执行（inline），见下面 toEngineOptions
+	//	eventWorkersPoolAuto  显式要 worker 池，worker 数按核数取
+	//	> 0                   指定 worker 数
+	//	< 0                   就地执行
 	//
 	// 迁移前这几个选项（WithParseInWorkerPool / WithParseGoroutines /
 	// WithParseInEventLoop）配置的就是这条路径，现在接着往下传。
@@ -128,22 +147,35 @@ func toEngineOptions(opts ...EvOption) []engine.Option {
 	n := runtime.NumCPU()
 	loops := cfg.numLoops
 	if loops <= 0 {
-		// WebSocket 的默认不是 engine 的"每 CPU 一个"：大核数下 4/3 路
-		// 超订能把 syscall 的等待盖住（12 核 -> 16，实测比 12 路高约 4%）；
-		// 低核数下 event loop 只做 poll/投递，2 个就够，多出来的会抢
-		// worker 的核（4 核实测：2 loops 比 5 loops 高约 2%）。
-		if n <= 4 {
-			loops = 2
-		} else {
-			loops = n + n/3
+		// 默认事件循环数：2 核以上 192，单核 64。
+		//
+		// 这个数看着大，但每个循环是独立的 epoll 分片，连接按 fd 取模
+		// 分过去：循环越多，每个循环负责的连接越少，一次醒来要碰的
+		// 连接状态/读缓冲区/socket 越少，越能留在 cache 里。
+		//
+		// 实测（lab，10000 连接 1KB echo，C++ 客户端，server/client 对半）：
+		// 2 核上 2 个循环时每个循环 5000 条连接，LLC-load-miss 59%，
+		// 每消息 5.2µs；192 个循环（每循环约 50 条）时 miss 降到 1%，
+		// 每消息 2.8µs。2/4/8/12 核的 Echo 和 Pipeline 都在 96~384 个
+		// 循环之间接近峰值，192 是这个区间里内存和 TPS 的折中。
+		//
+		// 显式 WithEventLoops 仍然优先；连接数特别大（几十万以上）的
+		// 场景可以按"每个循环几百条连接"自己给一个更大的值。
+		loops = defaultEventLoops
+		if n == 1 {
+			loops = defaultEventLoopsSingleCPU
 		}
 	}
 	workers := cfg.eventWorkers
-	if workers == 0 {
-		// 任务池的 worker 数是 Echo 在低核数上的主要瓶颈：默认 5/3
-		// （4 核 6 个）时 worker 队列经常满，4 核 Echo 0.51M；24 个
-		// worker 时 0.65M，且 profile 里 taskRing/scheduler 的尖峰消失。
-		// 大核数下 24 不低于原来的 5/3（12 核 20 -> 24），先统一取下限。
+	switch workers {
+	case 0:
+		// 默认就地执行：读/解析/回调都在事件循环上，省掉一次跨
+		// goroutine 投递 + 唤醒。worker 池那套在 2 核上实测反而慢
+		// （每消息多 2~3µs 的交接和调度），高核数下也不如多个小循环。
+		workers = -1
+	case eventWorkersPoolAuto:
+		// 显式要 worker 池：沿用迁移前的默认 NumCPU*5/3，下限 24
+		// （低核数下 5/3 的 worker 队列经常满）。
 		workers = n * 5 / 3
 		if workers < 24 {
 			workers = 24

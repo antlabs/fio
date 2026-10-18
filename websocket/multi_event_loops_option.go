@@ -53,9 +53,12 @@ func WithMaxEventNum(num int) EvOption {
 //
 // 现在落到 engine 的事件移交（worker 池）上, 见 engine.WithEventWorkers:
 // event loop 只收事件和投递, 读/解析/回调跑在一组 worker 上, 按 fd 取模
-// 分片。**迁移前的默认行为就是它**。
+// 分片。
+//
+// **默认已经改成就地执行（inline）**：10000 连接 1KB echo 实测，worker
+// 池每次事件的交接/唤醒比多个小循环更贵。要回 worker 池用这个显式开。
 func WithParseInWorkerPool() EvOption {
-	return func(e *evOptionConfig) { e.eventWorkers = 0 }
+	return func(e *evOptionConfig) { e.eventWorkers = eventWorkersPoolAuto }
 }
 
 // 解析 goroutine 的数量。engine 那边是 worker 池的 worker 数。

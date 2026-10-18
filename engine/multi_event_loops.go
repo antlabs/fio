@@ -168,9 +168,13 @@ func New(opts ...Option) (*MultiEventLoop, error) {
 			maxEventNum: o.maxEventNum,
 			log:         m.log,
 			// 注册连接（OnOpen 投递）走这条路，不是数据路径。
-			// 压测里的 connect 风暴会瞬时挤进来一批，缓冲开大点，
-			// 免得 accept 循环被卡住（见 runOnLoop）。
-			tasks: make(chan func(), 4096),
+			// 每个循环只分到几十条连接（默认 192 个循环 / 万级连接），
+			// 256 格就够吸收一轮 connect 风暴；**不要开 4096**：一
+			// 格 8 字节，4096 格就是 32KB/循环，192 个循环白占 6MB，
+			// 384 个就 12MB（pprof 里 engine.New 是 Pipeline 内存的
+			// 四分之一），而这么多格子根本用不到。真满了 accept 会
+			// 等一会儿，是正常的背压（见 runOnLoop）。
+			tasks: make(chan func(), 256),
 		}
 		api, err := core.Create(core.TriggerTypeEdge)
 		if err != nil {
