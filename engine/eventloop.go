@@ -20,6 +20,7 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"sync/atomic"
 
 	"github.com/antlabs/pulse/core"
 	"golang.org/x/sys/unix"
@@ -35,6 +36,10 @@ type EventLoop struct {
 
 	// tasks 是"要在这个循环的 goroutine 上跑"的函数（见 runOnLoop）
 	tasks chan func()
+
+	// waiting 是"循环马上要睡进 Poll"。投递方只有看到它才写唤醒管道，
+	// 连接风暴时能省掉绝大多数 wake write（见 runOnLoop）。
+	waiting atomic.Int32
 
 	parent *MultiEventLoop
 
@@ -95,6 +100,15 @@ func (el *EventLoop) Loop() {
 		//
 		// Free 的停止不靠超时：它往唤醒管道写一个字节（见 wake.go），
 		// epoll fd 立刻可读，park 着的循环马上就醒。
+		// 马上要睡了：置位后**再看一眼队列**，然后才 Poll。投递方在
+		// 这之前入队的任务看到 waiting=0（以为循环还在跑，不写唤醒
+		// 管道），这一眼保证它不会被睡过去；在这之后入队的会看到
+		// waiting=1，自己写管道。见 runOnLoop。
+		el.waiting.Store(1)
+		if len(el.tasks) > 0 {
+			el.waiting.Store(0)
+			continue
+		}
 		_, err := el.Poll(-1, func(fd int, state core.State, err error) {
 			// io.EOF 不是"出错"，是"对端关了"。kqueue 那边尤其要紧：
 			// 对端发 FIN 时它回调的是 cb(fd, WRITE, io.EOF)——状态是
@@ -203,6 +217,7 @@ func (el *EventLoop) Loop() {
 
 			el.processConn(c, state.IsRead(), state.IsWrite())
 		})
+		el.waiting.Store(0)
 		if err != nil {
 			el.parent.err("apiPoll", "err", err.Error())
 			return
@@ -348,8 +363,17 @@ func (el *EventLoop) readAndDispatch(c *Conn) error {
 // 等一下——反正只有"注册"走这条路，不是数据路径。
 func (el *EventLoop) runOnLoop(f func()) {
 	el.tasks <- f
-	// 不叫这一声，任务要等 Poll 超时才轮到（见 wake.go）
-	el.wake()
+	// 循环醒着就不写唤醒管道：它下一轮开头会把队列取走。只有它已经
+	// 置了 waiting（马上/已经睡进 Poll）才需要叫。
+	//
+	// connect 风暴（Connections 档一次 10000 条）里这一步省掉绝大多数
+	// wake write，再叠加 384 个 loop 的分摊，dial/upgrade 的 CPU 明显
+	// 低一截。**不能只看 len(tasks)>0 就省**：循环可能正好在 Store(1)
+	// 之后、Poll 之前，这时必须叫（它自己在 Store 后还会看一眼队列，
+	// 两边合起来不漏唤醒）。
+	if el.waiting.Load() != 0 {
+		el.wake()
+	}
 }
 
 // del 把连接从连接表里摘掉。**用调用方传进来的 fd**，不要从连接上读

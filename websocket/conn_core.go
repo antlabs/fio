@@ -486,9 +486,14 @@ func (c *Conn) processCallback(f frame.Frame2, needCopy bool) (err error) {
 				}
 				// 进入业务协程执行
 				payload := f.Payload
-				// here
+				// **别在闭包里用 f**：逃逸分析按函数做，闭包按引用捕获 f
+				// 会让 f 这个参数在函数入口整个进堆——即使热路径（普通
+				// 单帧消息）根本不走这个分支，也每消息多一次 24 字节
+				// 分配（256B Pipeline 实测 5.6GB alloc_space）。把需要
+				// 的字段先取出来，闭包只捕获值。
+				op := f.Opcode
 				c.addTask(func() bool {
-					return c.processPing(f, payload)
+					return c.processPingOp(op, payload)
 				})
 				return
 			}
@@ -498,9 +503,10 @@ func (c *Conn) processCallback(f frame.Frame2, needCopy bool) (err error) {
 			return
 		}
 
-		// 进入业务协程执行
+		// 同上：闭包只捕获 opcode 的值，不捕获 f。
+		op := f.Opcode
 		c.addTask(func() bool {
-			c.Callback.OnMessage(c, f.Opcode, nil)
+			c.Callback.OnMessage(c, op, nil)
 			return false
 		})
 		return
@@ -510,8 +516,8 @@ func (c *Conn) processCallback(f frame.Frame2, needCopy bool) (err error) {
 	return ErrOpcode
 }
 
-func (c *Conn) processPing(f frame.Frame2, payload *[]byte) bool {
-	c.Callback.OnMessage(c, f.Opcode, *payload)
+func (c *Conn) processPingOp(op Opcode, payload *[]byte) bool {
+	c.Callback.OnMessage(c, op, *payload)
 	bytespool.PutBytes(payload)
 	return false
 }
@@ -684,8 +690,8 @@ func (c *Conn) WriteMessage(op Opcode, writeBuf []byte) (err error) {
 	// 这两件事以前是 frame.WriteFrame 干的（基线里所有快速路径都写着
 	// !c.isClient() && !rsv1，剩下的全走它）。手拼之后漏过两次，所以
 	// 这里一次说清楚。
-	var hdr [14]byte // 10 字节最长帧头 + 4 字节掩码
-	hn := wsHeader(hdr[:], uint8(op), len(writeBuf))
+	hdr := c.writeHdr[:] // 10 字节最长帧头 + 4 字节掩码；持 c.mu 复用，见字段注释
+	hn := wsHeader(hdr, uint8(op), len(writeBuf))
 	if rsv1 {
 		hdr[0] |= 1 << 6
 	}

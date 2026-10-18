@@ -15,6 +15,7 @@ func TestDefaultEventLoopsAdaptive(t *testing.T) {
 	if n == 1 {
 		want = defaultEventLoopsSingleCPU
 	}
+	want = capEventLoopsForFD(want)
 
 	m := NewMultiEventLoopAndStartMust()
 	defer m.Free()

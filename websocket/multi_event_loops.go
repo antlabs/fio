@@ -17,6 +17,7 @@ import (
 	"log/slog"
 	"runtime"
 	"sync"
+	"syscall"
 
 	"github.com/antlabs/fio/engine"
 )
@@ -39,12 +40,15 @@ import (
 
 // 默认事件循环数，见 toEngineOptions。
 //
-// 2 核以上统一 192 个：2/4/8/12 核实测都在 96~384 这个平台期里，
-// 192 是 TPS 和内存的折中。单核上 192 个循环挤一个 P，Pipeline 反而
-// 掉 33%，实测 64 个最好（Echo 也还在高位）。
+// 2 核以上统一 384 个：2/4/8/12 核实测 384 的 Pipeline 比 192 高
+// 4%~23%（12+12、1KB：23.2M vs 18.8M），Echo 基本持平或略高；
+// 每消息的堆分配清掉之后，这个数不再把内存推高（12+12 Pipeline 192
+// 是 40MB、384 是 50MB，仍然低于清分配前的 72MB）。
+//
+// 单核上几百个循环挤一个 P 反而慢，实测 56 个最好（Pipeline 2.49M）。
 const (
-	defaultEventLoops          = 192
-	defaultEventLoopsSingleCPU = 64
+	defaultEventLoops          = 384
+	defaultEventLoopsSingleCPU = 56
 )
 
 // eventWorkersPoolAuto 是 "显式要 worker 池、worker 数按核数算" 的哨兵值。
@@ -136,6 +140,29 @@ func NewMultiEventLoopAndStartMust(opts ...EvOption) *MultiEventLoop {
 	return &MultiEventLoop{MultiEventLoop: el}
 }
 
+// capEventLoopsForFD 按 RLIMIT_NOFILE 给默认事件循环数封顶。
+//
+// 一个 event loop 要 4 个 fd: pulse 的 epoll、pulse waiter 为了 park
+// 在 runtime netpoller 上 dup 的 epoll、唤醒管道的读写两端。默认 384
+// 个 loop 就是 1500+ 个 fd——ulimit 1024 的进程连服务都起不来，而很多
+// 小服务确实用默认 ulimit。这里按 5 个 fd/loop、最多占一半 fd 来封顶，
+// 剩下的留给连接。显式 WithEventLoops 不封顶，调用方自己负责。
+func capEventLoopsForFD(loops int) int {
+	var rl syscall.Rlimit
+	if err := syscall.Getrlimit(syscall.RLIMIT_NOFILE, &rl); err != nil {
+		return loops
+	}
+	const fdsPerLoop = 5
+	if rl.Cur >= uint64(loops)*fdsPerLoop*2 {
+		return loops
+	}
+	budget := int(rl.Cur / (fdsPerLoop * 2))
+	if budget < 1 {
+		budget = 1
+	}
+	return budget
+}
+
 // toEngineOptions 把 websocket 的 EvOption 收一遍, 再翻译成 engine 的选项。
 func toEngineOptions(opts ...EvOption) []engine.Option {
 	var cfg evOptionConfig
@@ -165,6 +192,11 @@ func toEngineOptions(opts ...EvOption) []engine.Option {
 		if n == 1 {
 			loops = defaultEventLoopsSingleCPU
 		}
+		// 每个 loop 要占 4 个 fd（epoll、pulse waiter 的 dup、唤醒管道
+		// 两端）。按 5 个算，最多用一半的 RLIMIT_NOFILE，剩下的留给
+		// 连接；不然默认 1024 fd 的进程光 loop 就 EMFILE 了。
+		// 显式 WithEventLoops 不受这个限制（调用方自己负责）。
+		loops = capEventLoopsForFD(loops)
 	}
 	workers := cfg.eventWorkers
 	switch workers {

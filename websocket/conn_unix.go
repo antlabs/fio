@@ -86,6 +86,15 @@ type Conn struct {
 	// 自己的头（见 readPayload）。
 	bufView              []byte
 	payloadView          []byte
+	// writeHdr 是 WriteMessage 拼帧头用的固定缓冲。
+	//
+	// **不能是局部数组**：它会被交给 engine 的 CorkWrite/Writev，逃逸
+	// 分析证明不了对方不长期持有，于是每消息堆分配一个 14 字节数组
+	// （256B Pipeline 的 pprof：WriteMessage 占 50% 的分配对象数、
+	// 3.7GB alloc_space）。挂在连接上复用，WriteMessage 持 c.mu 串行
+	// 使用；engine 那两条写路径都在返回前把 header 拷走（cork 拷进
+	// 攒包缓冲、Writev 拼到栈上或写缓冲），不会留引用。
+	writeHdr             [14]byte
 	rr                   int                // rbuf 读索引
 	rw                   int                // rbuf 写索引
 	lenAndMaskSize       int                // payload长度和掩码的长度
