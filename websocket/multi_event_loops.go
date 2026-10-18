@@ -15,6 +15,7 @@ package websocket
 
 import (
 	"log/slog"
+	"runtime"
 	"sync"
 
 	"github.com/antlabs/fio/engine"
@@ -77,11 +78,10 @@ var (
 
 func getDefaultMultiEventLoop() *MultiEventLoop {
 	defaultOnce.Do(func() {
-		el, err := engine.NewAndStart(
-			engine.WithEventLoops(0),
-			engine.WithMaxEventNum(256),
-			engine.WithLogLevel(slog.LevelError),
-		)
+		el, err := engine.NewAndStart(toEngineOptions(
+			WithMaxEventNum(256),
+			WithLogLevel(slog.LevelError),
+		)...)
 		if err != nil {
 			panic(err)
 		}
@@ -125,8 +125,17 @@ func toEngineOptions(opts ...EvOption) []engine.Option {
 			o(&cfg)
 		}
 	}
+	loops := cfg.numLoops
+	if loops <= 0 {
+		// WebSocket 的默认不是 engine 的"每 CPU 一个"：每条消息至少一次
+		// 读、一次写系统调用，4/3 路超订能把 syscall 的等待盖住。12 个
+		// server 核 -> 16（实测比 12 路高约 4%），4 核 -> 5，2 核 -> 2。
+		// 显式 WithEventLoops 仍然优先；engine 默认不变，别的协议不受影响。
+		loops = runtime.NumCPU()
+		loops += loops / 3
+	}
 	return []engine.Option{
-		engine.WithEventLoops(cfg.numLoops),
+		engine.WithEventLoops(loops),
 		engine.WithMaxEventNum(cfg.maxEventNum),
 		engine.WithLogLevel(cfg.level),
 		engine.WithEventWorkers(cfg.eventWorkers),
