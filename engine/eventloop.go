@@ -149,7 +149,12 @@ func (el *EventLoop) Loop() {
 			// 连接查找、读、解析、回调、写都在 worker 上做（batch.go）。
 			// 放在 getConn 之前，loop 不碰连接对象。
 			if el.parent.batchPool != nil {
+				c := el.parent.getConn(fd)
+				if c == nil {
+					return
+				}
 				el.batch.tasks = append(el.batch.tasks, batchTask{
+					c:       c,
 					fd:      fd,
 					isRead:  state.IsRead(),
 					isWrite: state.IsWrite(),

@@ -15,6 +15,7 @@ package websocket
 
 import (
 	"log/slog"
+	"os"
 	"runtime"
 	"sync"
 	"syscall"
@@ -58,6 +59,36 @@ const (
 // 批次也小。实测 2+2 核 64 个 loop、12+12 核 384 个 loop 是 Worker 模式的
 // 平衡点（再多 worker 侧排队/调度开销上来）。
 const defaultWorkerLoopsPerCPU = 32
+
+// workerTopology 返回 Worker 模式的默认拓扑。
+//
+// Linux 低核（<=4）用 per-core：一个 event loop 对一个 worker，loop i /
+// worker i 绑同一个 CPU。实测 2+2 核 Echo 346k -> 383k、Pipeline
+// 4.31M -> 4.85M；4+4 核 Echo 660k -> ~750k、Pipeline 8.29M -> ~9.0M。
+// 8 核以上 per-core 反而差（loop/worker 数太多），继续用批量池。
+//
+// per-core 需要 GOMAXPROCS 留足 P：2/4 核用 4×N，调用方没显式设置
+// GOMAXPROCS 时由 toEngineOptions 抬上去（全局副作用，见 CLAUDE.md）。
+func workerTopology(n int) (loops, workers int, perCore bool) {
+	if runtime.GOOS == "linux" && n <= 4 {
+		switch n {
+		case 1:
+			loops, workers = 1, 1
+		case 2:
+			loops, workers = 2, 2
+		case 3:
+			loops, workers = 24, 24
+		default:
+			loops, workers = 32, 32
+		}
+		return loops, workers, true
+	}
+	loops = defaultWorkerLoopsPerCPU * n
+	if loops < defaultWorkerLoopsPerCPU {
+		loops = defaultWorkerLoopsPerCPU
+	}
+	return loops, n, false
+}
 
 type evOptionConfig struct {
 	numLoops    int        // 起多少个 event loop
@@ -176,6 +207,7 @@ func toEngineOptions(opts ...EvOption) []engine.Option {
 	n := runtime.NumCPU()
 	loops := cfg.numLoops
 	workers := -1
+	perCore := false
 	if cfg.inline {
 		// Event 模式（内联）：读/解析/回调/写都在 event loop 上。
 		if loops <= 0 {
@@ -197,19 +229,32 @@ func toEngineOptions(opts ...EvOption) []engine.Option {
 		//
 		// 实测（2+2 核、10k×1KB、C++ 客户端）：这个默认下 Echo 约
 		// 345k、Pipeline 4.3M；4/8/12 核见 lab 报告。
-		if loops <= 0 {
-			loops = defaultWorkerLoopsPerCPU * n
-			if loops < defaultWorkerLoopsPerCPU {
-				loops = defaultWorkerLoopsPerCPU
-			}
+		if cfg.numLoops <= 0 && cfg.eventWorkers <= 0 {
+			loops, workers, perCore = workerTopology(n)
 			loops = capEventLoopsForFD(loops)
-		}
-		workers = cfg.eventWorkers
-		if workers <= 0 {
-			workers = n
-		}
-		if workers < 2 {
-			workers = 2
+			if perCore {
+				// per-core 的 loop/worker 都 LockOSThread 绑核，需要比
+				// goroutine 数少一些的 P；实测 4N 最好。只在默认拓扑下
+				// 抬，显式 WithEventLoops/WithParseGoroutines 不动。
+				if cur := runtime.GOMAXPROCS(0); cur < 4*n {
+					runtime.GOMAXPROCS(4 * n)
+				}
+			}
+		} else {
+			if loops <= 0 {
+				loops = defaultWorkerLoopsPerCPU * n
+				if loops < defaultWorkerLoopsPerCPU {
+					loops = defaultWorkerLoopsPerCPU
+				}
+				loops = capEventLoopsForFD(loops)
+			}
+			workers = cfg.eventWorkers
+			if workers <= 0 {
+				workers = n
+			}
+			if workers < 2 {
+				workers = 2
+			}
 		}
 	}
 	engOpts := []engine.Option{
@@ -222,6 +267,11 @@ func toEngineOptions(opts ...EvOption) []engine.Option {
 		// Worker 模式默认用批量移交（一轮 epoll 事件 = 一个批次），
 		// 见 engine/batch.go；syscall 期间让出 P，别的 worker/loop 才能跑。
 		engOpts = append(engOpts, engine.WithBatchPool(), engine.WithEnterSyscall())
+		// per-core 拓扑（一个 loop 一个 worker，绑同一个 CPU）：
+		// 默认低核拓扑或显式环境开关。
+		if perCore || os.Getenv("FIO_PER_CORE_WORKERS") != "" {
+			engOpts = append(engOpts, engine.WithPerCoreWorkers())
+		}
 	}
 	return engOpts
 }

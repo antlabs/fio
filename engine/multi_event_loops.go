@@ -51,6 +51,8 @@ type MultiEventLoop struct {
 	// batchPool 是批量事件移交的 worker 池（Worker 模式的默认实现），
 	// 见 batch.go。和 pool 二选一。
 	batchPool *batchPool
+	// perCore 是 per-core 拓扑（一个 loop 一个 worker，绑同一个 CPU）。
+	perCore bool
 
 	// reusePort 见 WithReusePort：监听 socket 带不带 SO_REUSEPORT。
 	reusePort bool
@@ -65,6 +67,9 @@ type options struct {
 	eventWorkers int
 	// batchPool 让 eventWorkers > 0 时使用批量移交（batch.go）。
 	batchPool bool
+	// perCore 用 per-core 拓扑：一个 loop 一个 worker，loop i/worker i
+	// 绑同一个 CPU（Linux）。
+	perCore bool
 	// reusePort 让监听 socket 带 SO_REUSEPORT，见 WithReusePort。
 	reusePort bool
 	// enterSyscall 让 Linux 的 socket syscall 走 entersyscall 版本。
@@ -97,6 +102,15 @@ func WithEventWorkers(n int) Option {
 // 见 batch.go。默认 Worker 模式用它。
 func WithBatchPool() Option {
 	return func(o *options) { o.batchPool = true }
+}
+
+// WithPerCoreWorkers 让 Worker 模式用 per-core 拓扑：一个 event loop
+// 对一个 worker，loop i 和 worker i 绑同一个 CPU（Linux sched_setaffinity）。
+//
+// 需要 GOMAXPROCS 留够 P（实测 2 核 8、4 核 16~32），否则锁在同一个
+// CPU 上的 goroutine 抢不到 P。调用方/benchmark 负责设置 GOMAXPROCS。
+func WithPerCoreWorkers() Option {
+	return func(o *options) { o.perCore = true }
 }
 
 // WithEnterSyscall 让 socket syscall 走 entersyscall 版本。
@@ -164,14 +178,22 @@ func New(opts ...Option) (*MultiEventLoop, error) {
 	if workers == 0 {
 		workers = defEventWorkers()
 	}
+	perCore := o.perCore
+	if pinEnabled {
+		perCore = true
+	}
+	if perCore {
+		enablePinning()
+	}
 	m := &MultiEventLoop{
 		numLoops:    o.numLoops,
 		maxEventNum: o.maxEventNum,
 		reusePort:   o.reusePort,
+		perCore:     perCore,
 	}
 	if workers > 0 {
 		if o.batchPool {
-			m.batchPool = newBatchPool(workers)
+			m.batchPool = newBatchPool(workers, perCore)
 		} else {
 			m.pool = newTaskPool(workers)
 		}
@@ -233,9 +255,14 @@ func (m *MultiEventLoop) Start() {
 	if m.batchPool != nil {
 		m.batchPool.start()
 	}
-	for _, el := range m.loops {
+	for i, el := range m.loops {
 		m.loopsWg.Add(1)
-		go el.Loop()
+		go func(idx int, el *EventLoop) {
+			if m.perCore {
+				pinLoop(idx)
+			}
+			el.Loop()
+		}(i, el)
 	}
 }
 
@@ -335,7 +362,7 @@ func (m *MultiEventLoop) Add(fd int, h Handler) (*Conn, error) {
 		// worker。
 		if m.batchPool != nil {
 			b := m.batchPool.getBatch(el)
-			b.tasks = append(b.tasks, batchTask{fd: fd})
+			b.tasks = append(b.tasks, batchTask{c: c, fd: fd})
 			m.batchPool.workerForLoop(el.index).ch <- b
 			return c, nil
 		}

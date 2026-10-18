@@ -11,10 +11,7 @@ import (
 // 显式 WithEventLoops 仍然优先。
 func TestDefaultEventLoopsAdaptive(t *testing.T) {
 	n := runtime.NumCPU()
-	want := defaultWorkerLoopsPerCPU * n
-	if want < defaultWorkerLoopsPerCPU {
-		want = defaultWorkerLoopsPerCPU
-	}
+	want, _, _ := workerTopology(n)
 	want = capEventLoopsForFD(want)
 
 	m := NewMultiEventLoopAndStartMust()

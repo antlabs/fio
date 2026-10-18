@@ -44,6 +44,7 @@ import (
 // batchTask 是批次里的一个事件。只记 fd 和状态，不碰连接对象——连接对象
 // 的查找和协议状态都留给 worker，event loop 保持只做 epoll/分发。
 type batchTask struct {
+	c       *Conn
 	fd      int
 	isRead  bool
 	isWrite bool
@@ -57,32 +58,43 @@ type taskBatch struct {
 }
 
 type batchWorker struct {
+	id   int
 	ch   chan *taskBatch
 	done chan struct{}
 	p    *batchPool
 }
 
 type batchPool struct {
-	workers []*batchWorker
-	free    sync.Pool
+	workers  []*batchWorker
+	perShard int
+	perCore  bool
+	free     sync.Pool
 }
 
-func newBatchPool(n int) *batchPool {
+func newBatchPool(n int, perCore bool) *batchPool {
 	// n 是目标 worker 总数；每个 shard 上常驻 batchWorkersPerShard 个，
 	// 所以 shard 数 = n/2。n=2 -> 1 个 shard、2 个 worker；n=12 -> 6 个
 	// shard、12 个 worker。2 核时所有批次进一个 shard，两个 worker 抢着
 	// 处理，避免某些 shard 空闲、某些排队。
-	shards := n / batchWorkersPerShard
+	perShard := batchWorkersPerShard
+	shards := n / perShard
 	if shards < 1 {
 		shards = 1
 	}
-	p := &batchPool{}
+	if perCore {
+		// per-core：一个 shard 一个 worker，loop i 的批次固定到
+		// worker i；两边绑同一个 CPU。
+		perShard = 1
+		shards = n
+	}
+	p := &batchPool{perShard: perShard, perCore: perCore}
 	p.free.New = func() any {
 		return &taskBatch{tasks: make([]batchTask, 0, 64)}
 	}
 	p.workers = make([]*batchWorker, shards)
 	for i := range p.workers {
 		p.workers[i] = &batchWorker{
+			id:   i,
 			ch:   make(chan *taskBatch, 1024),
 			done: make(chan struct{}),
 			p:    p,
@@ -100,8 +112,13 @@ const batchWorkersPerShard = 2
 
 func (p *batchPool) start() {
 	for _, w := range p.workers {
-		for i := 0; i < batchWorkersPerShard; i++ {
-			go w.run()
+		for i := 0; i < p.perShard; i++ {
+			go func(w *batchWorker) {
+				if p.perCore {
+					pinLoop(w.id)
+				}
+				w.run()
+			}(w)
 		}
 	}
 }
@@ -148,7 +165,10 @@ func (w *batchWorker) run() {
 // processOne 和旧 taskNode.processOne 的语义一致：OnOpen/读/解析/回调/写
 // 都在 worker 上执行，busy/pending 位保证同一条连接不会被并发处理。
 func (w *batchWorker) processOne(el *EventLoop, t batchTask) {
-	c := el.parent.getConn(t.fd)
+	c := t.c
+	if c == nil {
+		c = el.parent.getConn(t.fd)
+	}
 	if c == nil {
 		return
 	}
