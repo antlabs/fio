@@ -125,19 +125,39 @@ func toEngineOptions(opts ...EvOption) []engine.Option {
 			o(&cfg)
 		}
 	}
+	n := runtime.NumCPU()
 	loops := cfg.numLoops
 	if loops <= 0 {
-		// WebSocket 的默认不是 engine 的"每 CPU 一个"：每条消息至少一次
-		// 读、一次写系统调用，4/3 路超订能把 syscall 的等待盖住。12 个
-		// server 核 -> 16（实测比 12 路高约 4%），4 核 -> 5，2 核 -> 2。
-		// 显式 WithEventLoops 仍然优先；engine 默认不变，别的协议不受影响。
-		loops = runtime.NumCPU()
-		loops += loops / 3
+		// WebSocket 的默认不是 engine 的"每 CPU 一个"：大核数下 4/3 路
+		// 超订能把 syscall 的等待盖住（12 核 -> 16，实测比 12 路高约 4%）；
+		// 低核数下 event loop 只做 poll/投递，2 个就够，多出来的会抢
+		// worker 的核（4 核实测：2 loops 比 5 loops 高约 2%）。
+		if n <= 4 {
+			loops = 2
+		} else {
+			loops = n + n/3
+		}
 	}
-	return []engine.Option{
+	workers := cfg.eventWorkers
+	if workers == 0 {
+		// 任务池的 worker 数是 Echo 在低核数上的主要瓶颈：默认 5/3
+		// （4 核 6 个）时 worker 队列经常满，4 核 Echo 0.51M；24 个
+		// worker 时 0.65M，且 profile 里 taskRing/scheduler 的尖峰消失。
+		// 大核数下 24 不低于原来的 5/3（12 核 20 -> 24），先统一取下限。
+		workers = n * 5 / 3
+		if workers < 24 {
+			workers = 24
+		}
+	}
+	engOpts := []engine.Option{
 		engine.WithEventLoops(loops),
 		engine.WithMaxEventNum(cfg.maxEventNum),
 		engine.WithLogLevel(cfg.level),
-		engine.WithEventWorkers(cfg.eventWorkers),
+		engine.WithEventWorkers(workers),
 	}
+	if workers > 0 {
+		// worker 池模式：syscall 期间让出 P，别的 worker/event loop 才能跑。
+		engOpts = append(engOpts, engine.WithEnterSyscall())
+	}
+	return engOpts
 }

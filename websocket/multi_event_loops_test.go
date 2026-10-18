@@ -10,8 +10,11 @@ import (
 // 默认事件循环是 4/3 个 CPU（WebSocket 的 syscall 等待要靠轻微超订盖住），
 // 不是 engine 的"每 CPU 一个"。显式 WithEventLoops 仍然优先。
 func TestDefaultEventLoopsAdaptive(t *testing.T) {
-	want := runtime.NumCPU()
-	want += want / 3
+	n := runtime.NumCPU()
+	want := 2
+	if n > 4 {
+		want = n + n/3
+	}
 
 	m := NewMultiEventLoopAndStartMust()
 	defer m.Free()

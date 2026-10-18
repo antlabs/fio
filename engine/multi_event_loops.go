@@ -61,6 +61,8 @@ type options struct {
 	eventWorkers int
 	// reusePort 让监听 socket 带 SO_REUSEPORT，见 WithReusePort。
 	reusePort bool
+	// enterSyscall 让 Linux 的 socket syscall 走 entersyscall 版本。
+	enterSyscall bool
 }
 
 // Option 配 MultiEventLoop。
@@ -83,6 +85,15 @@ func WithEventLoops(n int) Option {
 // 这两件事都松开。
 func WithEventWorkers(n int) Option {
 	return func(o *options) { o.eventWorkers = n }
+}
+
+// WithEnterSyscall 让 socket syscall 走 entersyscall 版本。
+//
+// worker 池模式下多个 goroutine 挤在少量 P 上，RawSyscall 在 syscall 期间
+// 不通知 runtime，别的 worker/event loop 只能等；Syscall6 会把 P 让出去。
+// inline 模式用 Raw 更省。默认由 websocket 层按模式设置。
+func WithEnterSyscall() Option {
+	return func(o *options) { o.enterSyscall = true }
 }
 
 // WithMaxEventNum 一次 epoll_wait 最多拿多少事件。
@@ -131,6 +142,9 @@ func New(opts ...Option) (*MultiEventLoop, error) {
 	}
 	if o.maxEventNum <= 0 {
 		o.maxEventNum = defMaxEventNum
+	}
+	if o.enterSyscall {
+		setEnterSyscall(true)
 	}
 
 	// worker 数：没指定(0)用默认，负数表示关掉（事件就地处理）。

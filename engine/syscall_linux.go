@@ -50,9 +50,17 @@ func socketRead(fd int, p []byte) (int, error) {
 		return 0, nil
 	}
 	// recvfrom(fd, buf, len, flags=0, src_addr=NULL, addrlen=NULL)
-	n, _, errno := unix.RawSyscall6(unix.SYS_RECVFROM,
-		uintptr(fd), uintptr(unsafe.Pointer(&p[0])), uintptr(len(p)),
-		0, 0, 0)
+	var n uintptr
+	var errno unix.Errno
+	if enterSyscall.Load() {
+		n, _, errno = unix.Syscall6(unix.SYS_RECVFROM,
+			uintptr(fd), uintptr(unsafe.Pointer(&p[0])), uintptr(len(p)),
+			0, 0, 0)
+	} else {
+		n, _, errno = unix.RawSyscall6(unix.SYS_RECVFROM,
+			uintptr(fd), uintptr(unsafe.Pointer(&p[0])), uintptr(len(p)),
+			0, 0, 0)
+	}
 	if errno == unix.ENOTSOCK {
 		// 不是 socket, 退回 VFS
 		return rawRead(fd, p)
@@ -79,9 +87,17 @@ func socketWrite(fd int, p []byte) (int, error) {
 	// MSG_NOSIGNAL: 对端已经 reset 的连接, 写会返回 EPIPE 而不是抛
 	// SIGPIPE。不带这个标志时内核要生成并投递那个信号(Go runtime 还得
 	// 接住它), 在长连接被对端关掉的场景里是实打实的开销。
-	n, _, errno := unix.RawSyscall6(unix.SYS_SENDTO,
-		uintptr(fd), uintptr(unsafe.Pointer(&p[0])), uintptr(len(p)),
-		unix.MSG_NOSIGNAL, 0, 0)
+	var n uintptr
+	var errno unix.Errno
+	if enterSyscall.Load() {
+		n, _, errno = unix.Syscall6(unix.SYS_SENDTO,
+			uintptr(fd), uintptr(unsafe.Pointer(&p[0])), uintptr(len(p)),
+			unix.MSG_NOSIGNAL, 0, 0)
+	} else {
+		n, _, errno = unix.RawSyscall6(unix.SYS_SENDTO,
+			uintptr(fd), uintptr(unsafe.Pointer(&p[0])), uintptr(len(p)),
+			unix.MSG_NOSIGNAL, 0, 0)
+	}
 	if errno == unix.ENOTSOCK {
 		// 不是 socket, 退回 VFS
 		return rawWrite(fd, p)
@@ -146,8 +162,15 @@ func writevIovec(fd int, iov *unix.Iovec, count int) (int, error) {
 	msg := unix.Msghdr{Iov: iov}
 	msg.SetIovlen(count)
 
-	n, _, errno := unix.RawSyscall6(unix.SYS_SENDMSG,
-		uintptr(fd), uintptr(unsafe.Pointer(&msg)), unix.MSG_NOSIGNAL, 0, 0, 0)
+	var n uintptr
+	var errno unix.Errno
+	if enterSyscall.Load() {
+		n, _, errno = unix.Syscall6(unix.SYS_SENDMSG,
+			uintptr(fd), uintptr(unsafe.Pointer(&msg)), unix.MSG_NOSIGNAL, 0, 0, 0)
+	} else {
+		n, _, errno = unix.RawSyscall6(unix.SYS_SENDMSG,
+			uintptr(fd), uintptr(unsafe.Pointer(&msg)), unix.MSG_NOSIGNAL, 0, 0, 0)
+	}
 	if errno == unix.ENOTSOCK {
 		// 不是 socket 的 fd 退回 VFS(sendmsg 对它也是 ENOTSOCK)。把
 		// iovec 描述的各段拼成一块再写。
