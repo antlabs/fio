@@ -17,7 +17,25 @@ package engine
 import (
 	"io"
 	"sync"
+	"sync/atomic"
+	"time"
 )
+
+// batchTaskLimit 是一批最多装多少事件。
+//
+// 不只是省内存：业务回调慢时，event loop 要能**继续提交后面的批次**，
+// 动态扩容才有东西可扩。如果一轮 epoll 的 100 个事件装成一批交给一个
+// worker，worker 在第一个慢回调里睡 50ms，队列是空的、event loop 也没
+// 有新事件可提交，扩容永远触发不了（实测 100 条 50ms 回调串行 2.57s）。
+// 批小一点，慢回调占住一个 worker 时，后面的批次已经在队列里，扩容
+// worker 可以并行处理。
+const batchTaskLimit = 64
+
+// slowTaskThreshold / slowSplitChunk：worker 处理一个任务超过 10ms 就
+// 认为业务回调慢，把这一批里**还没处理**的任务拆成小批重新入队，
+// 让动态扩容的 worker 并行处理；慢任务本身不可抢占，但后面的任务
+// 不用陪它排队。
+const slowSplitChunk = 8
 
 // 批量事件移交（Worker 模式的默认实现）。
 //
@@ -57,18 +75,38 @@ type taskBatch struct {
 	tasks []batchTask
 }
 
+// workerState 是每个 worker goroutine 的进度状态，watchdog 用它检测
+// "某个 worker 卡在慢回调里"。
+type workerState struct {
+	busy     atomic.Int32
+	seq      atomic.Int64
+	slowFlag atomic.Int32
+	last     int64 // watchdog 专用
+	stall    int32 // 连续多少个 1ms tick 没有任务进展
+}
+
 type batchWorker struct {
 	id   int
 	ch   chan *taskBatch
 	done chan struct{}
 	p    *batchPool
+
+	// running 是这个 shard 当前的 worker goroutine 数（base + 扩容）。
+	running atomic.Int32
+	max     int32
+
+	mu     sync.Mutex
+	states []*workerState
 }
 
 type batchPool struct {
-	workers  []*batchWorker
-	perShard int
-	perCore  bool
-	free     sync.Pool
+	workers     []*batchWorker
+	perShard    int
+	perCore     bool
+	maxPerShard int32
+	stallTicks  int32
+	tickerDone  chan struct{}
+	free        sync.Pool
 }
 
 func newBatchPool(n int, perCore bool) *batchPool {
@@ -87,9 +125,20 @@ func newBatchPool(n int, perCore bool) *batchPool {
 		perShard = 1
 		shards = n
 	}
-	p := &batchPool{perShard: perShard, perCore: perCore}
+	perShardMax := int32(256)
+	// 慢回调判定：per-core 的 loop/worker 绑核，调度抖动小，10ms；
+	// 批量池在 8/12 核上 384 个 loop 会抢 CPU，worker 被调走 >10ms
+	// 很常见，10ms 会误扩容（12 核 Echo 1.9M -> 0.36M），用 100ms。
+	stallTicks := int32(100)
+	if perCore {
+		// per-core 的 shard 多（每个 loop 一个），每个 shard 最多再扩
+		// 16 个；慢业务时扩容 worker 不绑核，能跑别的 CPU。
+		perShardMax = 16
+		stallTicks = 10
+	}
+	p := &batchPool{perShard: perShard, perCore: perCore, maxPerShard: perShardMax, stallTicks: stallTicks, tickerDone: make(chan struct{})}
 	p.free.New = func() any {
-		return &taskBatch{tasks: make([]batchTask, 0, 64)}
+		return &taskBatch{tasks: make([]batchTask, 0, batchTaskLimit)}
 	}
 	p.workers = make([]*batchWorker, shards)
 	for i := range p.workers {
@@ -98,6 +147,7 @@ func newBatchPool(n int, perCore bool) *batchPool {
 			ch:   make(chan *taskBatch, 1024),
 			done: make(chan struct{}),
 			p:    p,
+			max:  perShardMax,
 		}
 	}
 	return p
@@ -113,17 +163,112 @@ const batchWorkersPerShard = 2
 func (p *batchPool) start() {
 	for _, w := range p.workers {
 		for i := 0; i < p.perShard; i++ {
-			go func(w *batchWorker) {
-				if p.perCore {
+			// 只有 per-core 拓扑才把 base worker 绑核；批量池（8/12 核）
+			// 的 worker 不能绑，否则 12 个 worker 被钉在 6 个 CPU 上，
+			// Echo 会从 1.87M 掉到 0.34M。
+			w.spawn(p.perCore, true)
+		}
+	}
+	go p.watch()
+}
+
+// spawn 加一个 worker。pin 只给 base worker（per-core 绑核）；扩容出来的
+// worker 不绑核，业务慢时才能跑到别的 CPU 上，不被慢回调所在核困住。
+func (w *batchWorker) spawn(pin, base bool) {
+	for {
+		n := w.running.Load()
+		if n >= w.max {
+			return
+		}
+		if w.running.CompareAndSwap(n, n+1) {
+			st := &workerState{}
+			w.mu.Lock()
+			w.states = append(w.states, st)
+			w.mu.Unlock()
+			go func() {
+				if pin {
 					pinLoop(w.id)
 				}
-				w.run()
-			}(w)
+				w.run(st, base)
+			}()
+			return
 		}
 	}
 }
 
+func (w *batchWorker) unregister(st *workerState) {
+	w.mu.Lock()
+	for i, v := range w.states {
+		if v == st {
+			w.states[i] = w.states[len(w.states)-1]
+			w.states = w.states[:len(w.states)-1]
+			break
+		}
+	}
+	w.mu.Unlock()
+}
+
+// watch 每 1ms 看一次每个 worker 的任务进度：worker 在处理批次，但 seq
+// 1ms 没动，说明某条业务回调卡住了；置 slowFlag、必要时加不绑核 worker。
+//
+// 不能按"整批处理时长"或"队列长度"判断慢：正常快业务一批 512 条在
+// 2 核上也可能 >10ms，按批次时长会误扩容，把 per-core 的 cache 打掉
+// （Echo 382k -> 133k）。这里看的是"单条任务是否有进展"。
+func (p *batchPool) watch() {
+	t := time.NewTicker(time.Millisecond)
+	defer t.Stop()
+	for {
+		select {
+		case <-p.tickerDone:
+			return
+		case <-t.C:
+			for _, w := range p.workers {
+				w.mu.Lock()
+				sts := make([]*workerState, len(w.states))
+				copy(sts, w.states)
+				w.mu.Unlock()
+				for _, st := range sts {
+					if st.busy.Load() == 0 {
+						st.last = st.seq.Load()
+						st.stall = 0
+						continue
+					}
+					seq := st.seq.Load()
+					if seq == st.last {
+						// 1ms 太敏感：2 核上 loop/worker 抢 P，worker
+						// 被调走 1~2ms 很常见，会误判成慢回调、把
+						// per-core 的 cache 打掉（Echo 382k -> 131k）。
+						// 连续 stallTicks 个 tick 没进展才算慢。
+						st.stall++
+						if st.stall >= p.stallTicks {
+							st.slowFlag.Store(1)
+							if len(w.ch) > 0 && w.running.Load() < w.max {
+								w.spawn(false, false)
+							}
+						}
+					} else {
+						st.stall = 0
+						st.last = seq
+					}
+				}
+			}
+		}
+	}
+}
+
+// submit 把一批交给这个 shard。**不能阻塞 event loop**：channel 满时
+// 起一个临时 goroutine 处理这一批（fnet 的池子也是这个兜底），
+// 业务再慢也不会把事件循环卡住。
+func (w *batchWorker) submit(b *taskBatch) {
+	select {
+	case w.ch <- b:
+	default:
+		go w.processBatch(&workerState{}, b)
+	}
+}
+
 func (p *batchPool) stop() {
+	close(p.tickerDone)
 	for _, w := range p.workers {
 		close(w.done)
 	}
@@ -142,23 +287,80 @@ func (p *batchPool) getBatch(el *EventLoop) *taskBatch {
 }
 
 func (p *batchPool) putBatch(b *taskBatch) {
+	// 清掉 *Conn，避免池里的 backing array 把已经关掉的连接留住。
+	clear(b.tasks)
 	b.el = nil
 	b.tasks = b.tasks[:0]
 	p.free.Put(b)
 }
 
-func (w *batchWorker) run() {
+func (w *batchWorker) run(st *workerState, base bool) {
 	for {
 		select {
 		case b := <-w.ch:
-			el := b.el
-			for i := range b.tasks {
-				w.processOne(el, b.tasks[i])
+			st.busy.Add(1)
+			w.processBatch(st, b)
+			st.busy.Add(-1)
+			// 扩容 worker 空闲就退休；base worker 常驻。正常快业务没有
+			// 扩容，退休不会发生在热路径上。退休前再看一眼队列，防止
+			// 正好有批次进来没人接（有的话补一个）。
+			if !base && len(w.ch) == 0 {
+				w.running.Add(-1)
+				w.unregister(st)
+				if len(w.ch) > 0 {
+					w.spawn(false, false)
+				}
+				return
 			}
-			w.p.putBatch(b)
 		case <-w.done:
 			return
 		}
+	}
+}
+
+func (w *batchWorker) processBatch(st *workerState, b *taskBatch) {
+	el := b.el
+	const checkEvery = 16
+	check := 0
+	for i := range b.tasks {
+		st.seq.Add(1)
+		w.processOne(el, b.tasks[i])
+		// 每 16 条查一次慢标志，不要每条都 Swap：Pipeline 每条消息
+		// 一次 atomic RMW，12 核上会掉 10%+。慢任务本身不可抢占，
+		// 最多多跑 15 条快任务就发现并 offload。
+		check++
+		if check >= checkEvery {
+			check = 0
+			if st.slowFlag.Load() != 0 {
+				st.slowFlag.Store(0)
+				if i+1 < len(b.tasks) {
+					w.offload(el, b.tasks[i+1:])
+				}
+				w.p.putBatch(b)
+				return
+			}
+		}
+	}
+	// 短批次里也可能有慢任务：标志留着会污染下一批，清掉。
+	if st.slowFlag.Load() != 0 {
+		st.slowFlag.Store(0)
+	}
+	w.p.putBatch(b)
+}
+
+func (w *batchWorker) offload(el *EventLoop, tasks []batchTask) {
+	for len(tasks) > 0 {
+		n := slowSplitChunk
+		if n > len(tasks) {
+			n = len(tasks)
+		}
+		nb := w.p.getBatch(el)
+		nb.tasks = append(nb.tasks, tasks[:n]...)
+		w.submit(nb)
+		if w.running.Load() < w.max {
+			w.spawn(false, false)
+		}
+		tasks = tasks[n:]
 	}
 }
 

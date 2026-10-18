@@ -52,13 +52,11 @@ const (
 	defaultEventLoopsSingleCPU = 56
 )
 
-// Worker 模式的默认 loop 数：每核 32 个 poller。
-//
-// Worker 模式的 event loop 只 poll + 攒批，读/解析/回包在 batch worker 上。
-// loop 仍然按 fd 分片，每个 loop 的连接集合小，它 poll 时碰的 socket 少；
-// 批次也小。实测 2+2 核 64 个 loop、12+12 核 384 个 loop 是 Worker 模式的
-// 平衡点（再多 worker 侧排队/调度开销上来）。
-const defaultWorkerLoopsPerCPU = 32
+// Worker 模式的默认 loop 数：8 核以上封顶 192 个（8 核 192、12 核以上
+// 192）。loop 只 poll + 攒批，读/解析/回包在 worker；192 个 loop 时每个
+// loop 的连接集合已经够小，再往上 TPS 在 1~2% 内，但 fd/事件数组/栈和
+// 内存会线性涨。per-core 低核拓扑不受影响。
+const defaultWorkerMaxLoops = 192
 
 // workerTopology 返回 Worker 模式的默认拓扑。
 //
@@ -83,9 +81,12 @@ func workerTopology(n int) (loops, workers int, perCore bool) {
 		}
 		return loops, workers, true
 	}
-	loops = defaultWorkerLoopsPerCPU * n
-	if loops < defaultWorkerLoopsPerCPU {
-		loops = defaultWorkerLoopsPerCPU
+	loops = 32 * n
+	if loops > defaultWorkerMaxLoops {
+		loops = defaultWorkerMaxLoops
+	}
+	if loops < 32 {
+		loops = 32
 	}
 	return loops, n, false
 }
@@ -242,9 +243,12 @@ func toEngineOptions(opts ...EvOption) []engine.Option {
 			}
 		} else {
 			if loops <= 0 {
-				loops = defaultWorkerLoopsPerCPU * n
-				if loops < defaultWorkerLoopsPerCPU {
-					loops = defaultWorkerLoopsPerCPU
+				loops = 32 * n
+				if loops > defaultWorkerMaxLoops {
+					loops = defaultWorkerMaxLoops
+				}
+				if loops < 32 {
+					loops = 32
 				}
 				loops = capEventLoopsForFD(loops)
 			}

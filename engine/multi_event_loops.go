@@ -363,7 +363,7 @@ func (m *MultiEventLoop) Add(fd int, h Handler) (*Conn, error) {
 		if m.batchPool != nil {
 			b := m.batchPool.getBatch(el)
 			b.tasks = append(b.tasks, batchTask{c: c, fd: fd})
-			m.batchPool.workerForLoop(el.index).ch <- b
+			m.batchPool.workerForLoop(el.index).submit(b)
 			return c, nil
 		}
 		if m.pool != nil {

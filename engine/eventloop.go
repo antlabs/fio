@@ -160,6 +160,9 @@ func (el *EventLoop) Loop() {
 					isWrite: state.IsWrite(),
 					eof:     eof,
 				})
+				if len(el.batch.tasks) >= batchTaskLimit {
+					el.flushBatch()
+				}
 				return
 			}
 
@@ -254,15 +257,7 @@ func (el *EventLoop) Loop() {
 		// 连接集合小，worker 处理一批时 cache 友好；唤醒从每消息一次
 		// 降到每批一次。
 		if el.parent.batchPool != nil {
-			b := el.batch
-			el.batch = nil
-			if b != nil {
-				if len(b.tasks) != 0 {
-					el.parent.batchPool.workerForLoop(el.index).ch <- b
-				} else {
-					el.parent.batchPool.putBatch(b)
-				}
-			}
+			el.flushBatch()
 		}
 
 		if err != nil {
@@ -270,6 +265,21 @@ func (el *EventLoop) Loop() {
 			return
 		}
 	}
+}
+
+// flushBatch 把当前批次交给 loop 对应的 worker，并换一个新的空批次。
+func (el *EventLoop) flushBatch() {
+	b := el.batch
+	if b == nil {
+		return
+	}
+	el.batch = nil
+	if len(b.tasks) != 0 {
+		el.parent.batchPool.workerForLoop(el.index).submit(b)
+	} else {
+		el.parent.batchPool.putBatch(b)
+	}
+	el.batch = el.parent.batchPool.getBatch(el)
 }
 
 // processConn 处理一个连接的一轮：读、喂给协议、写。
