@@ -160,7 +160,7 @@ func (el *EventLoop) Loop() {
 					isWrite: state.IsWrite(),
 					eof:     eof,
 				})
-				if len(el.batch.tasks) >= batchTaskLimit {
+				if len(el.batch.tasks) >= el.parent.batchPool.taskLimit {
 					el.flushBatch()
 				}
 				return

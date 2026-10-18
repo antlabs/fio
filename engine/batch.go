@@ -29,7 +29,13 @@ import (
 // 有新事件可提交，扩容永远触发不了（实测 100 条 50ms 回调串行 2.57s）。
 // 批小一点，慢回调占住一个 worker 时，后面的批次已经在队列里，扩容
 // worker 可以并行处理。
-const batchTaskLimit = 64
+// 批次上限按拓扑分：per-core 的 loop 少、每 loop 连接多，大批次能少
+// 拆几次（Echo/Pipeline 的低核 TPS 敏感）；批量池 8/12 核用 64，内存
+// 更低。慢回调的并行靠 watchdog/offload，不靠把批次切得很小。
+const (
+	batchTaskLimitPerCore = 256
+	batchTaskLimitBatch   = 64
+)
 
 // slowTaskThreshold / slowSplitChunk：worker 处理一个任务超过 10ms 就
 // 认为业务回调慢，把这一批里**还没处理**的任务拆成小批重新入队，
@@ -105,6 +111,7 @@ type batchPool struct {
 	perCore     bool
 	maxPerShard int32
 	stallTicks  int32
+	taskLimit   int
 	tickerDone  chan struct{}
 	free        sync.Pool
 }
@@ -136,9 +143,13 @@ func newBatchPool(n int, perCore bool) *batchPool {
 		perShardMax = 16
 		stallTicks = 10
 	}
-	p := &batchPool{perShard: perShard, perCore: perCore, maxPerShard: perShardMax, stallTicks: stallTicks, tickerDone: make(chan struct{})}
+	taskLimit := batchTaskLimitBatch
+	if perCore {
+		taskLimit = batchTaskLimitPerCore
+	}
+	p := &batchPool{perShard: perShard, perCore: perCore, maxPerShard: perShardMax, stallTicks: stallTicks, taskLimit: taskLimit, tickerDone: make(chan struct{})}
 	p.free.New = func() any {
-		return &taskBatch{tasks: make([]batchTask, 0, batchTaskLimit)}
+		return &taskBatch{tasks: make([]batchTask, 0, p.taskLimit)}
 	}
 	p.workers = make([]*batchWorker, shards)
 	for i := range p.workers {
