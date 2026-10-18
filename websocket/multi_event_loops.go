@@ -38,7 +38,7 @@ import (
 // numLoops/level/maxEventNum。剩下的(业务协程池、解析池、gosched……)engine
 // 现在没有对应的开关, 收在这里但不往下传。
 
-// 默认事件循环数，见 toEngineOptions。
+// Event 模式（内联模式）的默认事件循环数，见 toEngineOptions。
 //
 // 2 核以上统一 384 个：2/4/8/12 核实测 384 的 Pipeline 比 192 高
 // 4%~23%（12+12、1KB：23.2M vs 18.8M），Echo 基本持平或略高；
@@ -51,25 +51,27 @@ const (
 	defaultEventLoopsSingleCPU = 56
 )
 
-// eventWorkersPoolAuto 是 "显式要 worker 池、worker 数按核数算" 的哨兵值。
-// 0 留给了 "没填 = 默认 inline"。
-const eventWorkersPoolAuto = -2
+// Worker 模式的默认 loop 数：每核 32 个 poller。
+//
+// Worker 模式的 event loop 只 poll + 攒批，读/解析/回包在 batch worker 上。
+// loop 仍然按 fd 分片，每个 loop 的连接集合小，它 poll 时碰的 socket 少；
+// 批次也小。实测 2+2 核 64 个 loop、12+12 核 384 个 loop 是 Worker 模式的
+// 平衡点（再多 worker 侧排队/调度开销上来）。
+const defaultWorkerLoopsPerCPU = 32
 
 type evOptionConfig struct {
 	numLoops    int        // 起多少个 event loop
 	level       slog.Level // 日志级别
 	maxEventNum int        // 一次 epoll/kqueue 最多处理多少事件
 
-	// eventWorkers 是解析池（engine 那边叫事件移交: event loop 只分发,
-	// 读/解析/回调交给一组 worker）。
-	//
-	//	0                     默认：就地执行（inline），见下面 toEngineOptions
-	//	eventWorkersPoolAuto  显式要 worker 池，worker 数按核数取
-	//	> 0                   指定 worker 数
-	//	< 0                   就地执行
-	//
-	// 迁移前这几个选项（WithParseInWorkerPool / WithParseGoroutines /
-	// WithParseInEventLoop）配置的就是这条路径，现在接着往下传。
+	// inline = true 是 Event 模式（内联）：读/解析/回调/写都在 event loop
+	// 的 goroutine 上。默认 false 是 Worker 模式：event loop 只 poll/分发，
+	// 读/解析/回调/回包在 batch worker 池里（engine/batch.go）。
+	inline bool
+
+	// eventWorkers 是 Worker 模式的 worker 总数；<=0 表示按核数取默认。
+	// 迁移前的 WithParseInWorkerPool / WithParseGoroutines /
+	// WithParseInEventLoop 仍然映射到这两个字段。
 	eventWorkers int
 
 	// 下面几个只为了"保留 WithXxx 签名且能编译"。
@@ -173,44 +175,41 @@ func toEngineOptions(opts ...EvOption) []engine.Option {
 	}
 	n := runtime.NumCPU()
 	loops := cfg.numLoops
-	if loops <= 0 {
-		// 默认事件循环数：2 核以上 192，单核 64。
-		//
-		// 这个数看着大，但每个循环是独立的 epoll 分片，连接按 fd 取模
-		// 分过去：循环越多，每个循环负责的连接越少，一次醒来要碰的
-		// 连接状态/读缓冲区/socket 越少，越能留在 cache 里。
-		//
-		// 实测（lab，10000 连接 1KB echo，C++ 客户端，server/client 对半）：
-		// 2 核上 2 个循环时每个循环 5000 条连接，LLC-load-miss 59%，
-		// 每消息 5.2µs；192 个循环（每循环约 50 条）时 miss 降到 1%，
-		// 每消息 2.8µs。2/4/8/12 核的 Echo 和 Pipeline 都在 96~384 个
-		// 循环之间接近峰值，192 是这个区间里内存和 TPS 的折中。
-		//
-		// 显式 WithEventLoops 仍然优先；连接数特别大（几十万以上）的
-		// 场景可以按"每个循环几百条连接"自己给一个更大的值。
-		loops = defaultEventLoops
-		if n == 1 {
-			loops = defaultEventLoopsSingleCPU
+	workers := -1
+	if cfg.inline {
+		// Event 模式（内联）：读/解析/回调/写都在 event loop 上。
+		if loops <= 0 {
+			loops = defaultEventLoops
+			if n == 1 {
+				loops = defaultEventLoopsSingleCPU
+			}
+			loops = capEventLoopsForFD(loops)
 		}
-		// 每个 loop 要占 4 个 fd（epoll、pulse waiter 的 dup、唤醒管道
-		// 两端）。按 5 个算，最多用一半的 RLIMIT_NOFILE，剩下的留给
-		// 连接；不然默认 1024 fd 的进程光 loop 就 EMFILE 了。
-		// 显式 WithEventLoops 不受这个限制（调用方自己负责）。
-		loops = capEventLoopsForFD(loops)
-	}
-	workers := cfg.eventWorkers
-	switch workers {
-	case 0:
-		// 默认就地执行：读/解析/回调都在事件循环上，省掉一次跨
-		// goroutine 投递 + 唤醒。worker 池那套在 2 核上实测反而慢
-		// （每消息多 2~3µs 的交接和调度），高核数下也不如多个小循环。
-		workers = -1
-	case eventWorkersPoolAuto:
-		// 显式要 worker 池：沿用迁移前的默认 NumCPU*5/3，下限 24
-		// （低核数下 5/3 的 worker 队列经常满）。
-		workers = n * 5 / 3
-		if workers < 24 {
-			workers = 24
+	} else {
+		// Worker 模式（默认）：event loop 只 poll + 攒批，读/解析/
+		// 回调/回包在 batch worker 池里。
+		//
+		// loop 数按 32/核：2 核 64、12 核 384。loop 还是按 fd 分片，
+		// 每个 loop 的连接少，poll 时碰的 socket 少，一个批次也小。
+		// worker 数默认 = 核数；batch pool 每 shard 2 个 worker、shard
+		// = worker/2：2 核 1 个 shard、2 个 worker；12 核 6 个 shard、
+		// 12 个 worker。
+		//
+		// 实测（2+2 核、10k×1KB、C++ 客户端）：这个默认下 Echo 约
+		// 345k、Pipeline 4.3M；4/8/12 核见 lab 报告。
+		if loops <= 0 {
+			loops = defaultWorkerLoopsPerCPU * n
+			if loops < defaultWorkerLoopsPerCPU {
+				loops = defaultWorkerLoopsPerCPU
+			}
+			loops = capEventLoopsForFD(loops)
+		}
+		workers = cfg.eventWorkers
+		if workers <= 0 {
+			workers = n
+		}
+		if workers < 2 {
+			workers = 2
 		}
 	}
 	engOpts := []engine.Option{
@@ -220,8 +219,9 @@ func toEngineOptions(opts ...EvOption) []engine.Option {
 		engine.WithEventWorkers(workers),
 	}
 	if workers > 0 {
-		// worker 池模式：syscall 期间让出 P，别的 worker/event loop 才能跑。
-		engOpts = append(engOpts, engine.WithEnterSyscall())
+		// Worker 模式默认用批量移交（一轮 epoll 事件 = 一个批次），
+		// 见 engine/batch.go；syscall 期间让出 P，别的 worker/loop 才能跑。
+		engOpts = append(engOpts, engine.WithBatchPool(), engine.WithEnterSyscall())
 	}
 	return engOpts
 }

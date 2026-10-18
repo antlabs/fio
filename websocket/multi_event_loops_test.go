@@ -7,13 +7,13 @@ import (
 	"testing"
 )
 
-// 默认事件循环：2 核以上 192，单核 64（每个循环负责的连接越少，
-// cache 命中越好）。显式 WithEventLoops 仍然优先。
+// 默认是 Worker 模式：每核 32 个 event loop、worker 总数按核数算。
+// 显式 WithEventLoops 仍然优先。
 func TestDefaultEventLoopsAdaptive(t *testing.T) {
 	n := runtime.NumCPU()
-	want := defaultEventLoops
-	if n == 1 {
-		want = defaultEventLoopsSingleCPU
+	want := defaultWorkerLoopsPerCPU * n
+	if want < defaultWorkerLoopsPerCPU {
+		want = defaultWorkerLoopsPerCPU
 	}
 	want = capEventLoopsForFD(want)
 
@@ -21,6 +21,22 @@ func TestDefaultEventLoopsAdaptive(t *testing.T) {
 	defer m.Free()
 	if got := m.NumLoops(); got != want {
 		t.Fatalf("NumLoops() = %d, want %d", got, want)
+	}
+}
+
+// Event 模式（内联）仍然保留，loop 数走 384/56 那套。
+func TestEventModeLoops(t *testing.T) {
+	n := runtime.NumCPU()
+	want := defaultEventLoops
+	if n == 1 {
+		want = defaultEventLoopsSingleCPU
+	}
+	want = capEventLoopsForFD(want)
+
+	m := NewMultiEventLoopAndStartMust(WithEventMode())
+	defer m.Free()
+	if got := m.NumLoops(); got != want {
+		t.Fatalf("EventMode NumLoops() = %d, want %d", got, want)
 	}
 }
 

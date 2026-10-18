@@ -41,6 +41,14 @@ type EventLoop struct {
 	// 连接风暴时能省掉绝大多数 wake write（见 runOnLoop）。
 	waiting atomic.Int32
 
+	// index 是它在 MultiEventLoop.loops 里的下标；批量任务池用
+	// index%workers 把同一个 loop 的批次固定交给一个 worker。
+	index int
+
+	// batch 是当前这一轮 epoll 事件攒的批次（batchPool 模式），
+	// Poll 返回后整批交给 worker，见 batch.go。
+	batch *taskBatch
+
 	parent *MultiEventLoop
 
 	// wakeR/wakeW 是自唤醒管道，见 wake.go
@@ -104,6 +112,11 @@ func (el *EventLoop) Loop() {
 		// 这之前入队的任务看到 waiting=0（以为循环还在跑，不写唤醒
 		// 管道），这一眼保证它不会被睡过去；在这之后入队的会看到
 		// waiting=1，自己写管道。见 runOnLoop。
+		// batchPool 模式：每一轮 Poll 用一个批次装这一轮的事件。
+		// Poll 返回后整批交给 worker，见下面 flush。
+		if el.parent.batchPool != nil && el.batch == nil {
+			el.batch = el.parent.batchPool.getBatch(el)
+		}
 		el.waiting.Store(1)
 		if len(el.tasks) > 0 {
 			el.waiting.Store(0)
@@ -131,6 +144,19 @@ func (el *EventLoop) Loop() {
 			}
 
 			el.addPollEvNum(1)
+
+			// batchPool 模式：event loop 只把 (fd, 状态) 塞进本轮批次，
+			// 连接查找、读、解析、回调、写都在 worker 上做（batch.go）。
+			// 放在 getConn 之前，loop 不碰连接对象。
+			if el.parent.batchPool != nil {
+				el.batch.tasks = append(el.batch.tasks, batchTask{
+					fd:      fd,
+					isRead:  state.IsRead(),
+					isWrite: state.IsWrite(),
+					eof:     eof,
+				})
+				return
+			}
 
 			c := el.parent.getConn(fd)
 			if c == nil {
@@ -218,6 +244,22 @@ func (el *EventLoop) Loop() {
 			el.processConn(c, state.IsRead(), state.IsWrite())
 		})
 		el.waiting.Store(0)
+
+		// 这一轮攒下的批次整批交给 loop 对应的 worker：同一个 loop 的
+		// 连接集合小，worker 处理一批时 cache 友好；唤醒从每消息一次
+		// 降到每批一次。
+		if el.parent.batchPool != nil {
+			b := el.batch
+			el.batch = nil
+			if b != nil {
+				if len(b.tasks) != 0 {
+					el.parent.batchPool.workerForLoop(el.index).ch <- b
+				} else {
+					el.parent.batchPool.putBatch(b)
+				}
+			}
+		}
+
 		if err != nil {
 			el.parent.err("apiPoll", "err", err.Error())
 			return

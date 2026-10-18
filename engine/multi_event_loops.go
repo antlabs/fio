@@ -44,9 +44,13 @@ type MultiEventLoop struct {
 	loopsWg sync.WaitGroup
 	curConn int64
 
-	// pool 是事件移交用的 worker 池（WithEventWorkers 开了才有），
+	// pool 是事件移交用的旧 worker 池（WithEventWorkers 开了才有），
 	// 见 worker.go。
 	pool *taskPool
+
+	// batchPool 是批量事件移交的 worker 池（Worker 模式的默认实现），
+	// 见 batch.go。和 pool 二选一。
+	batchPool *batchPool
 
 	// reusePort 见 WithReusePort：监听 socket 带不带 SO_REUSEPORT。
 	reusePort bool
@@ -59,6 +63,8 @@ type options struct {
 	level       slog.Level
 	// eventWorkers > 0 时开启事件移交（worker 池），见 worker.go。
 	eventWorkers int
+	// batchPool 让 eventWorkers > 0 时使用批量移交（batch.go）。
+	batchPool bool
 	// reusePort 让监听 socket 带 SO_REUSEPORT，见 WithReusePort。
 	reusePort bool
 	// enterSyscall 让 Linux 的 socket syscall 走 entersyscall 版本。
@@ -85,6 +91,12 @@ func WithEventLoops(n int) Option {
 // 这两件事都松开。
 func WithEventWorkers(n int) Option {
 	return func(o *options) { o.eventWorkers = n }
+}
+
+// WithBatchPool 让 Worker 模式按"一轮 epoll 事件 = 一个批次"移交，
+// 见 batch.go。默认 Worker 模式用它。
+func WithBatchPool() Option {
+	return func(o *options) { o.batchPool = true }
 }
 
 // WithEnterSyscall 让 socket syscall 走 entersyscall 版本。
@@ -155,8 +167,14 @@ func New(opts ...Option) (*MultiEventLoop, error) {
 	m := &MultiEventLoop{
 		numLoops:    o.numLoops,
 		maxEventNum: o.maxEventNum,
-		pool:        newTaskPool(workers),
 		reusePort:   o.reusePort,
+	}
+	if workers > 0 {
+		if o.batchPool {
+			m.batchPool = newBatchPool(workers)
+		} else {
+			m.pool = newTaskPool(workers)
+		}
 	}
 	m.log = slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: o.level}))
 	m.conns.Init(core.GetMaxFd())
@@ -165,6 +183,7 @@ func New(opts ...Option) (*MultiEventLoop, error) {
 	for i := range m.loops {
 		el := &EventLoop{
 			parent:      m,
+			index:       i,
 			maxEventNum: o.maxEventNum,
 			log:         m.log,
 			// 注册连接（OnOpen 投递）走这条路，不是数据路径。
@@ -211,6 +230,9 @@ func (m *MultiEventLoop) Start() {
 	if m.pool != nil {
 		m.pool.start()
 	}
+	if m.batchPool != nil {
+		m.batchPool.start()
+	}
 	for _, el := range m.loops {
 		m.loopsWg.Add(1)
 		go el.Loop()
@@ -239,6 +261,9 @@ func (m *MultiEventLoop) Free() {
 	m.loopsWg.Wait()
 	if m.pool != nil {
 		m.pool.stop()
+	}
+	if m.batchPool != nil {
+		m.batchPool.stop()
 	}
 	for _, el := range m.loops {
 		el.PollingApi.Free()
@@ -308,6 +333,12 @@ func (m *MultiEventLoop) Add(fd int, h Handler) (*Conn, error) {
 		// grpc 的 ConnHandler.conn 竞争，http2 表现为大响应违反发送流控、
 		// 真实客户端读到 EOF。fd 固定分片，这里投的和事件去的是同一个
 		// worker。
+		if m.batchPool != nil {
+			b := m.batchPool.getBatch(el)
+			b.tasks = append(b.tasks, batchTask{fd: fd})
+			m.batchPool.workerForLoop(el.index).ch <- b
+			return c, nil
+		}
 		if m.pool != nil {
 			m.pool.nodeFor(fd).push(task{c: c})
 			return c, nil

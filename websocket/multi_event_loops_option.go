@@ -48,22 +48,32 @@ func WithMaxEventNum(num int) EvOption {
 	}
 }
 
-// event loop 只做事件的分发，websocket frame 的读取和解析放到一组
-// goroutine 里面做。
+// 选择 Worker 模式（本项目默认）：event loop 只做等待/唤醒/分发，
+// WebSocket 帧读取、解析、用户回调、回包写出在 worker 池里执行。
 //
-// 现在落到 engine 的事件移交（worker 池）上, 见 engine.WithEventWorkers:
-// event loop 只收事件和投递, 读/解析/回调跑在一组 worker 上, 按 fd 取模
-// 分片。
-//
-// **默认已经改成就地执行（inline）**：10000 连接 1KB echo 实测，worker
-// 池每次事件的交接/唤醒比多个小循环更贵。要回 worker 池用这个显式开。
+// 这是显式写法；不传任何模式选项就是 Worker 模式。
 func WithParseInWorkerPool() EvOption {
-	return func(e *evOptionConfig) { e.eventWorkers = eventWorkersPoolAuto }
+	return func(e *evOptionConfig) {
+		e.inline = false
+		e.eventWorkers = 0
+	}
 }
 
-// 解析 goroutine 的数量。engine 那边是 worker 池的 worker 数。
+// WithWorkerMode 是 WithParseInWorkerPool 的别名，名字更直观。
+func WithWorkerMode() EvOption { return WithParseInWorkerPool() }
+
+// 解析 goroutine 的数量（Worker 模式的 worker 总数）。
+// n <= 0 等价于 WithParseInEventLoop（Event 模式）。
 func WithParseGoroutines(n int) EvOption {
-	return func(e *evOptionConfig) { e.eventWorkers = n }
+	return func(e *evOptionConfig) {
+		if n <= 0 {
+			e.inline = true
+			e.eventWorkers = 0
+			return
+		}
+		e.inline = false
+		e.eventWorkers = n
+	}
 }
 
 // WithParseWorkersPerShard 让每个解析分片起 n 个常驻 worker。
@@ -84,11 +94,19 @@ func WithBusinessGoNum(initCount, min, max int) EvOption {
 	}
 }
 
-// 关掉解析池, 让 event loop 自己读和解析 websocket frame（事件就地处理,
-// 不往 worker 池投）。
+// 选择 Event 模式（内联模式）：读/解析/回调/写都在 event loop 自己的
+// goroutine 上，不经过 worker 池。
+//
+// 低核 Echo 上它比 Worker 模式快（没有跨 goroutine 交接），但不是默认。
 func WithParseInEventLoop() EvOption {
-	return func(e *evOptionConfig) { e.eventWorkers = -1 }
+	return func(e *evOptionConfig) {
+		e.inline = true
+		e.eventWorkers = 0
+	}
 }
+
+// WithEventMode 是 WithParseInEventLoop 的别名（内联/Event 模式）。
+func WithEventMode() EvOption { return WithParseInEventLoop() }
 
 // 投完一批让出 P。engine 现在不给这个开关, 不生效。
 func WithGosched() EvOption {
