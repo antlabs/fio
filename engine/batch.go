@@ -21,6 +21,11 @@ import (
 	"time"
 )
 
+// classifyBytesPerTask 是分类拓扑的阈值：一个 loop 平均每个 read 任务
+// 读到这么多字节，就按 pipeline（一次读多个 frame）走固定 worker。
+// echo 1KB 请求约 1KB/任务，pipeline 15 个 in-flight 约 15KB/任务。
+const classifyBytesPerTask = 4096
+
 // batchTaskLimit 是一批最多装多少事件。
 //
 // 不只是省内存：业务回调慢时，event loop 要能**继续提交后面的批次**，
@@ -110,30 +115,67 @@ type batchWorker struct {
 
 type batchPool struct {
 	workers     []*batchWorker
-	perShard    int
+	perShard    []int
 	perCore     bool
 	maxPerShard int32
 	stallTicks  int32
 	taskLimit   int
 	tickerDone  chan struct{}
 	free        sync.Pool
+
+	// 按负载给 loop 选 worker 组：小读（echo，每任务 ~1KB）走共享队列，
+	// 大读（pipeline，每任务 ~15KB）走固定 worker（loop%fixedShards），
+	// 兼顾 echo 的低延迟和 pipeline 的 cache 亲和。
+	classify     bool
+	sharedShards int
+	fixedShards  int
 }
 
 func newBatchPool(n int, perCore bool) *batchPool {
-	// n 是目标 worker 总数；每个 shard 上常驻 batchWorkersPerShard 个，
+	// n 是目标 worker 总数；默认每个 shard 常驻 batchWorkersPerShard 个，
 	// 所以 shard 数 = n/2。n=2 -> 1 个 shard、2 个 worker；n=12 -> 6 个
 	// shard、12 个 worker。
-	perShard := batchWorkersPerShard
-	shards := n / perShard
-	if shards < 1 {
-		shards = 1
-	}
-	if perCore {
+	// ≤4 核默认按负载分两组：小读（echo）走共享组，大读（pipeline）
+	// 走固定组。5 核以上继续单一共享拓扑（实测 Pipeline 已领先）。
+	classify := !perCore && n <= 4
+	var counts []int
+	sharedShards, fixedShards := 0, 0
+	switch {
+	case perCore:
 		// per-core：一个 shard 一个 worker，loop i 的批次固定到
 		// worker i；两边绑同一个 CPU。
-		perShard = 1
-		shards = n
+		counts = make([]int, n)
+		for i := range counts {
+			counts[i] = 1
+		}
+	case classify:
+		// 共享组：n/2 个 shard ×2 worker（小读、低延迟）；
+		// 固定组：n 个 shard ×1 worker（大读、cache 亲和）。
+		sharedShards = n / 2
+		if sharedShards < 1 {
+			sharedShards = 1
+		}
+		fixedShards = n
+		counts = make([]int, sharedShards+fixedShards)
+		for i := range counts {
+			if i < sharedShards {
+				counts[i] = 2
+			} else {
+				counts[i] = 1
+			}
+		}
+	default:
+		per := batchWorkersPerShard
+		shards := n / per
+		if shards < 1 {
+			shards = 1
+		}
+		counts = make([]int, shards)
+		for i := range counts {
+			counts[i] = per
+		}
 	}
+	shards := len(counts)
 	perShardMax := int32(256)
 	// 慢回调判定：per-core 的 loop/worker 绑核，调度抖动小，10ms；
 	// 批量池在 8/12 核上 384 个 loop 会抢 CPU，worker 被调走 >10ms
@@ -149,27 +191,39 @@ func newBatchPool(n int, perCore bool) *batchPool {
 	if perCore {
 		taskLimit = batchTaskLimitPerCore
 	}
-	p := &batchPool{perShard: perShard, perCore: perCore, maxPerShard: perShardMax, stallTicks: stallTicks, taskLimit: taskLimit, tickerDone: make(chan struct{})}
+	p := &batchPool{perShard: counts, perCore: perCore, classify: classify, sharedShards: sharedShards, fixedShards: fixedShards, maxPerShard: perShardMax, stallTicks: stallTicks, taskLimit: taskLimit, tickerDone: make(chan struct{})}
 	p.free.New = func() any {
 		// 初始只开 16 格，不按上限 64/256 开：echo 一批往往只有 1~3 条，
 		// 按上限开会让队列里每个 batch 都攥着 64×24B 的数组（pprof 里
 		// 3MB 就花在这）。真装不下 append 会自己长。
 		return &taskBatch{tasks: make([]batchTask, 0, 16)}
 	}
-	// 每个 shard 的队列深度：只有 1 个 shard（2 核）时给 1024；多 shard
-	// （4 核以上）给 512。实测 4+4：512 的 Echo 是 1.00M，1024 是 881k
-	// （队列短、延迟低）；但 2+2 只有 1 个 shard、2 个 worker，512 会满、
-	// 退回临时 goroutine，Echo 从 504k 掉到 397k，所以 1 个 shard 时不能
-	// 减半。8+8 也是 512 更好（1.27M vs 1.24M）。
-	chanCap := 1024
-	if shards > 1 {
-		chanCap = 512
-	}
+	// 每个 shard 的队列深度：默认只有 1 个 shard（2 核）时给 1024；多
+	// shard（4 核以上）给 512。实测 4+4：512 的 Echo 是 1.00M，1024 是
+	// 881k（队列短、延迟低）；但 2+2 只有 1 个 shard、2 个 worker，512
+	// 会满、退回临时 goroutine，Echo 从 504k 掉到 397k，所以 1 个 shard
+	// 时不能减半。8+8 也是 512 更好（1.27M vs 1.24M）。
+	// 分类拓扑：共享组沿用上面的规则；固定组是 1 worker/shard，用 1024。
 	p.workers = make([]*batchWorker, shards)
 	for i := range p.workers {
+		capN := 1024
+		if shards > 1 {
+			capN = 512
+		}
+		if classify {
+			if i < sharedShards {
+				if sharedShards == 1 {
+					capN = 1024
+				} else {
+					capN = 512
+				}
+			} else {
+				capN = 1024
+			}
+		}
 		p.workers[i] = &batchWorker{
 			id:   i,
-			ch:   make(chan *taskBatch, chanCap),
+			ch:   make(chan *taskBatch, capN),
 			done: make(chan struct{}),
 			p:    p,
 			max:  perShardMax,
@@ -186,8 +240,8 @@ func newBatchPool(n int, perCore bool) *batchPool {
 const batchWorkersPerShard = 2
 
 func (p *batchPool) start() {
-	for _, w := range p.workers {
-		for i := 0; i < p.perShard; i++ {
+	for i, w := range p.workers {
+		for j := 0; j < p.perShard[i]; j++ {
 			// 只有 per-core 拓扑把 base worker 绑核；默认批量池（8/12
 			// 核）不能绑，否则 12 个 worker 被钉在 6 个 CPU 上，Echo
 			// 会从 1.87M 掉到 0.34M。
@@ -299,8 +353,26 @@ func (p *batchPool) stop() {
 	}
 }
 
-// workerForLoop 让一个 loop 的所有批次固定落到一个 shard 上。
-func (p *batchPool) workerForLoop(loop int) *batchWorker {
+// pipelineLoop 判断这个 loop 是不是一次读多个 frame 的 pipeline 负载：
+// 平均每个 read 任务读到的字节数 >= classifyBytesPerTask。样本不足 8 个
+// 任务时先按 echo（共享组）走，避免启动时误判。
+func (p *batchPool) pipelineLoop(el *EventLoop) bool {
+	if !p.classify {
+		return false
+	}
+	n := el.readStatTasks.Load()
+	return n >= 8 && el.readStatBytes.Load()/n >= classifyBytesPerTask
+}
+
+// workerForClass 选这个 loop 这一批交给哪个 shard。
+// 分类拓扑里大读 loop 走固定组，其余走共享组；默认拓扑按 loop 固定映射。
+func (p *batchPool) workerForClass(loop int, pipeline bool) *batchWorker {
+	if p.classify {
+		if pipeline {
+			return p.workers[p.sharedShards+loop%p.fixedShards]
+		}
+		return p.workers[loop%p.sharedShards]
+	}
 	return p.workers[loop%len(p.workers)]
 }
 
@@ -416,7 +488,13 @@ func (w *batchWorker) processOne(el *EventLoop, t batchTask) {
 		if c.IsClosed() {
 			return
 		}
+		if w.p.classify {
+			c.readBytes.Store(0)
+		}
 		_ = el.readAndDispatch(c)
+		if w.p.classify {
+			el.recordRead(c)
+		}
 		c.closeWith(io.EOF)
 		return
 	}
@@ -424,10 +502,22 @@ func (w *batchWorker) processOne(el *EventLoop, t batchTask) {
 	if !c.tryBusy() {
 		// 记下事件后重抢一次；抢到说明原处理者已经放掉，归我们跑。
 		if c.markPendingAndRetry(t.isRead, t.isWrite) {
+			if w.p.classify {
+				c.readBytes.Store(0)
+			}
 			el.processConn(c, false, false)
+			if w.p.classify {
+				el.recordRead(c)
+			}
 		}
 		return
 	}
 	// processConn 自己管理 busy，跑完负责 unbusy。
+	if w.p.classify {
+		c.readBytes.Store(0)
+	}
 	el.processConn(c, t.isRead, t.isWrite)
+	if w.p.classify {
+		el.recordRead(c)
+	}
 }

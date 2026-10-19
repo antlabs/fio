@@ -60,6 +60,12 @@ type EventLoop struct {
 	// stats 是这个循环自己的诊断计数（每个 loop 一份，见 stats.go）。
 	stats stats
 
+	// readStatBytes/readStatTasks 是按负载分类用的累计读量/任务数。
+	// batch worker 处理完读写，event loop 在 flushBatch 里读它们决定
+	// 这一批走共享组还是固定组。
+	readStatBytes atomic.Int64
+	readStatTasks atomic.Int64
+
 	log *slog.Logger
 }
 
@@ -274,11 +280,19 @@ func (el *EventLoop) flushBatch() {
 	el.batch = nil
 	p := el.parent.batchPool
 	if len(b.tasks) != 0 {
-		p.workerForLoop(el.index).submit(b)
+		p.workerForClass(el.index, p.pipelineLoop(el)).submit(b)
 	} else {
 		p.putBatch(b)
 	}
 	el.batch = p.getBatch(el)
+}
+
+// recordRead 把一次 read 任务的字节数记到 loop 的分类计数上。
+func (el *EventLoop) recordRead(c *Conn) {
+	if n := c.readBytes.Load(); n > 0 {
+		el.readStatBytes.Add(n)
+		el.readStatTasks.Add(1)
+	}
 }
 
 // processConn 处理一个连接的一轮：读、喂给协议、写。
@@ -369,9 +383,16 @@ func (el *EventLoop) processConn(c *Conn, isRead, isWrite bool) {
 func (el *EventLoop) readAndDispatch(c *Conn) error {
 	c.beginRead()
 
+	total := 0
+	defer func() {
+		if p := el.parent.batchPool; p != nil && p.classify {
+			c.readBytes.Add(int64(total))
+		}
+	}()
 	var readErr error
 	for {
-		_, more, err := c.readBatch()
+		n, more, err := c.readBatch()
+		total += n
 		if err != nil {
 			readErr = err
 		}

@@ -17,9 +17,16 @@
 - 默认 Worker 拓扑：worker 数 = 核数；event loop 数 = 32×worker，封顶 384；
   batch pool 每 shard 2 个 worker 共享一个队列（shard 数 = worker/2），**不绑核**。
   每轮 epoll_wait 默认最多取 64 条事件，批次上限 64。
-  实测（10k×1KB、同场 A/B fnet）：2+2 530k/4.8M、4+4 863-889k/8.7-8.9M、
+  实测（10k×1KB、同场 A/B fnet）：2+2 504-521k/4.7-5.0M、4+4 969-1003k/8.8M、
   8+8 1.26-1.29M/12.4-12.5M、12+12 1.90M/15.3M（Echo/Pipeline，环境波动 10%+）。
   改这些值要重跑 2/4/8/12 核 A/B。
+- **≤4 核按负载分组**：worker 回填每个 loop 的平均读字节/任务数；平均 ≥4KB
+  （pipeline，一次读多个 frame）的 loop 走固定组（N 个 shard×1 worker，
+  loop%N，cache 亲和），低于阈值（echo，约 1KB）走共享组（N/2 个 shard×2
+  worker，低延迟）。样本不足 8 个 read 任务时先按 echo 走。5 核以上仍是单一
+  共享拓扑。实测分类版 2+2 Echo ~504k / Pipeline ~4.9M、4+4 Echo ~986k /
+  Pipeline ~8.81M（同场参考 975k/8.58M）。这个分组是默认，不是实验开关；
+  改阈值/组数要重跑 2+2、4+4 的 Echo+Pipeline A/B。
 - `WithPerCoreWorkers`（loop/worker 1:1 绑核）保留但**不再是默认**：低核实测
   2+2 只有 ~377k Echo，比上面的共享队列拓扑（~530k）慢；一条连接的状态在
   两个 pinned 线程/核之间搬，cache 反而更差。

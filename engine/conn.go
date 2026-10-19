@@ -126,6 +126,14 @@ type Conn struct {
 	//
 	// 只在处理这条连接的 goroutine 上碰，不需要原子操作。
 	handlerChanged bool
+
+	// readBytes 是这一轮任务从 socket 读进来的字节数。batch worker 用它
+	// 累计每个 loop 的读量，event loop 据此把 echo（小读）和 pipeline
+	// （一次读多个 frame）分到不同的 worker 组。
+	//
+	// 用原子：读它的 worker 已经归还 busy 之后才统计，下一个持有者可能
+	// 已经重置/累加了。统计值差一两个任务无所谓，但不能数据竞争。
+	readBytes atomic.Int64
 }
 
 const (
