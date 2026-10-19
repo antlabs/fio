@@ -58,15 +58,18 @@ const slowSplitChunk = 8
 //	worker:     按 batch 里的顺序处理，处理完把 batch 还给池子
 //
 // 一个 batch 里的连接都属于同一个 loop，也就是同一个小的 fd 分片
-// （默认 384 个 loop，10k 连接时每个 loop 约 26 条），worker 处理这一批
-// 时碰的连接状态是集中的，cache 局部性接近内联模式；跨 goroutine 的唤醒
-// 从"每消息一次"降到"每批一次"。
+// （默认 loop 数 = 32×核数，10k 连接时每个 loop 几十到一百多条），
+// worker 处理这一批时碰的连接状态是集中的；跨 goroutine 的唤醒从
+// "每消息一次"降到"每批一次"。
 //
-// 所有任务仍然按 loop 固定投给同一个 worker（worker = loopIndex%workers），
-// 所以同一条连接的事件顺序不变，OnOpen 也一定和它的数据落在同一个 worker 上。
+// 一个 loop 的批次固定投到它对应的 shard（loopIndex%shards）；shard 里
+// 2 个 worker 抢同一个 channel，某个 worker 忙时另一个还能接下一批，
+// 减少队头阻塞。同一条连接的事件顺序由 busy/pending 位保证，不靠
+// 单 worker 串行。
 
-// batchTask 是批次里的一个事件。只记 fd 和状态，不碰连接对象——连接对象
-// 的查找和协议状态都留给 worker，event loop 保持只做 epoll/分发。
+// batchTask 是批次里的一个事件。记 fd、连接指针和状态；event loop 从
+// 指针表里取一次 *Conn，但不碰它上面的任何字段，协议的读取/解析/回调
+// 都留给 worker。
 type batchTask struct {
 	c       *Conn
 	fd      int
@@ -119,8 +122,7 @@ type batchPool struct {
 func newBatchPool(n int, perCore bool) *batchPool {
 	// n 是目标 worker 总数；每个 shard 上常驻 batchWorkersPerShard 个，
 	// 所以 shard 数 = n/2。n=2 -> 1 个 shard、2 个 worker；n=12 -> 6 个
-	// shard、12 个 worker。2 核时所有批次进一个 shard，两个 worker 抢着
-	// 处理，避免某些 shard 空闲、某些排队。
+	// shard、12 个 worker。
 	perShard := batchWorkersPerShard
 	shards := n / perShard
 	if shards < 1 {
@@ -149,13 +151,25 @@ func newBatchPool(n int, perCore bool) *batchPool {
 	}
 	p := &batchPool{perShard: perShard, perCore: perCore, maxPerShard: perShardMax, stallTicks: stallTicks, taskLimit: taskLimit, tickerDone: make(chan struct{})}
 	p.free.New = func() any {
-		return &taskBatch{tasks: make([]batchTask, 0, p.taskLimit)}
+		// 初始只开 16 格，不按上限 64/256 开：echo 一批往往只有 1~3 条，
+		// 按上限开会让队列里每个 batch 都攥着 64×24B 的数组（pprof 里
+		// 3MB 就花在这）。真装不下 append 会自己长。
+		return &taskBatch{tasks: make([]batchTask, 0, 16)}
+	}
+	// 每个 shard 的队列深度：只有 1 个 shard（2 核）时给 1024；多 shard
+	// （4 核以上）给 512。实测 4+4：512 的 Echo 是 1.00M，1024 是 881k
+	// （队列短、延迟低）；但 2+2 只有 1 个 shard、2 个 worker，512 会满、
+	// 退回临时 goroutine，Echo 从 504k 掉到 397k，所以 1 个 shard 时不能
+	// 减半。8+8 也是 512 更好（1.27M vs 1.24M）。
+	chanCap := 1024
+	if shards > 1 {
+		chanCap = 512
 	}
 	p.workers = make([]*batchWorker, shards)
 	for i := range p.workers {
 		p.workers[i] = &batchWorker{
 			id:   i,
-			ch:   make(chan *taskBatch, 1024),
+			ch:   make(chan *taskBatch, chanCap),
 			done: make(chan struct{}),
 			p:    p,
 			max:  perShardMax,
@@ -174,9 +188,9 @@ const batchWorkersPerShard = 2
 func (p *batchPool) start() {
 	for _, w := range p.workers {
 		for i := 0; i < p.perShard; i++ {
-			// 只有 per-core 拓扑才把 base worker 绑核；批量池（8/12 核）
-			// 的 worker 不能绑，否则 12 个 worker 被钉在 6 个 CPU 上，
-			// Echo 会从 1.87M 掉到 0.34M。
+			// 只有 per-core 拓扑把 base worker 绑核；默认批量池（8/12
+			// 核）不能绑，否则 12 个 worker 被钉在 6 个 CPU 上，Echo
+			// 会从 1.87M 掉到 0.34M。
 			w.spawn(p.perCore, true)
 		}
 	}
@@ -285,7 +299,7 @@ func (p *batchPool) stop() {
 	}
 }
 
-// workerForLoop 让一个 loop 的所有批次固定落到一个 worker 上。
+// workerForLoop 让一个 loop 的所有批次固定落到一个 shard 上。
 func (p *batchPool) workerForLoop(loop int) *batchWorker {
 	return p.workers[loop%len(p.workers)]
 }
@@ -386,14 +400,15 @@ func (w *batchWorker) processOne(el *EventLoop, t batchTask) {
 		return
 	}
 
+	// Add 投来的 OnOpen 任务：没有读/写/EOF 标志。必须拿到 busy 才能跑
+	// OnOpen（activate 会等），不能和事件处理并发。
+	if !t.isRead && !t.isWrite && !t.eof {
+		el.activate(c)
+		return
+	}
+
 	if t.eof {
-		if !c.tryBusy() {
-			if t.isRead {
-				c.setPendingRead()
-			}
-			if t.isWrite {
-				c.setPendingWrite()
-			}
+		if !c.tryBusy() && !c.markPendingAndRetry(t.isRead, t.isWrite) {
 			return
 		}
 		defer c.unbusy()
@@ -407,14 +422,12 @@ func (w *batchWorker) processOne(el *EventLoop, t batchTask) {
 	}
 
 	if !c.tryBusy() {
-		if t.isRead {
-			c.setPendingRead()
-		}
-		if t.isWrite {
-			c.setPendingWrite()
+		// 记下事件后重抢一次；抢到说明原处理者已经放掉，归我们跑。
+		if c.markPendingAndRetry(t.isRead, t.isWrite) {
+			el.processConn(c, false, false)
 		}
 		return
 	}
-	// processConn 自己持有 busy，跑完负责 unbusy。
+	// processConn 自己管理 busy，跑完负责 unbusy。
 	el.processConn(c, t.isRead, t.isWrite)
 }

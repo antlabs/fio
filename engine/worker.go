@@ -225,21 +225,25 @@ func (n *taskNode) processOne(t task) {
 	if t.fn != nil {
 		if c.tryBusy() {
 			el.activateBusy(c)
-			c.unbusy()
+			if c.unbusyAndPending() {
+				el.processConn(c, false, false)
+			}
 		}
 		t.fn()
 		return
 	}
 
+	if !t.isRead && !t.isWrite && !t.eof {
+		// Add 投来的 OnOpen 任务。
+		el.activate(c)
+		return
+	}
+
 	if !c.tryBusy() {
-		// 别人正在处理这条连接（上一轮还没跑完、或者 Close 那条路）：
-		// 把事件记进 pending 位，处理完的那个会取走（见 processConn 的
-		// 循环）。fd 固定分片，正常情况下这里不会撞上。
-		if t.isRead {
-			c.setPendingRead()
-		}
-		if t.isWrite {
-			c.setPendingWrite()
+		// 别人正在处理这条连接：记下事件后重抢一次 busy。抢到说明
+		// 原处理者已经放掉，归我们处理（见 markPendingAndRetry）。
+		if c.markPendingAndRetry(t.isRead, t.isWrite) {
+			el.processConn(c, false, false)
 		}
 		return
 	}

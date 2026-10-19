@@ -26,9 +26,11 @@ import (
 
 // MultiEventLoop 是一组事件循环，连接按 fd 分片挂到其中一个上。
 //
-// 分片规则是 fd % len(loops)：同一个连接永远落在同一个循环上，所以它的
-// 状态（读缓冲区、写缓冲、协议自己的状态机）只被那一个 goroutine 碰，
-// 不用加锁。这是整套东西能快起来的根本。
+// 分片规则是 fd % len(loops)：同一个连接永远落在同一个循环上，它的
+// 读缓冲区、写缓冲、协议状态机都只在这个循环的分片里。Worker 模式下
+// event loop 只把事件投给 batch pool；同一 shard 的多个 worker 可能
+// 并发碰到同一条连接，由 Conn 的 busy/pending 位保证同一时刻只有一个
+// 执行者（见 batch.go / conn.go）。
 type MultiEventLoop struct {
 	loops []*EventLoop
 	log   *slog.Logger
@@ -199,7 +201,13 @@ func New(opts ...Option) (*MultiEventLoop, error) {
 		}
 	}
 	m.log = slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: o.level}))
-	m.conns.Init(core.GetMaxFd())
+	maxFd := core.GetMaxFd()
+	if maxFd > 65536 {
+		// 连接表按 fd 直接索引，RLIMIT 200k 时一次开 1.6MB 指针数组，
+		// 而 10k 连接的压测根本用不到。先开 64k 格，Add 里会按需长。
+		maxFd = 65536
+	}
+	m.conns.Init(maxFd)
 
 	m.loops = make([]*EventLoop, o.numLoops)
 	for i := range m.loops {
@@ -209,12 +217,11 @@ func New(opts ...Option) (*MultiEventLoop, error) {
 			maxEventNum: o.maxEventNum,
 			log:         m.log,
 			// 注册连接（OnOpen 投递）走这条路，不是数据路径。
-			// 每个循环只分到几十条连接（默认 192 个循环 / 万级连接），
-			// 256 格就够吸收一轮 connect 风暴；**不要开 4096**：一
-			// 格 8 字节，4096 格就是 32KB/循环，192 个循环白占 6MB，
-			// 384 个就 12MB（pprof 里 engine.New 是 Pipeline 内存的
-			// 四分之一），而这么多格子根本用不到。真满了 accept 会
-			// 等一会儿，是正常的背压（见 runOnLoop）。
+			// 每个循环只分到几十条连接（默认 384 个循环 / 万级连接），
+			// 256 格能吸收一轮 connect 风暴；**不要开 4096**：一
+			// 格 16 字节，4096 格就是 64KB/循环，384 个循环白占 24MB。
+			// 试过 64 格：Connections 阶段 10k 连接风暴直接把 TPS 打到
+			// 1920（accept 被背压卡住），不要省这点内存。
 			tasks: make(chan func(), 256),
 		}
 		api, err := core.Create(core.TriggerTypeEdge)
@@ -401,35 +408,51 @@ func (el *EventLoop) activateInner(c *Conn, alreadyBusy bool) {
 	if c.IsClosed() {
 		return
 	}
-	// 原子抢执行权，见上。
-	if atomic.OrUint32(&c.packed, flagActivated)&flagActivated != 0 {
+
+	// alreadyBusy：调用方（processConn）已经持有 busy。先原子抢执行权，
+	// 抢到就跑 OnOpen，否则别人已经跑过/正在跑。
+	if alreadyBusy {
+		if atomic.OrUint32(&c.packed, flagActivated)&flagActivated != 0 {
+			return
+		}
+		if c.handler != nil {
+			c.handler.OnOpen(c)
+		}
 		return
 	}
 
-	// busy 位：没人持有就自己占上、跑完自己还；alreadyBusy 那条路不碰。
-	owned := false
-	if !alreadyBusy {
-		owned = c.tryBusy()
+	// Add 投来的 OnOpen 任务：**必须先拿到 busy 再跑 OnOpen**。
+	//
+	// 以前 tryBusy 失败也照跑，靠“两条路在同一个 goroutine 上”成立；
+	// 多 worker/shard 之后事件可能在另一个 worker 上并行处理，OnOpen
+	// 和 OnData 同时写协议状态就是数据竞争（表现为连接卡死/帧错乱）。
+	// 拿不到就等：持有 busy 的那条路进 processConn 会自己补 OnOpen。
+	for !c.tryBusy() {
+		if c.IsClosed() {
+			return
+		}
+		if atomic.LoadUint32(&c.packed)&flagActivated != 0 {
+			return
+		}
+		runtime.Gosched()
+	}
+	// 拿到 busy 后再抢执行权，避免等待期间别人已经跑完 OnOpen。
+	// 这里不能只 unbusy：等 busy 期间可能有人把事件记成了 pending，
+	// 那个人的重抢 busy 会被我们挡住，必须由我们收尾处理。
+	if atomic.OrUint32(&c.packed, flagActivated)&flagActivated != 0 {
+		if c.unbusyAndPending() {
+			el.processConn(c, false, false)
+		}
+		return
 	}
 	if c.handler != nil {
 		c.handler.OnOpen(c)
 	}
-	if owned {
-		c.unbusy()
-	}
 
-	// OnOpen 之前（或者期间）到的事件：补处理掉。
-	//
-	// 有 pending 的话要接着处理（那些是 epoll 边缘，丢了就没有下一次
-	// 通知了）。alreadyBusy 那条路不补：processConn 自己会接着跑，
-	// 它拿着循环去取 pending。
-	if owned {
-		pendingRead, pendingWrite := c.takePendingRead(), c.takePendingWrite()
-		if pendingRead || pendingWrite {
-			if c.tryBusy() {
-				el.processConn(c, pendingRead, pendingWrite)
-			}
-		}
+	// OnOpen 之前（或者期间）到的事件：清 busy 后再取一次 pending，
+	// 和 markPendingAndRetry 对称（见 unbusyAndPending）。
+	if c.unbusyAndPending() {
+		el.processConn(c, false, false)
 	}
 }
 

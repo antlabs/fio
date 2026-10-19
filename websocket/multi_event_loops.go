@@ -52,43 +52,55 @@ const (
 	defaultEventLoopsSingleCPU = 56
 )
 
-// Worker 模式的默认 loop 数：8 核以上封顶 192 个（8 核 192、12 核以上
-// 192）。loop 只 poll + 攒批，读/解析/回包在 worker；192 个 loop 时每个
-// loop 的连接集合已经够小，再往上 TPS 在 1~2% 内，但 fd/事件数组/栈和
-// 内存会线性涨。per-core 低核拓扑不受影响。
-const defaultWorkerMaxLoops = 192
+// Worker 模式的默认 loop 数：32×worker，封顶 384。
+//
+// loop 只 poll + 攒批，读/解析/回包在 worker。loop 越多，每个 loop 的
+// 连接集合越小、一个批次越集中，cache 局部性越好；但 fd/事件数组/栈和
+// 内存线性涨，384 之后收益抵不过开销。
+//
+// 实测（10k×1KB、同场交替 A/B fnet，lab 24 核）：
+//
+//	配置       loop/worker  GOMAXPROCS   Echo        Pipeline
+//	2+2        64/2         8            530k        4.8M
+//	4+4        128/4        16           863-889k    8.7-8.9M
+//	8+8        256/8        8            1.26-1.29M  12.4-12.5M
+//	12+12      384/12       12           1.90M       15.3M
+//
+// GOMAXPROCS 规律见 toEngineOptions：≤4 核抬到 4N，≥5 核用 N。
+const defaultWorkerMaxLoops = 384
 
-// workerTopology 返回 Worker 模式的默认拓扑。
+// defaultWorkerMaxEvent 是 Worker 模式默认一次 epoll_wait 最多取多少事件。
+// 64 足够：loop 分片多，每个 loop 一次没那么多就绪 fd；压小事件数组能省
+// 内存，也不再让 epoll_wait 一次拷 1000 条。调用方显式设置的不动。
+const defaultWorkerMaxEvent = 64
+
+// workerTopology 返回 Worker 模式的默认拓扑：worker 数 = 核数，
+// loop 数 = 32×worker（封顶 384）。所有 loop/worker 都不绑核，由 Go
+// 调度器分配；batch pool 每 shard 2 个 worker 共享一个队列，低延迟。
 //
-// Linux 低核（<=4）用 per-core：一个 event loop 对一个 worker，loop i /
-// worker i 绑同一个 CPU。实测 2+2 核 Echo 346k -> 383k、Pipeline
-// 4.31M -> 4.85M；4+4 核 Echo 660k -> ~750k、Pipeline 8.29M -> ~9.0M。
-// 8 核以上 per-core 反而差（loop/worker 数太多），继续用批量池。
-//
-// per-core 需要 GOMAXPROCS 留足 P：2/4 核用 4×N，调用方没显式设置
-// GOMAXPROCS 时由 toEngineOptions 抬上去（全局副作用，见 CLAUDE.md）。
+// 以前低核（<=4）默认是 per-core（loop/worker 1:1 绑核），实测 2+2 只有
+// 377k Echo，而这个拓扑能到 530k：per-core 把 loop 和 worker 钉死在同一
+// 个核上，一条连接的状态在两个 pinned 线程之间来回搬，反而更慢。
+// WithPerCoreWorkers 仍然保留，给需要手动绑核的场景用。
 func workerTopology(n int) (loops, workers int, perCore bool) {
-	if runtime.GOOS == "linux" && n <= 4 {
-		switch n {
-		case 1:
-			loops, workers = 1, 1
-		case 2:
-			loops, workers = 2, 2
-		case 3:
-			loops, workers = 24, 24
-		default:
-			loops, workers = 32, 32
-		}
-		return loops, workers, true
+	workers = n
+	if workers < 1 {
+		workers = 1
 	}
-	loops = 32 * n
+	loops = 32 * workers
+	// 8 核以上直接给到封顶 384：256 个 loop（32/核）时 8+8 的 Echo 比
+	// 384 低约 3%（1.26M vs 1.285M），Pipeline 基本不变；384 和 12 核
+	// 的 32/核 是同一个数。
+	if workers >= 8 {
+		loops = defaultWorkerMaxLoops
+	}
 	if loops > defaultWorkerMaxLoops {
 		loops = defaultWorkerMaxLoops
 	}
 	if loops < 32 {
 		loops = 32
 	}
-	return loops, n, false
+	return loops, workers, false
 }
 
 type evOptionConfig struct {
@@ -136,7 +148,6 @@ var (
 func getDefaultMultiEventLoop() *MultiEventLoop {
 	defaultOnce.Do(func() {
 		el, err := engine.NewAndStart(toEngineOptions(
-			WithMaxEventNum(256),
 			WithLogLevel(slog.LevelError),
 		)...)
 		if err != nil {
@@ -220,26 +231,22 @@ func toEngineOptions(opts ...EvOption) []engine.Option {
 		}
 	} else {
 		// Worker 模式（默认）：event loop 只 poll + 攒批，读/解析/
-		// 回调/回包在 batch worker 池里。
+		// 回调/回包在 batch worker 池里。拓扑见 workerTopology。
 		//
-		// loop 数按 32/核：2 核 64、12 核 384。loop 还是按 fd 分片，
-		// 每个 loop 的连接少，poll 时碰的 socket 少，一个批次也小。
-		// worker 数默认 = 核数；batch pool 每 shard 2 个 worker、shard
-		// = worker/2：2 核 1 个 shard、2 个 worker；12 核 6 个 shard、
-		// 12 个 worker。
-		//
-		// 实测（2+2 核、10k×1KB、C++ 客户端）：这个默认下 Echo 约
-		// 345k、Pipeline 4.3M；4/8/12 核见 lab 报告。
+		// GOMAXPROCS 是进程级副作用：≤4 核抬到 4N（实测 2/4 核都要
+		// 更多 P 才跑得满），≥5 核用 N（8 核抬到 16 反而把 Echo 从
+		// 1.26M 打到 1.11M）。只在默认拓扑下抬；显式
+		// WithEventLoops/WithParseGoroutines 不动；调用方显式设了
+		// GOMAXPROCS 环境变量也不动（压测对照）。
 		if cfg.numLoops <= 0 && cfg.eventWorkers <= 0 {
 			loops, workers, perCore = workerTopology(n)
 			loops = capEventLoopsForFD(loops)
-			if perCore {
-				// per-core 的 loop/worker 都 LockOSThread 绑核，需要比
-				// goroutine 数少一些的 P；实测 4N 最好。只在默认拓扑下
-				// 抬，显式 WithEventLoops/WithParseGoroutines 不动。
-				if cur := runtime.GOMAXPROCS(0); cur < 4*n {
-					runtime.GOMAXPROCS(4 * n)
-				}
+			target := n
+			if n <= 4 {
+				target = 4 * n
+			}
+			if cur := runtime.GOMAXPROCS(0); cur < target && os.Getenv("GOMAXPROCS") == "" {
+				runtime.GOMAXPROCS(target)
 			}
 		} else {
 			if loops <= 0 {
@@ -261,16 +268,30 @@ func toEngineOptions(opts ...EvOption) []engine.Option {
 			}
 		}
 	}
+	// Worker 模式默认每次 epoll_wait 取 64 条（见 defaultWorkerMaxEvent）；
+	// Event 模式保持引擎默认（256）。显式 WithMaxEventNum 优先。
+	maxEventNum := cfg.maxEventNum
+	if !cfg.inline && workers > 0 && maxEventNum <= 0 {
+		maxEventNum = defaultWorkerMaxEvent
+	}
 	engOpts := []engine.Option{
 		engine.WithEventLoops(loops),
-		engine.WithMaxEventNum(cfg.maxEventNum),
+		engine.WithMaxEventNum(maxEventNum),
 		engine.WithLogLevel(cfg.level),
 		engine.WithEventWorkers(workers),
 	}
 	if workers > 0 {
 		// Worker 模式默认用批量移交（一轮 epoll 事件 = 一个批次），
-		// 见 engine/batch.go；syscall 期间让出 P，别的 worker/loop 才能跑。
-		engOpts = append(engOpts, engine.WithBatchPool(), engine.WithEnterSyscall())
+		// 见 engine/batch.go。
+		engOpts = append(engOpts, engine.WithBatchPool())
+		// per-core 拓扑里 loop 和 worker 绑同一个 CPU：entersyscall 让出的
+		// P 没有别的 goroutine 能跑，只剩 runtime 的进入/退出开销，用
+		// RawSyscall。批量池（8 核以上）多个 worker 挤在少量核上，
+		// syscall 期间让出 P 才有意义。
+		// FIO_ENTER_SYSCALL 非空时强制开启，便于同场 A/B。
+		if !perCore || os.Getenv("FIO_ENTER_SYSCALL") != "" {
+			engOpts = append(engOpts, engine.WithEnterSyscall())
+		}
 		// per-core 拓扑（一个 loop 一个 worker，绑同一个 CPU）：
 		// 默认低核拓扑或显式环境开关。
 		if perCore || os.Getenv("FIO_PER_CORE_WORKERS") != "" {

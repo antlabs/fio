@@ -1310,6 +1310,51 @@ func (c *Conn) tryBusy() bool {
 	return atomic.OrUint32(&c.packed, flagBusy)&flagBusy == 0
 }
 
+// markPendingAndRetry 在 tryBusy 失败时记下事件，然后**再抢一次** busy。
+// 抢到说明原持有者在记录之前已经放掉，返回 true，调用方接着处理 pending。
+//
+// 只记 pending 不重试会丢边缘：持有者在“取 pending”之后、“清 busy”
+// 之前被记上，取的人已经走过，记录的人又以为还有别人处理，事件就一直
+// 躺在 pending 位里没人跑（ET 不会再来一次通知，连接就卡死了）。
+// 和 unbusyAndPending 成对使用。
+func (c *Conn) markPendingAndRetry(isRead, isWrite bool) bool {
+	if isRead {
+		c.setPendingRead()
+	}
+	if isWrite {
+		c.setPendingWrite()
+	}
+	return c.tryBusy()
+}
+
+// unbusyAndPending 清 busy 后，如果还有 pending 就重新抢 busy。
+//
+// 返回 true 表示 pending 里有事件且 busy 已经归调用方，调用方要接着
+// 跑 processConn —— **pending 位不在这里消费**，留给 processConn 自己
+// 取。返回 false 表示没事件，或者 busy 已经被别人抢走（pending 原样
+// 留给新持有者，它跑完会再检查）。
+//
+// 这是 markPendingAndRetry 的另一半：一方“置 pending 后抢 busy”，
+// 另一方“清 busy 后抢 busy”，谁抢到谁处理，pending 最终只由
+// processConn 消费。
+func (c *Conn) unbusyAndPending() bool {
+	c.unbusy()
+	if c.IsClosed() || !c.hasPending() {
+		return false
+	}
+	// **只抢 busy，不消费 pending**。
+	//
+	// 早先这里先把 pending 取走（清位）再返回 true，让调用方去
+	// processConn(false,false)；可 processConn 是靠自己取 pending 的，
+	// 进来时位已经被清掉，这一轮什么也不做就退出了——事件就这么丢了。
+	// 实测 TestUpgradeConnNative 在 2 核多 worker 下 ~1% 卡满 5s，
+	// 要等对端 FIN 重新触发一次才处理。
+	//
+	// 抢不到 busy 也不能取：原样留给新持有者，它跑完会再检查。
+	// 抢到了就一直持有到 processConn 取走并处理（中间的 setter 抢不走）。
+	return c.tryBusy()
+}
+
 func (c *Conn) unbusy() {
 	// 热路径: 大部分时候没有 flagFreePending, 清掉 busy 就完事。
 	// 用 atomic.And 的返回值判断, 不额外多一次原子读。
@@ -1325,6 +1370,13 @@ func (c *Conn) unbusy() {
 
 func (c *Conn) setPendingRead()  { atomic.OrUint32(&c.packed, flagPendingRead) }
 func (c *Conn) setPendingWrite() { atomic.OrUint32(&c.packed, flagPendingWrite) }
+
+// hasPending 是 pending 位的一次普通读。processConn 每轮收尾都要看一次
+// pending，绝大多数时候是 0；先普通 load 看一眼，能省掉两次 lock 前缀
+// 的 RMW（takePendingRead/Write）。
+func (c *Conn) hasPending() bool {
+	return atomic.LoadUint32(&c.packed)&(flagPendingRead|flagPendingWrite) != 0
+}
 
 func (c *Conn) takePendingRead() bool {
 	return atomic.AndUint32(&c.packed, ^flagPendingRead)&flagPendingRead != 0

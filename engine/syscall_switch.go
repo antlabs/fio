@@ -16,12 +16,14 @@ import (
 var enterSyscall atomic.Bool
 
 func init() {
-	enterSyscall.Store(os.Getenv("FIO_ENTER_SYSCALL") != "")
+	// 三态：未设置按模式默认（见 websocket.toEngineOptions）；
+	// 非空且不是 0/false 强制 Syscall6，0/false 强制 RawSyscall。
+	if v, ok := os.LookupEnv("FIO_ENTER_SYSCALL"); ok {
+		enterSyscall.Store(v != "" && v != "0" && v != "false")
+	}
 }
 
 // SetEnterSyscall 由 engine 选项调用（WithEnterSyscall）。
 func setEnterSyscall(v bool) {
-	if v {
-		enterSyscall.Store(true)
-	}
+	enterSyscall.Store(v)
 }

@@ -145,9 +145,9 @@ func (el *EventLoop) Loop() {
 
 			el.addPollEvNum(1)
 
-			// batchPool 模式：event loop 只把 (fd, 状态) 塞进本轮批次，
-			// 连接查找、读、解析、回调、写都在 worker 上做（batch.go）。
-			// 放在 getConn 之前，loop 不碰连接对象。
+			// batchPool 模式：event loop 只把 (连接指针, fd, 状态) 塞进
+			// 本轮批次，读、解析、回调、写都在 worker 上做（batch.go）。
+			// loop 只查一次指针表，不碰连接上的任何状态。
 			if el.parent.batchPool != nil {
 				c := el.parent.getConn(fd)
 				if c == nil {
@@ -240,11 +240,9 @@ func (el *EventLoop) Loop() {
 			// pending 位上，处理完的那个取走再跑一轮——ET 的边缘只来
 			// 一次，丢了就再也没有通知，连接会卡住。
 			if !c.tryBusy() {
-				if state.IsRead() {
-					c.setPendingRead()
-				}
-				if state.IsWrite() {
-					c.setPendingWrite()
+				// 记下事件后重抢一次；抢到说明处理者已经放掉，归我们跑。
+				if c.markPendingAndRetry(state.IsRead(), state.IsWrite()) {
+					el.processConn(c, false, false)
 				}
 				return
 			}
@@ -274,12 +272,13 @@ func (el *EventLoop) flushBatch() {
 		return
 	}
 	el.batch = nil
+	p := el.parent.batchPool
 	if len(b.tasks) != 0 {
-		el.parent.batchPool.workerForLoop(el.index).submit(b)
+		p.workerForLoop(el.index).submit(b)
 	} else {
-		el.parent.batchPool.putBatch(b)
+		p.putBatch(b)
 	}
-	el.batch = el.parent.batchPool.getBatch(el)
+	el.batch = p.getBatch(el)
 }
 
 // processConn 处理一个连接的一轮：读、喂给协议、写。
@@ -287,23 +286,23 @@ func (el *EventLoop) flushBatch() {
 // 循环而不是递归：同一个连接连续有事件时（请求-响应就是这种），就地接着
 // 跑省掉一次完整的投递和唤醒，也保证同一个连接还是串行的。
 func (el *EventLoop) processConn(c *Conn, isRead, isWrite bool) {
-	defer c.unbusy()
-
 	for {
 		if c.IsClosed() {
+			c.unbusy()
 			return
 		}
 		// OnOpen 还没跑（Add 投的任务还排在队列里）就先把 OnOpen 补上。
 		//
 		// **不把事件记成 pending 等任务**：那个任务可能排在队列很后面
 		// （比如一批新连接一起进来的 connect 风暴），而 epoll 的边缘只
-		// 来一次——等着等着就没有下一次通知了。这里本来就是事件循环的
-		// goroutine，和那个任务是同一个执行者，直接跑掉最省事。
+		// 来一次——等着等着就没有下一次通知了。当前持有 busy 的 goroutine
+		// 直接补跑 OnOpen 最省事（inline 模式是事件循环，Worker 模式是 worker）。
 		//
 		// 这条路径实测撞到过：Add 返回后立刻有数据的连接（客户端连上
 		// 就发）在 -race 下必报 http2.ConnHandler.conn 的竞争。
 		el.activateBusy(c) // 调用方已经持有 busy，见 activateBusy
 		if c.IsClosed() {
+			c.unbusy()
 			return
 		}
 		if isWrite {
@@ -311,6 +310,7 @@ func (el *EventLoop) processConn(c *Conn, isRead, isWrite bool) {
 			// 一次拿锁搞定"看有没有积压 + 有就 flush"，见 FlushIfNeeded。
 			if err := c.FlushIfNeeded(); err != nil {
 				c.closeWith(err)
+				c.unbusy()
 				return
 			}
 		}
@@ -319,16 +319,39 @@ func (el *EventLoop) processConn(c *Conn, isRead, isWrite bool) {
 			err := el.readAndDispatch(c)
 			if err != nil {
 				c.closeWith(err)
+				c.unbusy()
 				return
 			}
 		}
 
-		// 处理期间又到的那些事件
+		// 处理期间又到的那些事件（通常没有：先普通 load 看一眼，
+		// 别每条消息都做两次 lock RMW）。
+		if c.hasPending() {
+			isRead = c.takePendingRead()
+			isWrite = c.takePendingWrite()
+			if isRead || isWrite {
+				continue
+			}
+		}
+
+		// 没事件了：先清 busy，再看一次 pending。置 pending 的一方会
+		// 在记录后重抢 busy（markPendingAndRetry），两边至少有一边看到。
+		// 不能再按原来的 defer unbusy 直接返回：多 worker/shard 时，
+		// 记录方可能在“取 pending”之后、“清 busy”之前把事件记上。
+		//
+		// 和 unbusyAndPending 一样，**先抢 busy 再取 pending**：取走再
+		// 抢失败会把事件从新持有者眼皮底下清掉。
+		c.unbusy()
+		if c.IsClosed() || !c.hasPending() || !c.tryBusy() {
+			return
+		}
 		isRead = c.takePendingRead()
 		isWrite = c.takePendingWrite()
 		if !isRead && !isWrite {
+			c.unbusy()
 			return
 		}
+		// 重新拿到 busy，接着处理刚取到的事件。
 	}
 }
 
