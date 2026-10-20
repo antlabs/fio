@@ -18,7 +18,7 @@ import "testing"
 
 // ≤4 核的默认布局：共享组 n/2 个 shard×2 worker，固定组 n 个 shard×1。
 func TestClassifyLayout(t *testing.T) {
-	p := newBatchPool(2, false)
+	p := newBatchPool(2, false, true)
 	if !p.classify || p.sharedShards != 1 || p.fixedShards != 2 {
 		t.Fatalf("2-core layout: classify=%v shared=%d fixed=%d", p.classify, p.sharedShards, p.fixedShards)
 	}
@@ -32,7 +32,7 @@ func TestClassifyLayout(t *testing.T) {
 		t.Fatal("pipeline batch should go to the fixed shard by loop")
 	}
 
-	p4 := newBatchPool(4, false)
+	p4 := newBatchPool(4, false, true)
 	if !p4.classify || p4.sharedShards != 2 || p4.fixedShards != 4 || len(p4.workers) != 6 {
 		t.Fatalf("4-core layout: classify=%v shared=%d fixed=%d workers=%d", p4.classify, p4.sharedShards, p4.fixedShards, len(p4.workers))
 	}
@@ -43,9 +43,15 @@ func TestClassifyLayout(t *testing.T) {
 		t.Fatal("4-core pipeline shard mapping wrong")
 	}
 
-	p8 := newBatchPool(8, false)
+	p8 := newBatchPool(8, false, true)
 	if p8.classify || len(p8.workers) != 4 {
 		t.Fatalf("8-core should keep the plain shared layout: classify=%v workers=%d", p8.classify, len(p8.workers))
+	}
+
+	// 显式拓扑（classify=false）必须保持原来的共享队列。
+	p0 := newBatchPool(2, false, false)
+	if p0.classify || len(p0.workers) != 1 || p0.perShard[0] != 2 {
+		t.Fatalf("explicit topology must not classify: classify=%v workers=%d perShard=%v", p0.classify, len(p0.workers), p0.perShard)
 	}
 }
 

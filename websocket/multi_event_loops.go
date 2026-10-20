@@ -220,6 +220,7 @@ func toEngineOptions(opts ...EvOption) []engine.Option {
 	loops := cfg.numLoops
 	workers := -1
 	perCore := false
+	classify := false
 	if cfg.inline {
 		// Event 模式（内联）：读/解析/回调/写都在 event loop 上。
 		if loops <= 0 {
@@ -240,6 +241,7 @@ func toEngineOptions(opts ...EvOption) []engine.Option {
 		// GOMAXPROCS 环境变量也不动（压测对照）。
 		if cfg.numLoops <= 0 && cfg.eventWorkers <= 0 {
 			loops, workers, perCore = workerTopology(n)
+			classify = n <= 4 && !perCore
 			loops = capEventLoopsForFD(loops)
 			target := n
 			if n <= 4 {
@@ -284,6 +286,9 @@ func toEngineOptions(opts ...EvOption) []engine.Option {
 		// Worker 模式默认用批量移交（一轮 epoll 事件 = 一个批次），
 		// 见 engine/batch.go。
 		engOpts = append(engOpts, engine.WithBatchPool())
+		if classify {
+			engOpts = append(engOpts, engine.WithClassifiedWorkers())
+		}
 		// per-core 拓扑里 loop 和 worker 绑同一个 CPU：entersyscall 让出的
 		// P 没有别的 goroutine 能跑，只剩 runtime 的进入/退出开销，用
 		// RawSyscall。批量池（8 核以上）多个 worker 挤在少量核上，

@@ -76,6 +76,10 @@ type options struct {
 	reusePort bool
 	// enterSyscall 让 Linux 的 socket syscall 走 entersyscall 版本。
 	enterSyscall bool
+	// classify 让 batch pool 按读量分 echo/pipeline 两组。只给默认
+	// websocket 拓扑用；显式 WithEventLoops/WithParseGoroutines 不传，
+	// 保持原来的共享队列行为（CI 的回归测试依赖它）。
+	classify bool
 }
 
 // Option 配 MultiEventLoop。
@@ -122,6 +126,13 @@ func WithPerCoreWorkers() Option {
 // inline 模式用 Raw 更省。默认由 websocket 层按模式设置。
 func WithEnterSyscall() Option {
 	return func(o *options) { o.enterSyscall = true }
+}
+
+// WithClassifiedWorkers 让 batch pool 按每个 loop 的平均读字节/任务数
+// 分两组：小读（echo）走共享队列，大读（pipeline）走固定 worker。
+// 只有默认 websocket 拓扑会传；显式拓扑不传。
+func WithClassifiedWorkers() Option {
+	return func(o *options) { o.classify = true }
 }
 
 // WithMaxEventNum 一次 epoll_wait 最多拿多少事件。
@@ -195,7 +206,7 @@ func New(opts ...Option) (*MultiEventLoop, error) {
 	}
 	if workers > 0 {
 		if o.batchPool {
-			m.batchPool = newBatchPool(workers, perCore)
+			m.batchPool = newBatchPool(workers, perCore, o.classify)
 		} else {
 			m.pool = newTaskPool(workers)
 		}

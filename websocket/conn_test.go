@@ -3,6 +3,7 @@ package websocket
 import (
 	"bytes"
 	"crypto/md5"
+	"errors"
 	"fmt"
 	"log/slog"
 	"math/rand"
@@ -10,6 +11,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 	"unsafe"
@@ -435,7 +437,10 @@ func TestFragmentFrame(t *testing.T) {
 		defer con.Close()
 
 		err = con.writeFragment(Ping, []byte("hello"), 1)
-		if err != nil {
+		// 服务端读到第一个分片就会按协议错误关闭；客户端后面的分片可能
+		// 正好写到已 reset 的连接上。这个 write 错误是预期拒绝的一部分，
+		// 真正的断言是下面服务端 OnClose 必须跑。
+		if err != nil && !errors.Is(err, syscall.ECONNRESET) && !errors.Is(err, syscall.EPIPE) {
 			t.Error(err)
 			return
 		}

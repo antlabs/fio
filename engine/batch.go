@@ -131,13 +131,14 @@ type batchPool struct {
 	fixedShards  int
 }
 
-func newBatchPool(n int, perCore bool) *batchPool {
+func newBatchPool(n int, perCore, classify bool) *batchPool {
 	// n 是目标 worker 总数；默认每个 shard 常驻 batchWorkersPerShard 个，
 	// 所以 shard 数 = n/2。n=2 -> 1 个 shard、2 个 worker；n=12 -> 6 个
 	// shard、12 个 worker。
-	// ≤4 核默认按负载分两组：小读（echo）走共享组，大读（pipeline）
-	// 走固定组。5 核以上继续单一共享拓扑（实测 Pipeline 已领先）。
-	classify := !perCore && n <= 4
+	// ≤4 核的**默认 websocket 拓扑**按负载分两组：小读（echo）走共享组，
+	// 大读（pipeline）走固定组。显式 WithEventLoops/WithParseGoroutines
+	// 不传 classify，保持原来的共享队列。
+	classify = classify && !perCore && n <= 4
 	var counts []int
 	sharedShards, fixedShards := 0, 0
 	switch {
