@@ -1021,32 +1021,12 @@ func (c *Conn) Writev(a, b []byte) error {
 
 	total := len(a) + len(b)
 
-	// **小消息(≤4KB)拼到栈上一次 sendto**。
+	// 小消息也直接 sendmsg+iovec，不拼到栈上再 sendto。
 	//
-	// sendmsg 要读 iovec 数组、sendto 只要一个指针, 小消息下后者更便宜;
-	// 大消息才值得用 iovec 省那次拷贝。之前无线程池的 websocket 在小消息
-	// 上也用 sendmsg, 测下来多花 CPU。
-	if total <= maxStackWrite {
-		var stack [maxStackWrite]byte
-		n := copy(stack[:], a)
-		copy(stack[n:], b)
-		all := stack[:total]
-
-		wn, werr := c.writeToSocket(all)
-		if werr == nil && wn == total {
-			return nil
-		}
-		if werr == nil || werr == syscall.EAGAIN || werr == syscall.EINTR {
-			if wn < 0 {
-				wn = 0
-			}
-			c.appendToWbufList(all[wn:], total-wn)
-			c.parent.addWrite(c)
-			return nil
-		}
-		return werr
-	}
-
+	// 以前的栈拼路径是为了省 iovec 开销；Worker 模式在 2+2/4+4/8+8 的
+	// Echo 上实测是反的：拼一块要先动 4KB 栈数组再 sendto，sendmsg 两段
+	// 直接交给内核，Echo 都是 +3~4%（8+8 1.25M -> 1.30M），CPU 持平。
+	// Pipeline 的写多数是 cork 的大块，走的是下面同一路，影响很小。
 	n, err := c.socketWritev(a, b)
 	if err == nil && n == total {
 		return nil

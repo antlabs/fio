@@ -288,8 +288,17 @@ func toEngineOptions(opts ...EvOption) []engine.Option {
 		// P 没有别的 goroutine 能跑，只剩 runtime 的进入/退出开销，用
 		// RawSyscall。批量池（8 核以上）多个 worker 挤在少量核上，
 		// syscall 期间让出 P 才有意义。
-		// FIO_ENTER_SYSCALL 非空时强制开启，便于同场 A/B。
-		if !perCore || os.Getenv("FIO_ENTER_SYSCALL") != "" {
+		// 高核共享拓扑（≥5 核）默认 RawSyscall：profile 显示 8+8
+		// Echo 的 84.6% CPU 在 syscall，Raw 省掉 enter/exit，Echo
+		// +3.5%、CPU -5%；Pipeline 只掉 0.6-2.6% 且仍领先 fnet。
+		// ≤4 核的分类拓扑保留 entersyscall（Pipeline 的固定组收益更
+		// 敏感）。FIO_ENTER_SYSCALL 三态覆盖：非空且不是 0/false 强制
+		// 开，0/false 强制 Raw，未设置按上面的拓扑默认。
+		enter := !perCore && n <= 4
+		if v, ok := os.LookupEnv("FIO_ENTER_SYSCALL"); ok {
+			enter = v != "" && v != "0" && v != "false"
+		}
+		if enter {
 			engOpts = append(engOpts, engine.WithEnterSyscall())
 		}
 		// per-core 拓扑（一个 loop 一个 worker，绑同一个 CPU）：

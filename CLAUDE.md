@@ -17,9 +17,15 @@
 - 默认 Worker 拓扑：worker 数 = 核数；event loop 数 = 32×worker，封顶 384；
   batch pool 每 shard 2 个 worker 共享一个队列（shard 数 = worker/2），**不绑核**。
   每轮 epoll_wait 默认最多取 64 条事件，批次上限 64。
-  实测（10k×1KB、同场 A/B fnet）：2+2 504-521k/4.7-5.0M、4+4 969-1003k/8.8M、
-  8+8 1.26-1.29M/12.4-12.5M、12+12 1.90M/15.3M（Echo/Pipeline，环境波动 10%+）。
+  实测（10k×1KB、同场 A/B fnet）：2+2 504-532k/4.7-5.0M、4+4 980-1018k/8.8M、
+  8+8 1.25-1.37M/12.1-12.5M、12+12 1.83M/15.2M（Echo/Pipeline，环境波动 10%+）。
   改这些值要重跑 2/4/8/12 核 A/B。
+- **syscall 模式按拓扑选**：≥5 核共享拓扑默认 RawSyscall（profile：8+8 Echo
+  84.6% CPU 在内核 syscall，Raw 省 enter/exit，Echo +3.5%、CPU -5%）；
+  ≤4 核分类拓扑默认 entersyscall（Pipeline 的固定组对让出 P 更敏感）。
+  `FIO_ENTER_SYSCALL` 可强制覆盖（0/false = Raw）。
+- **Writev 小消息默认 sendmsg+iovec**，不再拼 4KB 栈数组再 sendto：2+2/4+4/8+8
+  Echo 都 +3~4%（8+8 1.25M -> 1.30M），Pipeline 的 cork 大块不受影响。
 - **≤4 核按负载分组**：worker 回填每个 loop 的平均读字节/任务数；平均 ≥4KB
   （pipeline，一次读多个 frame）的 loop 走固定组（N 个 shard×1 worker，
   loop%N，cache 亲和），低于阈值（echo，约 1KB）走共享组（N/2 个 shard×2
@@ -38,6 +44,19 @@
   busy 被占时先记 pending 再重抢 busy（`markPendingAndRetry`），清 busy 后再
   取一次 pending（`unbusyAndPending`）；OnOpen 必须在 busy 保护下跑。少任何
   一半都会丢 epoll 边缘（表现为高核/多 worker 时连接卡死、TPS 掉到 60k）。
+
+## Echo profile（2026-10-21）
+
+- 8+8 Echo（1.26M、760% CPU）CPU profile：**84.6% flat 在
+  internal/runtime/syscall/linux.Syscall6**；writev/send ~60%、read ~23%、
+  event loop ~7%、WebSocket 解析 + batch 调度 <2%。慢在每请求的 syscall
+  内核时间，不在解析/channel。
+- 据此把 ≥5 核默认改成 RawSyscall、小消息改 sendmsg+iovec。8+8 Echo
+  1.25-1.26M -> 1.29-1.30M，CPU 761% -> 720-740%；12+12 Echo 1.83M
+  （反超 fnet 1.78M），Pipeline 15.21M。2/4 核分类拓扑保留 entersyscall，
+  Echo/Pipeline 都仍领先。
+- 剩余：8+8 Echo 比 fnet 的 1.31-1.32M 低约 1-4%，根因是 Worker 桥接的
+  每请求延迟/内核路径；Event 模式 8+8 约 2.25M，但默认必须是 Worker。
 
 ## Worker 池动态扩容（2026-10-19）
 
