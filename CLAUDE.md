@@ -20,10 +20,19 @@
   实测（10k×1KB、同场 A/B fnet）：2+2 504-532k/4.7-5.0M、4+4 980-1018k/8.8M、
   8+8 1.25-1.37M/12.1-12.5M、12+12 1.83M/15.2M（Echo/Pipeline，环境波动 10%+）。
   改这些值要重跑 2/4/8/12 核 A/B。
-- **syscall 模式按拓扑选**：≥5 核共享拓扑默认 RawSyscall（profile：8+8 Echo
-  84.6% CPU 在内核 syscall，Raw 省 enter/exit，Echo +3.5%、CPU -5%）；
-  ≤4 核分类拓扑默认 entersyscall（Pipeline 的固定组对让出 P 更敏感）。
+- **syscall 模式**：除了 `WithPerCoreWorkers`（loop/worker 绑同一核）用
+  RawSyscall，其余拓扑（共享队列/批量池）**默认 entersyscall**。2026-11-09
+  lab A/B（32KB 读块、Worker 默认、3 轮交替）：8+8 Pipeline 13.08M vs Raw
+  11.43M（+14.5%）、Echo 1.44M vs 1.33M（+8%）；12+12 Pipeline 13.57M vs
+  12.73M（+6.6%）、Echo 1.89M vs 1.92M（-1.3%，噪声级）。早先按 Echo
+  profile 选 Raw 的结论（当时 Raw +3.5%）在 Worker+32KB 之后已不成立。
   `FIO_ENTER_SYSCALL` 可强制覆盖（0/false = Raw）。
+- **读块大小 batchReadBufferSize = 32KB**（2026-11-09）：16KB 时 Pipeline
+  （10k×1KB、rpl=15、8+8）每次 recvfrom 只取一个客户端批次（15KB），32KB
+  正好取两批。实测 TPS 9.5M -> 12.0M（+26%），CPU 731% -> 672%，Pipeline
+  内存 40MB -> 47MB。48KB 持平，64KB 回退到 9.2M/130MB（队列没那么多数据，
+  cache 局部性变差）。`maxCorkBytes` 跟着到 64KB。改这两个值要重跑
+  2/4/8/12 核的 Echo+Pipeline A/B（同时看内存）。
 - **Writev 小消息默认 sendmsg+iovec**，不再拼 4KB 栈数组再 sendto：2+2/4+4/8+8
   Echo 都 +3~4%（8+8 1.25M -> 1.30M），Pipeline 的 cork 大块不受影响。
 - **≤4 核按负载分组**：worker 回填每个 loop 的平均读字节/任务数；平均 ≥4KB

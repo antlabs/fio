@@ -291,15 +291,18 @@ func toEngineOptions(opts ...EvOption) []engine.Option {
 		}
 		// per-core 拓扑里 loop 和 worker 绑同一个 CPU：entersyscall 让出的
 		// P 没有别的 goroutine 能跑，只剩 runtime 的进入/退出开销，用
-		// RawSyscall。批量池（8 核以上）多个 worker 挤在少量核上，
-		// syscall 期间让出 P 才有意义。
-		// 高核共享拓扑（≥5 核）默认 RawSyscall：profile 显示 8+8
-		// Echo 的 84.6% CPU 在 syscall，Raw 省掉 enter/exit，Echo
-		// +3.5%、CPU -5%；Pipeline 只掉 0.6-2.6% 且仍领先 fnet。
-		// ≤4 核的分类拓扑保留 entersyscall（Pipeline 的固定组收益更
-		// 敏感）。FIO_ENTER_SYSCALL 三态覆盖：非空且不是 0/false 强制
-		// 开，0/false 强制 Raw，未设置按上面的拓扑默认。
-		enter := !perCore && n <= 4
+		// RawSyscall。
+		//
+		// 其余拓扑（共享队列/批量池）默认 entersyscall：syscall 期间把 P
+		// 让给别的 worker/事件循环，同一个核上的工作能接着跑。
+		//
+		// 2026-11-09 lab 8+8 A/B（32KB 读块、Worker 默认，3 轮交替）：
+		//   Echo     entersyscall 1.44M vs RawSyscall 1.33M（+8%）
+		//   Pipeline entersyscall 13.08M vs RawSyscall 11.43M（+14.5%）
+		// 早先按 Echo profile 选 Raw 的结论已经不成立（当时 Raw +3.5%）。
+		// FIO_ENTER_SYSCALL 三态覆盖：非空且不是 0/false 强制开，
+		// 0/false 强制 Raw，未设置按上面的拓扑默认。
+		enter := !perCore
 		if v, ok := os.LookupEnv("FIO_ENTER_SYSCALL"); ok {
 			enter = v != "" && v != "0" && v != "false"
 		}

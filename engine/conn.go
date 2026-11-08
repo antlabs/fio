@@ -25,10 +25,26 @@ import (
 )
 
 // 攒包(cork)缓冲区的大小。见 cork.go。
-const maxCorkBytes = 32 * 1024
+//
+// 跟着 batchReadBufferSize 走：一次 32KB 的读最多解析出约 32 条 1KB
+// 消息，回包加上帧头约 33KB。上限留在 64KB，让这一批回包一次写出去
+// 而不是走 writev3 分两段。缓冲区同样用完还池。
+const maxCorkBytes = 64 * 1024
 
-// 读缓冲区的下限(自适应增长那个), 见 growReadBuffer。
-const batchReadBufferSize = 16 * 1024
+// batchReadBufferSize 是"一批"读的大小：一次读满这么多就先交给协议消费，
+// 不为了读空 socket 无限扩。
+//
+// 16KB -> 32KB（2026-11-09，lab 实测）：Pipeline（10k×1KB、rpl=15、8+8）
+// 客户端每个连接一次 send 15KB，socket 队列里通常压着两批；32KB 档一次
+// recvfrom 正好取走两批，读/写系统调用各少一半。TPS 9.5M -> 12.0M（+26%），
+// CPU 731% -> 672%，Pipeline 内存 40MB -> 47MB。
+//
+// 再往上不划算：48KB 持平（11.5M/11.3M），64KB 回退到 9.2M、内存 130MB
+// ——队列里没那么多数据，白背一块大缓冲区，cache 局部性反而更差。
+//
+// 缓冲区用完就还池（ReleaseReadBuf），常驻量取决于同时在跑的 worker
+// 数，不是连接数；echo 这种短读不会触发增长。见 growReadBuffer。
+const batchReadBufferSize = 32 * 1024
 
 var (
 	ErrClosed = errors.New("engine: connection closed")
