@@ -124,7 +124,13 @@ func (c *Conn) CorkWrite(header, payload []byte) error {
 		return ErrClosed
 	}
 	c.mu.Lock()
-	defer c.mu.Unlock()
+	needArm := false
+	defer func() {
+		c.mu.Unlock()
+		if needArm {
+			c.parent.addWrite(c)
+		}
+	}()
 
 	if len(c.wbufList) == 0 {
 		// 攒包缓冲区被写事件那条路消费掉了(部分写之后 flush 成功),
@@ -188,7 +194,7 @@ func (c *Conn) CorkWrite(header, payload []byte) error {
 		default:
 			c.appendToWbufList(payload[n-len(seg)-len(header):], total-n)
 		}
-		c.parent.addWrite(c)
+		needArm = true
 		return nil
 	}
 	*b = (*b)[:0]
@@ -223,7 +229,13 @@ func (c *Conn) EndCork() {
 	}
 
 	c.mu.Lock()
-	defer c.mu.Unlock()
+	needArm := false
+	defer func() {
+		c.mu.Unlock()
+		if needArm {
+			c.parent.addWrite(c)
+		}
+	}()
 	// 清位要在锁里: 别的 goroutine 的写路径拿着锁读这个位, 读到的要么是
 	// "还在攒"(它写进缓冲区, 由这里一起写出去), 要么是"攒完了"(它走普通
 	// 写路径)。锁外清位的话, 它可能读到过期的"还在攒", 把数据塞进一个
@@ -245,5 +257,5 @@ func (c *Conn) EndCork() {
 	// flush 自己负责把写完的缓冲区还回池子。别在这里再动 wbufList——
 	// flush 可能是提前返回的(连接已关), 那时列表还在, 逐个置 nil 会留下
 	// 一个"非空但全是 nil"的列表, 下一个 appendToWbufList 就会解引用 nil。
-	_ = c.flushLocked()
+	needArm, _ = c.flushLocked()
 }

@@ -430,11 +430,17 @@ func (c *Conn) WriteRaw(data []byte) error {
 		return nil
 	}
 	c.mu.Lock()
-	defer c.mu.Unlock()
+	needArm := false
+	defer func() {
+		c.mu.Unlock()
+		if needArm {
+			c.parent.addWrite(c)
+		}
+	}()
 
 	if len(c.wbufList) > 0 {
 		c.appendToWbufList(data, len(data))
-		c.flushLocked()
+		needArm, _ = c.flushLocked()
 		return nil
 	}
 	n, err := c.writeToSocket(data)
@@ -445,7 +451,7 @@ func (c *Conn) WriteRaw(data []byte) error {
 		if n < len(data) {
 			c.appendToWbufList(data[n:], len(data)-n)
 		}
-		c.parent.addWrite(c)
+		needArm = true
 		return nil
 	}
 	return err
@@ -930,12 +936,18 @@ func (c *Conn) Write(data []byte) error {
 	}
 
 	c.mu.Lock()
-	defer c.mu.Unlock()
+	needArm := false
+	defer func() {
+		c.mu.Unlock()
+		if needArm {
+			c.parent.addWrite(c)
+		}
+	}()
 
 	// 有积压: 先拼到后面去, 保证顺序
 	if len(c.wbufList) > 0 {
 		c.appendToWbufList(data, len(data))
-		c.flushLocked()
+		needArm, _ = c.flushLocked()
 		return nil
 	}
 
@@ -948,7 +960,7 @@ func (c *Conn) Write(data []byte) error {
 		if n < len(data) {
 			c.appendToWbufList(data[n:], len(data)-n)
 		}
-		c.parent.addWrite(c)
+		needArm = true
 		return nil
 	}
 	return err
@@ -1007,7 +1019,13 @@ func (c *Conn) Writev(a, b []byte) error {
 	}
 
 	c.mu.Lock()
-	defer c.mu.Unlock()
+	needArm := false
+	defer func() {
+		c.mu.Unlock()
+		if needArm {
+			c.parent.addWrite(c)
+		}
+	}()
 
 	if len(c.wbufList) > 0 {
 		// 有积压, 拼起来走普通那条
@@ -1015,7 +1033,7 @@ func (c *Conn) Writev(a, b []byte) error {
 		all = append(all, a...)
 		all = append(all, b...)
 		c.appendToWbufList(all, len(all))
-		c.flushLocked()
+		needArm, _ = c.flushLocked()
 		return nil
 	}
 
@@ -1043,7 +1061,7 @@ func (c *Conn) Writev(a, b []byte) error {
 			rest = append(rest, b[n-len(a):]...)
 		}
 		c.appendToWbufList(rest, total)
-		c.parent.addWrite(c)
+		needArm = true
 		return nil
 	}
 	return err
@@ -1055,8 +1073,12 @@ func (c *Conn) Flush() error {
 		return ErrClosed
 	}
 	c.mu.Lock()
-	defer c.mu.Unlock()
-	return c.flushLocked()
+	needArm, err := c.flushLocked()
+	c.mu.Unlock()
+	if needArm {
+		c.parent.addWrite(c)
+	}
+	return err
 }
 
 // FlushIfNeeded 写缓冲里非空才 flush，**只拿一次锁**。
@@ -1076,11 +1098,16 @@ func (c *Conn) FlushIfNeeded() error {
 		return nil
 	}
 	c.mu.Lock()
-	defer c.mu.Unlock()
 	if len(c.wbufList) == 0 {
+		c.mu.Unlock()
 		return nil
 	}
-	return c.flushLocked()
+	needArm, err := c.flushLocked()
+	c.mu.Unlock()
+	if needArm {
+		c.parent.addWrite(c)
+	}
+	return err
 }
 
 // NeedFlush 写缓冲里有没有东西。
@@ -1090,7 +1117,11 @@ func (c *Conn) NeedFlush() bool {
 	return len(c.wbufList) > 0
 }
 
-func (c *Conn) flushLocked() error {
+// flushLocked 返回 needArm：没写完、需要重新 arm 可写事件。
+//
+// **不在锁内做 epoll_ctl**：epoll_ctl/kevent 是系统调用，持着连接锁做
+// 会把读路径也挡在后面。调用方解锁之后按 needArm 去 arm。
+func (c *Conn) flushLocked() (needArm bool, err error) {
 	i := 0
 	for i < len(c.wbufList) {
 		wbuf := c.wbufList[i]
@@ -1109,15 +1140,14 @@ func (c *Conn) flushLocked() error {
 			// 没写完, 剩下的留在列表里
 			copy(c.wbufList, c.wbufList[i:])
 			c.wbufList = c.wbufList[:len(c.wbufList)-i]
-			c.parent.addWrite(c)
-			return nil
+			return true, nil
 		}
-		return err
+		return false, err
 	}
 	c.wbufList = c.wbufList[:0]
 	// 空了，清掉"有积压"那个位（见 flagHasWbuf）
 	atomic.AndUint32(&c.packed, ^flagHasWbuf)
-	return nil
+	return false, nil
 }
 
 // writeToSocket 直接写。**调用方必须持有 c.mu**——这个方法在 Write、
@@ -1209,7 +1239,8 @@ func (c *Conn) closeWith(err error) {
 		// 尽力而为：不保证送到（对端可能已经关了、socket 缓冲可能还是
 		// 满的），但"刚才还能写、只是没写全"这种最常见的情况能救回来。
 		c.mu.Lock()
-		_ = c.flushLocked()
+		// 正在关闭，不需要再 arm 可写事件。
+		_, _ = c.flushLocked()
 		c.mu.Unlock()
 
 		atomic.StoreInt32(&c.closed, 1)

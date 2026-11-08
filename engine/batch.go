@@ -336,14 +336,44 @@ func (p *batchPool) watch() {
 	}
 }
 
-// submit 把一批交给这个 shard。**不能阻塞 event loop**：channel 满时
-// 起一个临时 goroutine 处理这一批（fnet 的池子也是这个兜底），
-// 业务再慢也不会把事件循环卡住。
+// submit 把一批交给这个 shard。
+//
+// channel 满时的兜底**有上限**：
+//
+//   - running 没到 max：起一个一次性 worker 处理这一批（注册 state，
+//     watchdog 能看到它的进度），处理完就退休；
+//   - 已经到 max：当前 goroutine 直接处理这一批（最后一道背压）。
+//
+// 不能像以前那样无限起 goroutine（慢业务 + 高流量会瞬时膨胀几百个），
+// 也不能丢批次（ET 边缘只来一次）。到顶时 inline 处理可能让 event loop
+// 短暂停顿，但这是已经过载的极端情况，比内存/Goroutine 无限涨好。
 func (w *batchWorker) submit(b *taskBatch) {
 	select {
 	case w.ch <- b:
+		return
 	default:
-		go w.processBatch(&workerState{}, b)
+	}
+
+	for {
+		n := w.running.Load()
+		if n >= w.max {
+			w.processBatch(&workerState{}, b)
+			return
+		}
+		if w.running.CompareAndSwap(n, n+1) {
+			st := &workerState{}
+			w.mu.Lock()
+			w.states = append(w.states, st)
+			w.mu.Unlock()
+			go func() {
+				st.busy.Add(1)
+				w.processBatch(st, b)
+				st.busy.Add(-1)
+				w.running.Add(-1)
+				w.unregister(st)
+			}()
+			return
+		}
 	}
 }
 
