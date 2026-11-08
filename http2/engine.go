@@ -17,8 +17,21 @@
 package http2
 
 import (
+	"errors"
+	"sync/atomic"
+	"time"
+
 	"github.com/antlabs/fio/engine"
 )
+
+// goAwayGrace 是收到连接级错误之后延迟关闭的时间。
+//
+// 直接让 engine 关会把接收缓冲里还没读的字节变成 TCP RST，对端可能
+// 还没读到我们刚写的 GOAWAY。留一小段窗口让对端读走再关。
+const goAwayGrace = 100 * time.Millisecond
+
+// errConnClosed 连接已经关了/还没建好时调写接口。
+var errConnClosed = errors.New("http2: connection closed")
 
 // engine.Handler 的适配层：把 HTTP/2 接到 fio 的事件循环上。
 //
@@ -39,8 +52,12 @@ type ConnHandler struct {
 	// isClient 这条连接是客户端还是服务端
 	isClient bool
 
-	// conn 是协议状态，OnOpen 时建
-	conn *Conn
+	// conn 是协议状态，OnOpen 时建。
+	//
+	// 用 atomic.Pointer：engine 内部 OnOpen/OnData/OnClose 是串行的，
+	// 但 Conn()/WriteHeaders() 这些是公开方法，用户可能从别的 goroutine
+	// 调；和 OnClose 的 Store(nil) 不能是普通字段读写。
+	conn atomic.Pointer[Conn]
 }
 
 // NewStreamConnHandler 建一个**流级**的服务端 HTTP/2 engine.Handler：
@@ -61,10 +78,18 @@ func NewClientConnHandler(h StreamHandler) *ConnHandler {
 
 // OnOpen 连接建立：建协议状态。
 func (ch *ConnHandler) OnOpen(c *engine.Conn) {
-	ch.conn = NewConn(ch.isClient, ch.handler)
+	conn := NewConn(ch.isClient, ch.handler)
+	// ec 在第一次 Feed 之前装好：之后 handler 里的 Writer.Conn() 和
+	// 大块 DATA 的 Writev 快路径会读它。放在这里（而不是每次 FeedWrite
+	// 里赋值）避免和别的 goroutine 的读发生竞争。
+	conn.mu.Lock()
+	conn.ec = c
+	conn.mu.Unlock()
+	ch.conn.Store(conn)
+
 	if ch.isClient {
 		// 客户端先发连接序言（24 字节明文）+ SETTINGS
-		ch.sendPreface()
+		ch.sendPreface(conn)
 		ch.flush(c)
 		return
 	}
@@ -81,7 +106,7 @@ func (ch *ConnHandler) OnOpen(c *engine.Conn) {
 	// 和客户端的 SETTINGS 有一处不同：服务端还要声明
 	// SETTINGS_INITIAL_WINDOW_SIZE，也就是**我们愿意为每个流收多少**。
 	// 声明得大一点（1MB），这样对端发大请求体时不用频繁等我们补窗口。
-	ch.sendServerSettings()
+	ch.sendServerSettings(conn)
 	ch.flush(c)
 }
 
@@ -89,15 +114,15 @@ func (ch *ConnHandler) OnOpen(c *engine.Conn) {
 //
 // 序言是**明文的 24 字节**，不是帧，所以要单独塞进发送缓冲（writeFrame
 // 只管帧）。它后面紧跟一个 SETTINGS。
-func (ch *ConnHandler) sendPreface() {
-	ch.conn.WriteRaw(clientPreface)
+func (ch *ConnHandler) sendPreface(c *Conn) {
+	c.WriteRaw(clientPreface)
 	var buf []byte
 	buf = AppendSettings(buf, [2]uint32{0x5, defaultMaxFrameSize})
-	ch.conn.WriteRaw(buf)
+	c.WriteRaw(buf)
 }
 
 // sendServerSettings 服务端发自己的 SETTINGS（第一个帧）。
-func (ch *ConnHandler) sendServerSettings() {
+func (ch *ConnHandler) sendServerSettings(c *Conn) {
 	var buf []byte
 	buf = AppendSettings(buf,
 		// MAX_FRAME_SIZE：我们愿意收的最大帧
@@ -109,28 +134,46 @@ func (ch *ConnHandler) sendServerSettings() {
 		// （连接级的窗口协议上没法用 SETTINGS 调，只能靠 WINDOW_UPDATE
 		// 慢慢加——所以下面那句 WINDOW_UPDATE 才是真正要生效的。）
 		[2]uint32{0x4, maxRecvWindow},
+		// MAX_CONCURRENT_STREAMS：声明并强制执行的上限（见 finishHeaders
+		// 里的检查），防止慢速客户端无限开流。
+		[2]uint32{0x3, defaultMaxConcurrentStreams},
 	)
-	ch.conn.WriteRaw(buf)
+	c.WriteRaw(buf)
 
 	// 把连接级窗口也一次性开大（默认 65535，没法用 SETTINGS 声明）。
 	//
 	// RFC 9113 6.9.2 允许接收方随时发 WINDOW_UPDATE 调连接级窗口，
 	// 只要别超过 2^31-1。
-	ch.conn.writeFrame(AppendWindowUpdate(nil, 0, maxRecvWindow-defaultInitialWindowSize))
-	ch.conn.localInitialWindow = int32(maxRecvWindow)
-	ch.conn.recvWindow = int32(maxRecvWindow)
+	c.writeFrame(AppendWindowUpdate(nil, 0, maxRecvWindow-defaultInitialWindowSize))
+	// 和收包/建流路径共享的字段要在锁内改（此时通常还没开始 Feed，
+	// 但外部 goroutine 可能已经拿着 Conn 在写了）。
+	c.mu.Lock()
+	c.localInitialWindow = int32(maxRecvWindow)
+	c.recvWindow = int32(maxRecvWindow)
+	c.mu.Unlock()
 }
 
 // OnData 有数据可读：喂给 HTTP/2 状态机。
 //
 // 返回值按 engine 的契约：消化了多少字节。
 func (ch *ConnHandler) OnData(c *engine.Conn, buf []byte) (int, error) {
-	if ch.conn == nil {
+	if ch.conn.Load() == nil {
 		// OnOpen 还没跑到（引擎不保证它先于 OnData），补上
 		ch.OnOpen(c)
 	}
-
-	return ch.conn.FeedWrite(c, buf)
+	conn := ch.conn.Load()
+	if conn == nil {
+		return 0, errConnClosed
+	}
+	n, err := conn.FeedWrite(c, buf)
+	if err != nil {
+		// 连接级错误：GOAWAY 已经写进连接了。**不要把这个错误交给
+		// engine**——engine 会立刻 close，socket 接收缓冲里剩下的字节
+		// 会让内核回 RST，对端可能收不到 GOAWAY。延迟一小会儿再关。
+		time.AfterFunc(goAwayGrace, func() { c.Close() })
+		return n, nil
+	}
+	return n, nil
 }
 
 // FeedWrite 喂一段字节，并**在这次调用里把产生的帧写出去**，返回消化量。
@@ -146,8 +189,8 @@ func (ch *ConnHandler) OnData(c *engine.Conn, buf []byte) (int, error) {
 // 拿引擎那把锁，而两把锁的获取顺序在别处都是"协议 → 引擎"（引擎调 OnData
 // 时不持自己的锁），不会反向，所以不构成死锁。
 func (c *Conn) FeedWrite(ec *engine.Conn, data []byte) (int, error) {
-	// 记下底层连接：请求级的 Writer.Conn() 要用（见 handler.go）
-	c.ec = ec
+	// ec 在 OnOpen 里就装好了（见 ConnHandler.OnOpen），这里不再赋值：
+	// 每次 OnData 都写一遍会和 handler 里的 Writer.Conn() 竞争。
 	consumed, err := c.feed(data)
 	if werr := c.WriteOutput(ec); werr != nil && err == nil {
 		err = werr
@@ -171,22 +214,28 @@ func (c *Conn) WriteOutput(ec *engine.Conn) error {
 
 // OnClose 连接关闭。
 func (ch *ConnHandler) OnClose(c *engine.Conn, err error) {
-	ch.conn = nil
+	ch.conn.Store(nil)
 }
 
-// Conn 返回协议状态（要主动发请求/响应时用）。
-func (ch *ConnHandler) Conn() *Conn { return ch.conn }
+// Conn 返回协议状态（要主动发请求/响应时用）。连接已经关闭时返回 nil。
+func (ch *ConnHandler) Conn() *Conn { return ch.conn.Load() }
 
 // flush 把内部缓冲里的东西写出去。
 func (ch *ConnHandler) flush(c *engine.Conn) {
-	_ = ch.conn.WriteOutput(c)
+	if conn := ch.conn.Load(); conn != nil {
+		_ = conn.WriteOutput(c)
+	}
 }
 
 // WriteHeaders 发响应头（走 engine 的连接）。
 //
 // 这是给业务用的：收到 OnHeaders/OnData 之后，用这个发响应。
 func (ch *ConnHandler) WriteHeaders(c *engine.Conn, streamID uint32, fields []HeaderField, endStream bool) error {
-	if err := ch.conn.WriteHeaders(streamID, fields, endStream); err != nil {
+	conn := ch.conn.Load()
+	if conn == nil {
+		return errConnClosed
+	}
+	if err := conn.WriteHeaders(streamID, fields, endStream); err != nil {
 		return err
 	}
 	return ch.writeOut(c)
@@ -194,7 +243,11 @@ func (ch *ConnHandler) WriteHeaders(c *engine.Conn, streamID uint32, fields []He
 
 // WriteData 发响应体。
 func (ch *ConnHandler) WriteData(c *engine.Conn, streamID uint32, data []byte, endStream bool) error {
-	if err := ch.conn.WriteData(streamID, data, endStream); err != nil {
+	conn := ch.conn.Load()
+	if conn == nil {
+		return errConnClosed
+	}
+	if err := conn.WriteData(streamID, data, endStream); err != nil {
 		return err
 	}
 	return ch.writeOut(c)
@@ -202,7 +255,11 @@ func (ch *ConnHandler) WriteData(c *engine.Conn, streamID uint32, data []byte, e
 
 // WriteTrailers 发 trailer（带 END_STREAM）。
 func (ch *ConnHandler) WriteTrailers(c *engine.Conn, streamID uint32, fields []HeaderField) error {
-	if err := ch.conn.WriteTrailers(streamID, fields); err != nil {
+	conn := ch.conn.Load()
+	if conn == nil {
+		return errConnClosed
+	}
+	if err := conn.WriteTrailers(streamID, fields); err != nil {
 		return err
 	}
 	return ch.writeOut(c)
@@ -210,5 +267,9 @@ func (ch *ConnHandler) WriteTrailers(c *engine.Conn, streamID uint32, fields []H
 
 // writeOut 把状态机吐出来的字节写进连接。
 func (ch *ConnHandler) writeOut(c *engine.Conn) error {
-	return ch.conn.WriteOutput(c)
+	conn := ch.conn.Load()
+	if conn == nil {
+		return errConnClosed
+	}
+	return conn.WriteOutput(c)
 }

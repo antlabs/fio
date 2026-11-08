@@ -25,11 +25,13 @@ h2spec -h 127.0.0.1 -p 8443 -t -k
 
 | 平台 | 模式 | 结果 |
 |---|---|---|
-| macOS | **h2c（明文）** | **145 tests, 140 passed, 5 skipped, 0 failed**（连跑 5 次都是这个数） |
-| **Linux（lab）** | **h2c（明文）** | **145 tests, 140 passed, 5 skipped, 0 failed** |
+| macOS | **h2c（明文）** | **145 tests, 145 passed, 0 skipped, 0 failed**（h2spec module v2.2.1+incompatible，2026-11-08） |
+| **Linux（lab）** | **h2c（明文）** | **145 tests, 145 passed, 0 skipped, 0 failed**（同版本 h2spec，2026-11-08） |
 | macOS / Linux | h2 走 TLS | 约 132~137 passed，剩余 3~8 failed（偶发，见下） |
 
-那 5 个 skipped 是 h2spec 自己判定"不适用"的（服务端不知道该不该测），不是我们跳过。
+旧版 h2spec 有 5 条 skipped：它判定"不适用"或者拿不到服务端响应体长度。
+新版在服务端声明了 `SETTINGS_MAX_CONCURRENT_STREAMS` 之后会实际执行并发流
+用例，当前全部通过，所以记录是 0 skipped。
 
 ### 已经修掉的
 
@@ -48,6 +50,12 @@ h2spec -h 127.0.0.1 -p 8443 -t -k
 | 窗口记账错 | 大 body 卡在 65535 | 收了数据只减窗口不还，一路减到 0 |
 | 不主动发 WINDOW_UPDATE | 256KB 请求体卡住 | 收多少要还多少，连接级和流级都要还 |
 | 发送侧不做流控 | 大响应对端 GOAWAY | 两个窗口取小的那个，不够的部分要排队 |
+| **请求 trailer 没处理** | 4.4 "POST with trailers" Connection closed | 第二个 HEADERS 被当成新请求头校验（缺 :method）；现在按 trailer 处理，只做语法校验、不覆盖 `Stream.headers` |
+| **流级错误往上抛** | 一个坏请求杀掉整条连接 | `feed` 把 stream error 返回给 engine，engine 关连接；现在回 RST_STREAM 后继续用连接 |
+| **收尾空帧抢跑** | 6.9.2 窗口用例 Timeout/顺序错 | 窗口为 0 时 `WriteData(nil, true)` 绕过 pending body 先发 END_STREAM；现在收尾帧排在 pending 之后 |
+| **SETTINGS ACK 顺序** | 6.9.2 "Changes INITIAL_WINDOW_SIZE" Timeout | 窗口变化产生的 DATA 抢在 ACK 前面，客户端等 ACK 时丢弃；现在先 ACK 再续发 |
+| **GOAWAY 被 RST 冲掉** | 4.2 超大帧 "connection reset by peer" | 连接级错误后立即 close 会把未读字节变成 RST；现在 GOAWAY 之后延迟 100ms 再关 |
+| **并发流不限** | 5.1.2 并发流用例（旧版跳过） | 不声明 `MAX_CONCURRENT_STREAMS`；现在声明 128 并在 `finishHeaders` 强制执行 |
 
 ### 还没解决的：TLS 模式的偶发失败
 

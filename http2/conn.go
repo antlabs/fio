@@ -18,6 +18,7 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"sync/atomic"
 
 	"github.com/antlabs/fio/engine"
 )
@@ -47,7 +48,14 @@ var clientPreface = []byte("PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n")
 // 和 engine.Handler 是一个路子：协议层（比如 gRPC）实现它，http2 把流上
 // 的请求头、数据、结束通知交给它。
 type StreamHandler interface {
-	// OnHeaders 一个流的请求头解完了。pseudo 是 :method :path 这些。
+	// OnHeaders 一个流的头块解完了。pseudo 是 :method :path 这些。
+	//
+	// **同一个流会调两次**：第一次是请求头（服务端方向）或响应头
+	// （客户端方向）；如果对端还发了 trailer，第二次带 endStream=true，
+	// headers 就是 trailer 字段（此时 Conn.GetStream().headers 仍然是
+	// 第一次的请求/响应头，没有被覆盖）。
+	//
+	// 1xx 信息响应也会走这里（endStream=false），之后还会有最终响应头。
 	OnHeaders(c *Conn, streamID uint32, headers []HeaderField, endStream bool)
 
 	// OnData 流上的数据。末尾那次 endStream 为真。
@@ -64,8 +72,25 @@ type StreamHandler interface {
 //
 // HPACK 的编解码器是**连接级**的（动态表跨头块保留），所以
 // 一个 HTTP/2 连接一个 Conn，不能共用。
+//
+// # 并发模型
+//
+//   - **Feed/feed 只能由一个 goroutine 驱动**：解析器、HPACK 解码器、
+//     序言缓冲和 pendingHeaders 都是单线程状态。engine 模式下同一连接的
+//     事件由 busy 位串行化，天然满足。
+//   - **发送方法可以并发调用**（NewStreamID/WriteHeaders/WriteTrailers/
+//     WriteData/CloseStream/GetStream）：HPACK 编码器、流表、流号分配、
+//     各流的状态和窗口都由 mu 串行化。
+//   - **StreamHandler 的回调一律在 mu 外调用**。业务会在 OnHeaders/OnData
+//     里直接写响应（gRPC 的 Reply 就是这样），持锁回调会自死锁。
+//
+// 所以「engine 收到数据 -> 回调里写响应」和「别的 goroutine 发起写」可以
+// 同时存在；只有 Feed 本身要求单 goroutine。
 type Conn struct {
-	// 发送那边
+	// mu 保护收发两条路径共享的全部状态：outBuf、HPACK 编码器、streams
+	// 表、nextStreamID、各流的 state/窗口/headers 等。
+	//
+	// 锁的边界：**任何 StreamHandler 回调都不能在持锁时调用**。
 	mu      sync.Mutex
 	outBuf  []byte
 	encoder *hpackEncoder
@@ -77,6 +102,14 @@ type Conn struct {
 	prefaceBuf []byte
 
 	state connState
+
+	// draining 是"我方已经发过 GOAWAY"：后面的输入直接丢掉，等
+	// goAwayGrace 到点由 ConnHandler 关闭。
+	//
+	// **收到对端的 GOAWAY 不算 draining**：RFC 9113 6.8 允许对端在
+	// GOAWAY 之后继续回 PING/处理 lastStreamID 以内的流，不能把输入
+	// 全丢了（h2spec 3.8 就是发 GOAWAY 后再发 PING 等 ACK）。
+	draining bool
 
 	// 客户端的流 ID 是奇数，服务端发起的（push）是偶数
 	nextStreamID uint32
@@ -94,13 +127,20 @@ type Conn struct {
 		active    bool
 	}
 
-	// handler 是流事件的接收者（gRPC 之类）
-	handler StreamHandler
+	// handler 是流事件的接收者（gRPC 之类）。
+	//
+	// 用 atomic.Pointer：SetHandler 是公开方法，可能在别的 goroutine 上
+	// 和收包路径并发（虽然推荐在 Feed 之前调用）。
+	handler atomic.Pointer[StreamHandler]
 
 	// settings
 	peerMaxFrameSize  uint32
 	peerHeaderTable   uint32
 	peerInitialWindow uint32
+	// localMaxStreams 是我们愿意同时跑的对端发起流数（服务端方向）。
+	// 在 SETTINGS 里声明并强制执行，防止慢速客户端开无限条流做内存
+	// 放大；0 表示不限制。
+	localMaxStreams uint32
 
 	// --- 流控（RFC 9113 6.9）---
 	//
@@ -179,7 +219,6 @@ func NewConn(isClient bool, h StreamHandler) *Conn {
 		dec:          newHpackDecoder(),
 		encoder:      newHpackEncoder(),
 		streams:      make(map[uint32]*Stream),
-		handler:      h,
 		isClient:     isClient,
 		state:        stateOpen,
 		nextStreamID: 1,
@@ -187,6 +226,7 @@ func NewConn(isClient bool, h StreamHandler) *Conn {
 		peerMaxFrameSize:  defaultMaxFrameSize,
 		peerHeaderTable:   defaultHeaderTableSize,
 		peerInitialWindow: defaultInitialWindowSize,
+		localMaxStreams:   defaultMaxConcurrentStreams,
 
 		// 流控窗口的初值都是 65535（RFC 9113 6.9.2）。
 		//
@@ -202,11 +242,20 @@ func NewConn(isClient bool, h StreamHandler) *Conn {
 		// 服务端发起的流是偶数
 		c.nextStreamID = 2
 	}
+	if h != nil {
+		c.handler.Store(&h)
+	}
 	return c
 }
 
 // defaultInitialWindowSize 是流的初始窗口（RFC 9113 6.9.2: 65535）。
 const defaultInitialWindowSize = 65535
+
+// defaultMaxConcurrentStreams 是我们声明并强制执行的并发流上限。
+//
+// 128 对浏览器/常规 gRPC 客户端足够（它们一般并发几十条），同时挡住了
+// "开一万条流每条只发一半"那种内存放大。
+const defaultMaxConcurrentStreams = 128
 
 // maxRecvWindow 是我们愿意开给对端的窗口上限（连接级和流级都用它）。
 //
@@ -219,7 +268,25 @@ const defaultInitialWindowSize = 65535
 const maxRecvWindow = 1 << 20
 
 // SetHandler 换流事件的处理者（握手之后才知道要交给谁的时候用）。
-func (c *Conn) SetHandler(h StreamHandler) { c.handler = h }
+//
+// 可以并发调用（内部是 atomic.Pointer），但语义上建议在 Feed 开始之前
+// 设好：切换之后新到的回调走新 handler，已经在处理中的回调不会重放。
+func (c *Conn) SetHandler(h StreamHandler) {
+	if h == nil {
+		c.handler.Store(nil)
+		return
+	}
+	c.handler.Store(&h)
+}
+
+// getHandler 取当前的流事件处理者。
+func (c *Conn) getHandler() StreamHandler {
+	p := c.handler.Load()
+	if p == nil {
+		return nil
+	}
+	return *p
+}
 
 // ---------------------------------------------------------------------------
 // 收
@@ -245,6 +312,14 @@ func (c *Conn) Feed(data []byte) (int, []byte, error) {
 // **产生的帧留在 outBuf 里不交出去**，由调用方决定怎么拿走（Feed 用
 // takeOutput 交出所有权，FeedWrite 就地写掉再复用那块内存）。
 func (c *Conn) feed(data []byte) (int, error) {
+	// **我方已经发过 GOAWAY**：后面的字节直接丢掉，不能再按帧解析。
+	// 等 goAwayGrace 到点由 ConnHandler 关闭连接。
+	//
+	// 收到对端 GOAWAY 不在这里拦（见 draining 的说明）。
+	if c.draining {
+		return len(data), nil
+	}
+
 	consumed := 0
 
 	// 服务端先认客户端的连接序言。
@@ -285,8 +360,9 @@ func (c *Conn) feed(data []byte) (int, error) {
 			n, err := c.parser.Parse(rest, c.onFrame)
 			consumed += n
 			if err != nil {
-				c.handleErrorKeep(err)
-				return consumed, err
+				if c.handleErrorKeep(err) {
+					return consumed, err
+				}
 			}
 		}
 		return consumed, nil
@@ -298,8 +374,10 @@ func (c *Conn) feed(data []byte) (int, error) {
 		consumed = len(data)
 	}
 	if err != nil {
-		c.handleErrorKeep(err)
-		return consumed, err
+		// 流错误已经回了 RST_STREAM，连接继续用；不把错误往上抛。
+		if c.handleErrorKeep(err) {
+			return consumed, err
+		}
 	}
 	return consumed, nil
 }
@@ -337,17 +415,23 @@ func (c *Conn) handleError(err error) []byte {
 
 // handleErrorKeep 和 handleError 一样，但**把帧留在 outBuf 里不交出去**，
 // 交给 feed 的调用方去写（见 FeedWrite）。
-func (c *Conn) handleErrorKeep(err error) {
+//
+// 返回值是"这条连接还能不能继续用"：流错误写完 RST_STREAM 就返回 false
+// （只废掉那一条流），连接错误返回 true。**流错误不能往上报**——engine
+// 拿到非 nil error 会把整条连接关掉，那等于一个坏请求杀掉同一条连接上
+// 所有正常请求。
+func (c *Conn) handleErrorKeep(err error) (fatal bool) {
 	if err == nil {
-		return
+		return false
 	}
 	if se, ok := asStreamError(err); ok {
 		c.writeFrame(AppendRSTStream(nil, se.StreamID, uint32(se.Code)))
 		c.forgetStream(se.StreamID)
-		return
+		return false
 	}
 	ce := asConnError(err)
 	c.sendGoAway(ce.Code, ce.Msg)
+	return true
 }
 
 // onFrame 处理一个解析出来的帧。
@@ -415,6 +499,12 @@ func (c *Conn) onSettings(f *Frame) error {
 		return nil // 我们发的 SETTINGS 被确认了
 	}
 
+	// SETTINGS 里的窗口/帧大小/编码器参数都会被发包路径读，整段放在
+	// 一个临界区里改。这里不会调业务回调，持锁是安全的。
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	needFlush := false
 	for i := 0; i+6 <= len(f.Payload); i += 6 {
 		id := uint16(f.Payload[i])<<8 | uint16(f.Payload[i+1])
 		val := uint32(f.Payload[i+2])<<24 | uint32(f.Payload[i+3])<<16 |
@@ -442,7 +532,6 @@ func (c *Conn) onSettings(f *Frame) error {
 			delta := int32(val) - int32(c.peerInitialWindow)
 			c.peerInitialWindow = val
 			if delta != 0 {
-				c.mu.Lock()
 				for _, s := range c.streams {
 					if delta > 0 && s.sendWindow > (1<<31-1)-delta {
 						s.sendWindow = 1<<31 - 1
@@ -450,11 +539,7 @@ func (c *Conn) onSettings(f *Frame) error {
 					}
 					s.sendWindow += delta
 				}
-				c.mu.Unlock()
-				// 窗口调大之后攒着的数据要续发（和收到 WINDOW_UPDATE 一样）
-				if err := c.flushPending(); err != nil {
-					return err
-				}
+				needFlush = true
 			}
 		case 0x5: // SETTINGS_MAX_FRAME_SIZE
 			if val < defaultMaxFrameSize || val > MaxFrameSize {
@@ -468,8 +553,18 @@ func (c *Conn) onSettings(f *Frame) error {
 		}
 	}
 
-	// 必须回一个 ACK
-	return c.writeFrame(AppendSettingsAck(nil))
+	// **先回 ACK，再续发 pending**：设置窗口之后产生的 DATA 不能排在
+	// ACK 前面。h2spec（以及一些客户端）在等 SETTINGS ACK 时会丢弃先到
+	// 的其它帧，DATA 先发就等于丢了。
+	c.writeFrameLocked(AppendSettingsAck(nil))
+
+	// 窗口调大之后攒着的数据要续发（和收到 WINDOW_UPDATE 一样）
+	if needFlush {
+		if err := c.flushPendingLocked(); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (c *Conn) onPing(f *Frame) error {
@@ -501,13 +596,14 @@ func (c *Conn) onConnWindowUpdate(f *Frame) error {
 		// 连接级的 0 是协议错误（流级的 0 是允许的，表示"就这个流不要了"）
 		return fmt.Errorf("%w: connection WINDOW_UPDATE increment 0", ErrBadFrameLength)
 	}
+	c.mu.Lock()
 	// 窗口是 31 位（最高位保留），加超了就是 **FLOW_CONTROL_ERROR**
 	// （连接级的，所以要 GOAWAY 不是 RST_STREAM）
 	if c.sendWindow > (1<<31-1)-int32(inc) {
+		c.mu.Unlock()
 		return connError(ErrCodeFlowControl, "connection window overflow: %d + %d",
 			c.sendWindow, inc)
 	}
-	c.mu.Lock()
 	c.sendWindow += int32(inc)
 	c.mu.Unlock()
 
@@ -521,14 +617,19 @@ func (c *Conn) onConnWindowUpdate(f *Frame) error {
 
 // onStreamWindowUpdate 对端给某个流的发送窗口加了额度。
 func (c *Conn) onStreamWindowUpdate(f *Frame) error {
-	// **idle 上不能发 WINDOW_UPDATE**（RFC 9113 5.1 / 6.9）：没有流
-	// 哪来的窗口。这是连接级错误。
-	if err := c.checkStreamRecv(f.StreamID, frameKindWindowUpdate); err != nil {
-		return err
-	}
-
 	inc := uint32(f.Payload[0])<<24 | uint32(f.Payload[1])<<16 |
 		uint32(f.Payload[2])<<8 | uint32(f.Payload[3])
+
+	c.mu.Lock()
+	// **idle 上不能发 WINDOW_UPDATE**（RFC 9113 5.1 / 6.9）：没有流
+	// 哪来的窗口。这是连接级错误。
+	//
+	// 这个检查要排在 inc==0 前面：两个都错时报哪个错误，h2spec 有
+	// 期望（原来就是这么排的）。
+	if err := c.checkStreamRecvLocked(f.StreamID, frameKindWindowUpdate); err != nil {
+		c.mu.Unlock()
+		return err
+	}
 	if inc == 0 {
 		// **0 是连接级 PROTOCOL_ERROR**（RFC 9113 6.9）。
 		//
@@ -539,20 +640,22 @@ func (c *Conn) onStreamWindowUpdate(f *Frame) error {
 		// 为什么不按字面来：窗口增量是 unsigned 的，0 表示"没有增量"，
 		// 那对发送方就是一个永远解不开的僵局——它发不出去、也不知道
 		// 对端到底是什么意思。规范在 6.9 的末尾把这条明确成了连接错误。
+		c.mu.Unlock()
 		return connError(ErrCodeProtocol, "WINDOW_UPDATE increment 0 on stream %d", f.StreamID)
 	}
 	s := c.streams[f.StreamID]
 	if s == nil {
 		// 流已经关了。RFC 9113 6.9 说可以忽略（窗口更新是异步的，
 		// 对端发出来的时候还不知道我们关了流）。
+		c.mu.Unlock()
 		return nil
 	}
 	if s.sendWindow > (1<<31-1)-int32(inc) {
 		// **加超了 2^31-1 是流级 FLOW_CONTROL_ERROR**（RFC 9113 6.9）
+		c.mu.Unlock()
 		return streamError(f.StreamID, ErrCodeFlowControl,
 			"stream window overflow: %d + %d", s.sendWindow, inc)
 	}
-	c.mu.Lock()
 	s.sendWindow += int32(inc)
 	c.mu.Unlock()
 
@@ -632,72 +735,172 @@ func (c *Conn) finishHeaders(streamID uint32, block []byte, endStream bool) erro
 		return connError(ErrCodeCompression, "HPACK decode: %v", err)
 	}
 
-	// 流的状态检查要在建流之前做（"idle 上收到 DATA" 这类）
-	if err := c.checkStreamRecv(streamID, frameKindHeaders); err != nil {
+	// 流状态检查、建流、头字段校验、写流状态都在同一个临界区里做：
+	//
+	//   - 顺序和原来一致：奇偶/递增这类连接级错误先于头字段校验报出来
+	//     （h2spec 对这些错误的优先级有要求）
+	//   - 中间松开的话，发包路径可能已经把这条流结束并从表里删掉，
+	//     stream() 会把它重新建出来
+	//
+	// 校验是纯函数，不会回调业务，持锁是安全的。
+	c.mu.Lock()
+	if err := c.checkStreamRecvLocked(streamID, frameKindHeaders); err != nil {
+		c.mu.Unlock()
 		return err
 	}
-
+	// 服务端方向：对端在开新流。超过我们声明的并发上限就 REFUSED_STREAM，
+	// 不要让它无限占着 streams 表（慢速客户端可以只发头不收尾）。
+	if !c.isClient && c.localMaxStreams > 0 &&
+		c.streams[streamID] == nil && uint32(len(c.streams)) >= c.localMaxStreams {
+		c.mu.Unlock()
+		return streamError(streamID, ErrCodeRefusedStream,
+			"too many concurrent streams (max %d)", c.localMaxStreams)
+	}
 	s := c.stream(streamID)
 	if s == nil {
+		c.mu.Unlock()
 		return connError(ErrCodeProtocol, "HEADERS on stream %d that is not open", streamID)
 	}
 
-	// 头部校验（RFC 9113 8.3）：伪头、大小写、连接相关字段……
-	// 这些都是**流级**错误——一个头写错了，别的流不受影响。
+	// 这个头块是三种身份之一：
 	//
-	// **方向不同，要求不同**：
-	//   - 收到请求（我们是服务端）：要查 :method/:scheme/:path 齐全
-	//   - 收到响应（我们是客户端）：有 :status，根本没有 :method
+	//   - 第一次头块：请求头（服务端方向）或响应头（客户端方向）
+	//   - trailer：已经收过最终头块之后，再来一个带 END_STREAM 的
+	//     HEADERS（RFC 9113 8.1）
+	//   - 1xx 信息响应：客户端方向、没有 END_STREAM、:status 是 1xx。
+	//     它不结束流，后面还有最终响应头，所以不能把它当最终头块。
 	//
-	// 用同一个函数查两边的话，客户端会把每个正常的响应都判成
-	// "缺少 :method"。
-	var herr string
-	if c.isClient {
-		// 客户端收的是**响应**：只查语法（响应里有 :status，
-		// 不会有 :method/:scheme/:path，不能按请求那套要求）
-		_, herr, _, _, _, _ = validateHeaderSyntax(fields)
-	} else {
-		// 服务端收的是**请求**：伪头要齐全
-		var skip bool
-		skip, herr = validateRequestHeaders(fields)
-		_ = skip
-	}
-	if herr != "" {
-		return streamError(streamID, ErrCodeProtocol, "%s", herr)
+	// **trailer 不能按请求头校验**（它没有 :method/:scheme/:path），
+	// 也不覆盖 s.headers——这是之前 h2spec "POST with trailers" 失败的
+	// 根因：validateRequestHeaders 一直把 trailer 当残缺请求。
+	isTrailer := s.headersDone && endStream
+	isInfo := !s.headersDone && c.isClient && !endStream && informationalStatus(fields)
+
+	// 收过最终头块之后又来了一个不结束流的 HEADERS：协议上没有这种
+	// 东西（trailer 必须带 END_STREAM，1xx 只能出现在最终响应之前）。
+	if s.headersDone && !endStream {
+		c.mu.Unlock()
+		return streamError(streamID, ErrCodeProtocol,
+			"second HEADERS without END_STREAM on stream %d", streamID)
 	}
 
-	s.headers = append(s.headers[:0], fields...)
-
-	// 记下 content-length（服务端方向：请求体的长度声明）
-	if !c.isClient {
-		cl, ok, verr := contentLengthOf(fields)
-		if verr != "" {
-			return streamError(streamID, ErrCodeProtocol, "%s", verr)
+	var handlerFields []HeaderField
+	switch {
+	case isInfo:
+		// 1xx：只做语法校验，要求有 :status，不写 s.headers。
+		_, herr, _, _, _, hasStatus := validateHeaderSyntax(fields)
+		if herr != "" {
+			c.mu.Unlock()
+			return streamError(streamID, ErrCodeProtocol, "%s", herr)
 		}
-		if ok {
-			s.expectContentLength = cl
+		if !hasStatus {
+			c.mu.Unlock()
+			return streamError(streamID, ErrCodeProtocol, "informational response without :status")
+		}
+		handlerFields = fields
+
+	case isTrailer:
+		// trailer 只做语法校验；伪头一律不允许（RFC 9113 8.1）。
+		_, herr, hasMethod, hasScheme, hasPath, hasStatus := validateHeaderSyntax(fields)
+		if herr != "" {
+			c.mu.Unlock()
+			return streamError(streamID, ErrCodeProtocol, "%s", herr)
+		}
+		if hasMethod || hasScheme || hasPath || hasStatus {
+			c.mu.Unlock()
+			return streamError(streamID, ErrCodeProtocol, "pseudo-header in trailers")
+		}
+		s.trailers = append(s.trailers[:0], fields...)
+		handlerFields = s.trailers
+
+	default:
+		// 第一次头块：按方向做完整校验。
+		//
+		// **方向不同，要求不同**：
+		//   - 收到请求（我们是服务端）：要查 :method/:scheme/:path 齐全
+		//   - 收到响应（我们是客户端）：只查语法，不要求请求伪头
+		if c.isClient {
+			_, herr, _, _, _, _ := validateHeaderSyntax(fields)
+			if herr != "" {
+				c.mu.Unlock()
+				return streamError(streamID, ErrCodeProtocol, "%s", herr)
+			}
 		} else {
-			s.expectContentLength = -1
+			_, herr := validateRequestHeaders(fields)
+			if herr != "" {
+				c.mu.Unlock()
+				return streamError(streamID, ErrCodeProtocol, "%s", herr)
+			}
+		}
+
+		s.headers = append(s.headers[:0], fields...)
+		s.headersDone = true
+		handlerFields = s.headers
+
+		// 记下 content-length（服务端方向：请求体的长度声明）
+		if !c.isClient {
+			cl, ok, verr := contentLengthOf(fields)
+			if verr != "" {
+				c.mu.Unlock()
+				return streamError(streamID, ErrCodeProtocol, "%s", verr)
+			}
+			if ok {
+				s.expectContentLength = cl
+			} else {
+				s.expectContentLength = -1
+			}
 		}
 	}
+	c.mu.Unlock()
 
-	if c.handler != nil {
-		c.handler.OnHeaders(c, streamID, s.headers, endStream)
+	// **回调必须在锁外**：handler 里会直接写响应（见 Conn 的并发模型）。
+	//
+	// trailer 也走 OnHeaders：第二次调用、endStream=true、参数是 trailer
+	// 字段，s.headers 仍然是原来的请求/响应头。这样老的 handler 不改也能
+	// 正常工作（gRPC 客户端就是靠这个从 trailer 里读 grpc-status）。
+	if h := c.getHandler(); h != nil {
+		h.OnHeaders(c, streamID, handlerFields, endStream)
 	}
+
+	// 1xx 不结束流：没有 END_STREAM 可推进，直接返回。
+	if isInfo {
+		return nil
+	}
+
+	c.mu.Lock()
 	c.applyRecvEndStream(s, endStream)
 
-	// END_STREAM 就在头里的（GET 这种没有 body 的请求）：这时候就要核对
-	// "声明了 content-length 却没发数据"的情况。
+	// END_STREAM 就在头里/trailer 里的（GET 这种没有 body 的请求，
+	// 或者 trailer 结束的请求）：这时候就要核对"声明了 content-length
+	// 却没发数据"的情况。
 	//
 	// 同样**只查请求方向**——客户端收到的是响应，它的 content-length
 	// 说的是响应体长度，拿它去量请求是错的。
 	if endStream && !c.isClient {
 		if err := c.checkContentLength(s); err != nil {
+			c.mu.Unlock()
 			return err
 		}
 	}
 	c.forgetIfClosed(s)
+	c.mu.Unlock()
 	return nil
+}
+
+// informationalStatus 判断响应头里的 :status 是不是 1xx。
+//
+// 1xx 的信息响应不结束流，后面还会有最终响应头；不能把它当最终头块
+// （否则后面的最终响应会被当成 trailer 或第二个 HEADERS 报错）。
+func informationalStatus(fields []HeaderField) bool {
+	for _, f := range fields {
+		if f.Name != ":status" {
+			continue
+		}
+		return len(f.Value) == 3 && f.Value[0] == '1' &&
+			f.Value[1] >= '0' && f.Value[1] <= '9' &&
+			f.Value[2] >= '0' && f.Value[2] <= '9'
+	}
+	return false
 }
 
 // checkContentLength 核对"声明了 content-length 的请求，实际收到多少"。
@@ -715,13 +918,17 @@ func (c *Conn) checkContentLength(s *Stream) error {
 }
 
 // forgetIfClosed 流两边都结束了就从表里拿掉。
+//
+// **调用方必须持有 c.mu**。
 func (c *Conn) forgetIfClosed(s *Stream) {
 	if s.state == StreamClosed {
-		c.forgetStream(s.ID)
+		c.forgetStreamLocked(s.ID)
 	}
 }
 
 // applyRecvEndStream 对端发了 END_STREAM：推进流的状态。
+//
+// **调用方必须持有 c.mu**（收包路径在回调返回后、同一个临界区里调它）。
 func (c *Conn) applyRecvEndStream(s *Stream, endStream bool) {
 	if !endStream {
 		return
@@ -732,12 +939,19 @@ func (c *Conn) applyRecvEndStream(s *Stream, endStream bool) {
 		s.state = StreamHalfClosedRemote
 	case StreamHalfClosedLocal:
 		s.state = StreamClosed
-		c.forgetStream(s.ID)
+		c.forgetStreamLocked(s.ID)
 	}
 }
 
 // forgetStream 流关了就把它从表里拿掉（不然 map 只涨不消）。
 func (c *Conn) forgetStream(id uint32) {
+	c.mu.Lock()
+	c.forgetStreamLocked(id)
+	c.mu.Unlock()
+}
+
+// forgetStreamLocked 是 forgetStream 的持锁版本。
+func (c *Conn) forgetStreamLocked(id uint32) {
 	delete(c.streams, id)
 }
 
@@ -768,15 +982,8 @@ func (c *Conn) applyLocalEndStreamLocked(s *Stream) {
 		s.state = StreamHalfClosedLocal
 	case StreamHalfClosedRemote:
 		s.state = StreamClosed
-		c.forgetStream(s.ID)
+		c.forgetStreamLocked(s.ID)
 	}
-}
-
-// endStreamLocal 发完一个带 END_STREAM 的帧之后调（自己拿锁）。
-func (c *Conn) endStreamLocal(streamID uint32) {
-	c.mu.Lock()
-	c.applyLocalEndStreamLocked(c.streams[streamID])
-	c.mu.Unlock()
 }
 
 // frameKind 是"收到的帧"这种类别（用于状态检查）。
@@ -806,7 +1013,11 @@ const (
 //
 // 返回的错误是流级还是连接级，取决于规范怎么说——同一个动作在不同
 // 状态下要求的错误级别不一样（比如 RST_STREAM 在 idle 上是连接错误）。
-func (c *Conn) checkStreamRecv(streamID uint32, kind frameKind) error {
+//
+// **调用方必须持有 c.mu**：它读 streams 表和流的状态，并更新
+// maxPeerStreamID。收包侧的调用者通常还要在同一个临界区里接着取/建流，
+// 所以这里不自己加锁（见 onData/finishHeaders 的用法）。
+func (c *Conn) checkStreamRecvLocked(streamID uint32, kind frameKind) error {
 	s := c.streams[streamID]
 
 	// **奇偶和递增这两条只管"开新流"**（RFC 9113 5.1.1）。
@@ -947,17 +1158,23 @@ func (c *Conn) onData(f *Frame) error {
 		payload = payload[:len(payload)-padLen]
 	}
 
+	endStream := f.Flags&FlagDataEndStream != 0
+
+	// 状态检查、流查找、接收流控记账、recvBodyLen 一次做完：这些都是
+	// 发包路径也会碰的共享状态。回调放在锁外（见 Conn 的并发模型）。
+	c.mu.Lock()
 	// 状态检查：idle 上不能发 DATA，half-closed(remote)/closed 上也不行
 	// （RFC 9113 5.1）
-	if err := c.checkStreamRecv(f.StreamID, frameKindData); err != nil {
+	if err := c.checkStreamRecvLocked(f.StreamID, frameKindData); err != nil {
+		c.mu.Unlock()
 		return err
 	}
 
 	s := c.streams[f.StreamID]
 	if s == nil {
+		c.mu.Unlock()
 		return connError(ErrCodeProtocol, "DATA on stream %d that is not open", f.StreamID)
 	}
-	endStream := f.Flags&FlagDataEndStream != 0
 
 	// **接收流控**：对端能发这么多是因为我们给了额度，收多少就要还多少。
 	//
@@ -968,11 +1185,13 @@ func (c *Conn) onData(f *Frame) error {
 	//
 	// **两级都要还**：连接级和流级。只还流级的话，多个流一起跑的时候
 	// 连接级窗口先耗尽，对端还是卡住。
-	if err := c.giveRecvWindow(f.StreamID, int32(len(f.Payload))); err != nil {
+	if err := c.giveRecvWindowLocked(f.StreamID, int32(len(f.Payload))); err != nil {
+		c.mu.Unlock()
 		return err
 	}
 
 	s.recvBodyLen += int64(len(payload))
+	c.mu.Unlock()
 
 	// **空载荷也要回调**（只要带 END_STREAM）：一个空的 DATA + END_STREAM 是
 	// "这段没有，流到此结束"的合法写法——bodyless 的 POST、以及"只写响应头
@@ -980,9 +1199,11 @@ func (c *Conn) onData(f *Frame) error {
 	// END_STREAM 这件事就传不上去：协议的上面那层永远等不到"结束了"
 	// （实测：请求级 handler 的响应收尾、examples/http2/client 都卡在这；
 	// 真实客户端发的空体请求同理）。
-	if c.handler != nil && (len(payload) > 0 || endStream) {
-		c.handler.OnData(c, f.StreamID, payload, endStream)
+	if h := c.getHandler(); h != nil && (len(payload) > 0 || endStream) {
+		h.OnData(c, f.StreamID, payload, endStream)
 	}
+
+	c.mu.Lock()
 	if endStream {
 		// **收到最后一段才核对**（RFC 9113 8.1.1）：
 		// 声明的 content-length 和实际字节数对不上，是流级 PROTOCOL_ERROR。
@@ -996,12 +1217,14 @@ func (c *Conn) onData(f *Frame) error {
 		// ——拿响应的声明去量请求的数据，永远是错的。
 		if !c.isClient {
 			if err := c.checkContentLength(s); err != nil {
+				c.mu.Unlock()
 				return err
 			}
 		}
 	}
 	c.applyRecvEndStream(s, endStream)
 	c.forgetIfClosed(s)
+	c.mu.Unlock()
 	return nil
 }
 
@@ -1029,10 +1252,9 @@ func (c *Conn) onData(f *Frame) error {
 // 连接级和流级是**两套独立的账**：连接级是所有流共享的，流级是这个流
 // 自己的。两边都要还——只还一边的话对端要么在连接窗口上耗尽、要么在
 // 这个流上耗尽。
-func (c *Conn) giveRecvWindow(streamID uint32, n int32) error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
+// **调用方必须持有 c.mu**（见 onData：它和状态检查、recvBodyLen 记账在
+// 同一个临界区里）。
+func (c *Conn) giveRecvWindowLocked(streamID uint32, n int32) error {
 	c.recvWindow -= n
 	if c.recvWindow < 0 {
 		return fmt.Errorf("%w: connection window exceeded", ErrFlowControl)
@@ -1060,17 +1282,20 @@ func (c *Conn) giveRecvWindow(streamID uint32, n int32) error {
 }
 
 func (c *Conn) onRSTStream(f *Frame) error {
+	c.mu.Lock()
 	// **idle 上不能发 RST_STREAM**（RFC 9113 5.1）：对端在重置一个
 	// 双方都还没建的流，那说明它对我们这边的状态理解是错的——连接级
 	// 错误，不能只当"忽略这一个流"。
-	if err := c.checkStreamRecv(f.StreamID, frameKindRSTStream); err != nil {
+	if err := c.checkStreamRecvLocked(f.StreamID, frameKindRSTStream); err != nil {
+		c.mu.Unlock()
 		return err
 	}
+	c.mu.Unlock()
 
 	code := ErrCode(uint32(f.Payload[0])<<24 | uint32(f.Payload[1])<<16 |
 		uint32(f.Payload[2])<<8 | uint32(f.Payload[3]))
-	if c.handler != nil {
-		c.handler.OnRSTStream(c, f.StreamID, code)
+	if h := c.getHandler(); h != nil {
+		h.OnRSTStream(c, f.StreamID, code)
 	}
 	c.forgetStream(f.StreamID)
 	return nil
@@ -1080,6 +1305,9 @@ func (c *Conn) onRSTStream(f *Frame) error {
 // 流
 
 // stream 取一个流，没有就建（对端发起的就是这样）。
+//
+// **调用方必须持有 c.mu**：它会改 maxLocalStreamID 和 streams 表。收包路径
+// 和发包路径都会调，不能再假设只有一个 goroutine 碰这张表。
 func (c *Conn) stream(id uint32) *Stream {
 	// 按奇偶记下"我们这边开过的最大 ID"，关流之后还要靠它区分
 	// "已关闭"和"从没开过"（见 maxLocalStreamID 的说明）。
@@ -1111,6 +1339,14 @@ type Stream struct {
 	state   StreamState
 	headers []HeaderField
 
+	// headersDone 已经收过**最终**头块（请求/响应头）。之后再收到的
+	// 带 END_STREAM 的 HEADERS 就是 trailer。
+	//
+	// 1xx 信息响应不算：它不结束流，后面还有最终响应头。
+	headersDone bool
+	// trailers 是收到的 trailer 字段（只在收到时有值）。
+	trailers []HeaderField
+
 	// remoteEnded 对端发了 END_STREAM
 	remoteEnded bool
 	// localEnded 我们发了 END_STREAM
@@ -1132,6 +1368,11 @@ type Stream struct {
 	recvBodyLen int64
 }
 
+// Trailers 返回收到的 trailer 字段。
+//
+// 切片指向流内部，下一次头块到来之前有效；要留着就自己拷一份。
+func (s *Stream) Trailers() []HeaderField { return s.trailers }
+
 // StreamState 是流的状态（RFC 9113 5.1 的状态机）。
 type StreamState uint8
 
@@ -1143,11 +1384,34 @@ const (
 	StreamClosed
 )
 
-// GetStream 取一个流。
-func (c *Conn) GetStream(id uint32) *Stream { return c.streams[id] }
+// GetStream 取一个流的**快照**。
+//
+// 返回的是拷贝：headers/trailers 也单独拷了一份，之后收发两条路径继续
+// 修改活流不会影响它。可以安全地跨 goroutine 读；但它不是活的，不能
+// 通过它改连接状态。
+func (c *Conn) GetStream(id uint32) *Stream {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	s := c.streams[id]
+	if s == nil {
+		return nil
+	}
+	cp := *s
+	if len(s.headers) > 0 {
+		cp.headers = append([]HeaderField(nil), s.headers...)
+	}
+	if len(s.trailers) > 0 {
+		cp.trailers = append([]HeaderField(nil), s.trailers...)
+	}
+	return &cp
+}
 
 // CloseStream 关掉一个流（发完响应之后调）。
-func (c *Conn) CloseStream(id uint32) { delete(c.streams, id) }
+func (c *Conn) CloseStream(id uint32) {
+	c.mu.Lock()
+	delete(c.streams, id)
+	c.mu.Unlock()
+}
 
 // ---------------------------------------------------------------------------
 // 发
@@ -1159,6 +1423,9 @@ func (c *Conn) CloseStream(id uint32) { delete(c.streams, id) }
 // 我们开了流却不登记的话，对端的响应回来会被当成"对端在开一个新流"
 // ——奇偶校验立刻报错（RFC 9113 5.1.1），正常的响应全被拒。
 func (c *Conn) NewStreamID() uint32 {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
 	id := c.nextStreamID
 	c.nextStreamID += 2 // 同方向的流 ID 要跳 2（保持奇偶性）
 	c.stream(id)        // 登记（顺带初始化两个方向的窗口）
@@ -1167,6 +1434,11 @@ func (c *Conn) NewStreamID() uint32 {
 
 // WriteHeaders 发一个 HEADERS 帧。
 func (c *Conn) WriteHeaders(streamID uint32, fields []HeaderField, endStream bool) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	// Encode 和写帧必须在同一个临界区里：block 指向编码器内部复用的
+	// 缓冲，下一次 Encode 会覆盖它；同时流登记也要和写帧保持顺序。
 	block, err := c.encoder.Encode(fields)
 	if err != nil {
 		return err
@@ -1174,23 +1446,21 @@ func (c *Conn) WriteHeaders(streamID uint32, fields []HeaderField, endStream boo
 	// 登记这个流（我们开的：response 方向）。已经存在就什么都不做。
 	c.stream(streamID)
 	// 头块比分片上限大要拆成 HEADERS + CONTINUATION
-	return c.writeHeaderBlock(streamID, block, endStream)
+	return c.writeHeaderBlockLocked(streamID, block, endStream)
 }
 
 // writeHeaderBlock 把头块按分片上限拆开发。
 //
 // RFC 9113 4.3：头块超过 SETTINGS_MAX_FRAME_SIZE 要拆成 HEADERS +
 // 若干 CONTINUATION，中间不能夹别的帧（所以这里一次全发出去）。
-func (c *Conn) writeHeaderBlock(streamID uint32, block []byte, endStream bool) error {
+func (c *Conn) writeHeaderBlockLocked(streamID uint32, block []byte, endStream bool) error {
 	max := int(c.peerMaxFrameSize)
 	first := len(block) <= max
 
 	if first {
-		if err := c.writeFrame(AppendHeaders(nil, streamID, block, endStream, true)); err != nil {
-			return err
-		}
+		c.writeFrameLocked(AppendHeaders(nil, streamID, block, endStream, true))
 		if endStream {
-			c.endStreamLocal(streamID)
+			c.applyLocalEndStreamLocked(c.streams[streamID])
 		}
 		return nil
 	}
@@ -1207,11 +1477,9 @@ func (c *Conn) writeHeaderBlock(streamID uint32, block []byte, endStream bool) e
 		buf = append(buf, block[:n]...)
 		block = block[n:]
 	}
-	if err := c.writeFrame(buf); err != nil {
-		return err
-	}
+	c.writeFrameLocked(buf)
 	if endStream {
-		c.endStreamLocal(streamID)
+		c.applyLocalEndStreamLocked(c.streams[streamID])
 	}
 	return nil
 }
@@ -1233,6 +1501,9 @@ func boolToFlag(b bool, f uint8) uint8 {
 // trailer 里放 grpc-status。为什么状态不放在响应头里：服务端可能要把
 // 数据流式发出去，发到最后才知道结果（或者半路才出错）。
 func (c *Conn) WriteTrailers(streamID uint32, fields []HeaderField) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
 	block, err := c.encoder.Encode(fields)
 	if err != nil {
 		return err
@@ -1240,9 +1511,11 @@ func (c *Conn) WriteTrailers(streamID uint32, fields []HeaderField) error {
 	// trailer 必须带 END_STREAM（不然接收端不知道流结束了）
 	max := int(c.peerMaxFrameSize)
 	if len(block) <= max {
-		return c.writeFrame(AppendHeaders(nil, streamID, block, true, true))
+		c.writeFrameLocked(AppendHeaders(nil, streamID, block, true, true))
+		c.applyLocalEndStreamLocked(c.streams[streamID])
+		return nil
 	}
-	return c.writeHeaderBlock(streamID, block, true)
+	return c.writeHeaderBlockLocked(streamID, block, true)
 }
 
 // WriteData 发一段 DATA。
@@ -1268,6 +1541,15 @@ func (c *Conn) WriteData(streamID uint32, data []byte, endStream bool) error {
 
 // writeDataLocked 是 WriteData 的实现，调用方要持锁。
 func (c *Conn) writeDataLocked(streamID uint32, data []byte, endStream bool) error {
+	// **有积压就必须排到后面**：同一个流上的 DATA 和 END_STREAM 顺序不能
+	// 乱。尤其是 WriteData(nil, true)（响应收尾的空帧）——它不消耗流控
+	// 窗口，如果走快路径直接发出去，就会排在还没发出去的 body 前面，
+	// 对端看到"流已经结束"之后又收到 body。
+	if len(c.pending) > 0 {
+		c.appendPending(streamID, data, endStream)
+		return nil
+	}
+
 	// **帧直接建在发送缓冲上**，不要 AppendData(nil, ...) 再 append 进去：
 	//
 	//	AppendData(nil, ...)    分配一块，把体拷进去
@@ -1401,6 +1683,12 @@ func (c *Conn) appendPending(streamID uint32, data []byte, endStream bool) {
 func (c *Conn) flushPending() error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	return c.flushPendingLocked()
+}
+
+// flushPendingLocked 是 flushPending 的持锁版本（onSettings 里要在同一个
+// 临界区里改窗口再续发）。
+func (c *Conn) flushPendingLocked() error {
 	if len(c.pending) == 0 {
 		return nil
 	}
@@ -1409,6 +1697,19 @@ func (c *Conn) flushPending() error {
 	// 从头扫，遇到发不完的就停下（保持顺序）。
 	for len(c.pending) > 0 {
 		p := &c.pending[0]
+
+		// 零长度 DATA 不消耗流控窗口：队首如果只是一个收尾的空帧，不用
+		// 等 WINDOW_UPDATE。**只有队首能走这条**——前面还有 body 的话
+		// 已经在下面 blocked 分支返回了，顺序不会乱。
+		if len(p.data) == 0 {
+			c.writeFrameLocked(AppendData(nil, p.streamID, nil, p.endStream))
+			if p.endStream {
+				c.applyLocalEndStreamLocked(c.streams[p.streamID])
+			}
+			c.pending[0] = pendingData{}
+			c.pending = c.pending[1:]
+			continue
+		}
 
 		avail := c.sendWindow
 		if s := c.streams[p.streamID]; s != nil && s.sendWindow < avail {
@@ -1455,6 +1756,7 @@ func (c *Conn) flushPending() error {
 // sendGoAway 发 GOAWAY。
 func (c *Conn) sendGoAway(code ErrCode, debug string) []byte {
 	c.state = stateClosed
+	c.draining = true
 	c.goAway = true
 	buf := AppendGoAway(nil, c.lastStreamID, uint32(code), []byte(debug))
 	c.mu.Lock()
@@ -1519,12 +1821,16 @@ func (c *Conn) WriteRaw(b []byte) {
 // 名字里的 Must 是"要么成功要么 panic"：编码失败只可能是动态表满了这种
 // 我们自己状态的问题，不是调用方传错了参数。
 func (c *Conn) MustHeaders(streamID uint32, fields []HeaderField, endStream bool) []byte {
+	// 和 WriteHeaders 一样要持锁：encoder 和 streams 表都是共享状态。
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
 	block, err := c.encoder.Encode(fields)
 	if err != nil {
 		panic("http2: encode headers: " + err.Error())
 	}
-	// 和 WriteHeaders 一样：发头就意味着这个流存在了，登记上。
-	// 不登记的话，对端回过来的帧会被当成"新流"而报奇偶错误。
+	// 发头就意味着这个流存在了，登记上。不登记的话，对端回过来的帧会被
+	// 当成"新流"而报奇偶错误。
 	c.stream(streamID)
 	var buf []byte
 	buf = AppendHeaders(buf, streamID, block, endStream, true)
@@ -1534,7 +1840,9 @@ func (c *Conn) MustHeaders(streamID uint32, fields []HeaderField, endStream bool
 // MustData 拼 DATA 帧（超过分片上限会拆成多个）。载荷全部拷贝进返回值，
 // 调用方可以立刻复用原来的切片。
 func (c *Conn) MustData(streamID uint32, data []byte, endStream bool) []byte {
+	c.mu.Lock()
 	max := int(c.peerMaxFrameSize)
+	c.mu.Unlock()
 	var buf []byte
 	for len(data) > 0 {
 		n := max

@@ -18,6 +18,7 @@ import (
 	"errors"
 	"strconv"
 	"strings"
+	"sync"
 
 	"github.com/antlabs/fio/engine"
 	"github.com/antlabs/fio/http"
@@ -44,6 +45,19 @@ import (
 // （httparser 报 ErrHeaderTooLarge）的处置对齐。
 const defMaxHeaderSize = 32 * 1024
 
+// defMaxBodySize 是请求体的默认上限（8MB）。
+//
+// Content-Length 是对端声明的，不能拿来直接分配；真收到超限的数据时
+// 直接回 413，不再往 body 里 append。这样慢速客户端没法用一条流把
+// 服务端内存撑爆。0 表示不限制（SetMaxBodySize(0)）。
+const defMaxBodySize = 8 << 20
+
+// maxPreallocBodyH2 是"按 Content-Length 预分配"的上限。
+//
+// 和 http1 的 maxPreallocBody 一个意思：Content-Length 是声明，不能
+// 直接信；1MB 覆盖常见请求，超过的走 append 慢慢长。
+const maxPreallocBodyH2 = 1 << 20
+
 // errWriterNotSupported 请求级的 h2 Writer 不支持的操作。
 //
 // WriteRaw/WritePrepared 是"整条响应（含状态行和头）已经拼好"那种语义，
@@ -64,8 +78,19 @@ func NewConnHandler(h http.Handler, maxHeaderSize int32) *ConnHandler {
 	return NewStreamConnHandler(&httpBridge{
 		h:             h,
 		maxHeaderSize: int(maxHeaderSize),
+		maxBodySize:   defMaxBodySize,
 		streams:       make(map[uint32]*streamReq),
 	})
+}
+
+// SetMaxBodySize 设单请求体上限（字节）。n <= 0 表示不限制。
+//
+// 只对 NewConnHandler 建的请求级处理器有效；流级处理器（gRPC 等）自己
+// 管消息大小。
+func (ch *ConnHandler) SetMaxBodySize(n int64) {
+	if b, ok := ch.handler.(*httpBridge); ok {
+		b.maxBodySize = n
+	}
 }
 
 // httpBridge 是 StreamHandler 的请求级实现。**每条连接一个**
@@ -74,9 +99,16 @@ func NewConnHandler(h http.Handler, maxHeaderSize int32) *ConnHandler {
 type httpBridge struct {
 	h             http.Handler
 	maxHeaderSize int
+	maxBodySize   int64
 
 	// streams 是"还没收齐的请求"
 	streams map[uint32]*streamReq
+
+	// reqPool 复用 streamReq（含 header map / body 底层数组）。
+	//
+	// 能池化的前提是 http.Handler 的约定：Request 只在 ServeHTTP 调用
+	// 期间有效，handler 不能存起来。和 net/http 的约束一样。
+	reqPool sync.Pool
 
 	// 连接级复用：每来一个请求 reset 一次，不每请求分配
 	ctx *http.Ctx
@@ -84,21 +116,134 @@ type httpBridge struct {
 	w   *h2Writer
 }
 
+// rejectedStreamReq 是"这个流已经被 431/413 拒掉了"的哨兵。
+//
+// 用它占着 streams 表，后面的 DATA/trailer 就直接丢掉，不会因为
+// b.streams[id] == nil 又被当成一个新请求。共享一个空对象，不为每个
+// 被拒的流分配。
+var rejectedStreamReq = &streamReq{}
+
+// 复用上限：单个请求留下太大的 map/body 就不再留着，避免一条连接
+// 处理过一次大请求后长期攥着那块内存。
+const (
+	maxReuseHeaderEntries = 64
+	maxReuseBodyCap       = maxPreallocBodyH2
+	maxReuseTrailerCap    = 64
+)
+
+// getStreamReq 从池里取一个复位好的 streamReq。
+func (b *httpBridge) getStreamReq() *streamReq {
+	if v := b.reqPool.Get(); v != nil {
+		s := v.(*streamReq)
+		if s.header == nil {
+			s.header = make(map[string]string, 8)
+		} else {
+			clear(s.header)
+		}
+		s.method, s.path = "", ""
+		s.trailers = s.trailers[:0]
+		s.body = s.body[:0]
+		s.contentLen = -1
+		s.headerSize = 0
+		return s
+	}
+	return &streamReq{
+		header:     make(map[string]string, 8),
+		contentLen: -1,
+	}
+}
+
+// putStreamReq 把 streamReq 还回池子并清掉引用（header map/body 可以
+// 复用到下一个请求）。
+func (b *httpBridge) putStreamReq(s *streamReq) {
+	if len(s.header) > maxReuseHeaderEntries {
+		s.header = nil
+	} else {
+		clear(s.header)
+	}
+	if cap(s.body) > maxReuseBodyCap {
+		s.body = nil
+	} else {
+		s.body = s.body[:0]
+	}
+	if cap(s.trailers) > maxReuseTrailerCap {
+		s.trailers = nil
+	} else {
+		s.trailers = s.trailers[:0]
+	}
+	s.method, s.path = "", ""
+	s.contentLen = -1
+	s.headerSize = 0
+	b.reqPool.Put(s)
+}
+
 // streamReq 是一条流上收到的请求（攒到 END_STREAM 才交给 handler）。
 type streamReq struct {
 	method     string
 	path       string
 	header     map[string]string
+	trailers   []HeaderField
 	body       []byte
 	contentLen int64
 	headerSize int
 }
 
 func (b *httpBridge) OnHeaders(c *Conn, streamID uint32, headers []HeaderField, endStream bool) {
-	s := &streamReq{
-		header:     make(map[string]string, len(headers)),
-		contentLen: -1, // 没有 content-length 头时和 http1 一样是 -1
+	// 第二次 OnHeaders 是 trailer：请求头已经在下面那条路上收好了，
+	// 这里只把 trailer 挂到同一个请求上，等 END_STREAM 一起交给 handler。
+	if s := b.streams[streamID]; s != nil {
+		if s == rejectedStreamReq {
+			// 这个流已经被 431/413 拒了：trailer 直接丢掉，流结束就清表。
+			if endStream {
+				delete(b.streams, streamID)
+			}
+			return
+		}
+		s.trailers = append(s.trailers[:0], headers...)
+		if endStream {
+			b.serve(c, streamID, s)
+		}
+		return
 	}
+
+	// 先只算大小/Content-Length，不急着从池里取 streamReq：被 431/413
+	// 拒掉的请求不该产生任何分配。
+	var (
+		headerSize int
+		contentLen int64 = -1 // 没有 content-length 头时和 http1 一样是 -1
+	)
+	for _, f := range headers {
+		headerSize += len(f.Name) + len(f.Value) + 32
+		// h2 的头名必须是小写（validateHeaderSyntax 会拒大写），这里
+		// 不能用 http1 那种 "Content-Length" 写法，否则永远查不到。
+		if f.Name == "content-length" {
+			if n, err := strconv.ParseInt(f.Value, 10, 64); err == nil {
+				contentLen = n
+			}
+		}
+	}
+
+	// **头太大直接拒**：不要等到 END_STREAM 才回 431——那之前对端还可以
+	// 灌一个很大的 body，白占内存。
+	if headerSize > b.maxHeaderSize {
+		if !endStream {
+			b.streams[streamID] = rejectedStreamReq
+		}
+		_ = c.WriteHeaders(streamID, []HeaderField{{Name: ":status", Value: "431"}}, true)
+		return
+	}
+	// Content-Length 超限也直接拒（413），不建 streamReq。
+	if b.maxBodySize > 0 && contentLen > b.maxBodySize {
+		if !endStream {
+			b.streams[streamID] = rejectedStreamReq
+		}
+		_ = c.WriteHeaders(streamID, []HeaderField{{Name: ":status", Value: "413"}}, true)
+		return
+	}
+
+	s := b.getStreamReq()
+	s.headerSize = headerSize
+	s.contentLen = contentLen
 	for _, f := range headers {
 		switch f.Name {
 		case ":method":
@@ -114,12 +259,12 @@ func (b *httpBridge) OnHeaders(c *Conn, streamID uint32, headers []HeaderField, 
 		default:
 			s.header[f.Name] = f.Value
 		}
-		s.headerSize += len(f.Name) + len(f.Value) + 32
 	}
-	if v, ok := s.header["Content-Length"]; ok {
-		if n, err := strconv.ParseInt(v, 10, 64); err == nil {
-			s.contentLen = n
-		}
+
+	// 按声明的大小预分配，但只信 1MB 以内（和 http1 的 maxPreallocBody
+	// 一个口径）。池里拿回来的 body 可能更大，够用就不重新分配。
+	if s.contentLen > 0 && s.contentLen <= maxPreallocBodyH2 && cap(s.body) < int(s.contentLen) {
+		s.body = make([]byte, 0, int(s.contentLen))
 	}
 
 	b.streams[streamID] = s
@@ -133,6 +278,20 @@ func (b *httpBridge) OnData(c *Conn, streamID uint32, data []byte, endStream boo
 	if s == nil {
 		return
 	}
+	if s == rejectedStreamReq {
+		if endStream {
+			delete(b.streams, streamID)
+		}
+		return
+	}
+	// 没有 Content-Length 的请求也要有上限：超了直接 413，并把这个
+	// streamReq 丢掉，后面的 DATA 就不收了。
+	if b.maxBodySize > 0 && int64(len(s.body))+int64(len(data)) > b.maxBodySize {
+		delete(b.streams, streamID)
+		b.putStreamReq(s)
+		_ = c.WriteHeaders(streamID, []HeaderField{{Name: ":status", Value: "413"}}, true)
+		return
+	}
 	// data 指向引擎的读缓冲区（只在这次回调里有效），要拷一份攒起来
 	s.body = append(s.body, data...)
 	if endStream {
@@ -141,12 +300,20 @@ func (b *httpBridge) OnData(c *Conn, streamID uint32, data []byte, endStream boo
 }
 
 func (b *httpBridge) OnRSTStream(c *Conn, streamID uint32, code ErrCode) {
-	delete(b.streams, streamID)
+	if s := b.streams[streamID]; s != nil {
+		delete(b.streams, streamID)
+		if s != rejectedStreamReq {
+			b.putStreamReq(s)
+		}
+	}
 }
 
 // serve 请求收齐了：交给用户的 handler，再把响应编回去。
 func (b *httpBridge) serve(c *Conn, streamID uint32, s *streamReq) {
 	delete(b.streams, streamID)
+	// Request 只在 ServeHTTP 期间有效（和 net/http 一样），之后就可以
+	// 把 streamReq 还回池子。
+	defer b.putStreamReq(s)
 
 	if s.headerSize > b.maxHeaderSize {
 		// 头太大：431（和 http1 那边一致）
@@ -167,7 +334,14 @@ func (b *httpBridge) serve(c *Conn, streamID uint32, s *streamReq) {
 		Body:          s.body,
 		ContentLength: s.contentLen,
 	}
-	*b.w = h2Writer{c: c, streamID: streamID}
+	if len(s.trailers) > 0 {
+		tr := make(map[string]string, len(s.trailers))
+		for _, f := range s.trailers {
+			tr[f.Name] = f.Value
+		}
+		b.req.Trailer = tr
+	}
+	b.w.reset(c, streamID)
 
 	// 和 http1 一样：handler 跑在连接的 goroutine 上（这里是流回调，
 	// 也就是这条连接的引擎 goroutine），**不能阻塞**。
@@ -188,6 +362,17 @@ type h2Writer struct {
 	sent  bool
 	ended bool
 	err   error
+}
+
+// reset 把 writer 复位到新请求，**保留 header map** 给下一个请求复用。
+func (w *h2Writer) reset(c *Conn, streamID uint32) {
+	w.c = c
+	w.streamID = streamID
+	w.status = 0
+	w.sent = false
+	w.ended = false
+	w.err = nil
+	clear(w.header)
 }
 
 func (w *h2Writer) Header() map[string][]string {

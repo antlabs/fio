@@ -314,19 +314,23 @@ func TestContinuationRoundTrip(t *testing.T) {
 		{Name: ":path", Value: "/a/very/long/path/that/will/not/fit/in/one/frame"},
 		{Name: "user-agent", Value: "fio-test/1.0 (this is a long user agent string)"},
 	}
+	server.mu.Lock()
 	block, err := server.encoder.Encode(fields)
 	if err != nil {
+		server.mu.Unlock()
 		t.Fatal(err)
 	}
 	if len(block) <= 64 {
+		server.mu.Unlock()
 		t.Fatalf("头块只有 %d 字节, 没触发拆分(要 > 64)", len(block))
 	}
 
-	var buf []byte
-	if err := server.writeHeaderBlock(1, block, false); err != nil {
+	if err := server.writeHeaderBlockLocked(1, block, false); err != nil {
+		server.mu.Unlock()
 		t.Fatal(err)
 	}
-	buf = server.TakeOutput()
+	server.mu.Unlock()
+	buf := server.TakeOutput()
 
 	// 切一下看看是不是 HEADERS + CONTINUATION
 	p := NewFrameParser()
