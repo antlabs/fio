@@ -128,8 +128,15 @@ func (p *MessageParser) Parse(data []byte, fn func(msg []byte) error) (int, erro
 		consumed += messageHeaderLen + int(length)
 	}
 
-	// 剩下没处理的搬回 p.buf
-	if rest := work[consumed:]; len(rest) > 0 {
+	// 剩下没处理的留回 p.buf。
+	//
+	// 如果 work 本来就是 p.buf（上一轮已经攒了数据），未消费的部分
+	// **已经在正确的位置上**，再 append 一遍就是白拷：一条跨 N 个 DATA
+	// 帧的大消息会因此退化成 O(n²)。这里直接把切片往前推。
+	if oldLen > 0 {
+		p.buf = work[consumed:]
+	} else if rest := work[consumed:]; len(rest) > 0 {
+		// work 是调用方的读缓冲区，必须拷一份留着。
 		p.buf = append(p.buf[:0], rest...)
 	} else {
 		p.buf = p.buf[:0]

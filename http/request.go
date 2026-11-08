@@ -14,10 +14,12 @@
 
 package http
 
-// Request 是一个解析好的 HTTP/1.1 请求。
+// Request 是一个解析好的请求。
 //
-// 字段由 Parser（见 parse.go）直接填好，不是从回调里攒的。Request 在
-// 下一次 Reset 之前一直有效；Body 是攒出来的副本。
+// 字段由 Parser（见 parse.go）直接填好，不是从回调里攒的。HTTP/1.1 的
+// Request 在下一次 Reset 之前一直有效；HTTP/2 的 Request（handler.go
+// 里的 bridge）**只在 ServeHTTP 调用期间有效**——Header/Body/Trailer
+// 之后会还回池子，要留就自己拷一份（和 net/http 的约定一致）。
 type Request struct {
 	Method string // "GET"、"POST" ... 原样
 	Target string // 请求目标，原样（/path?query、绝对 URI、* 都可能）
@@ -31,8 +33,20 @@ type Request struct {
 	// 完整一块。
 	Body []byte
 
+	// Trailer 是 HTTP/2 请求的 trailer 字段（HTTP/1.1 的 chunked trailer
+	// 暂不填）。名字保持对端发来的原样（h2 里都是小写）。
+	Trailer map[string]string
+
 	// ContentLength 是 Content-Length 的值，没有这个头时为 -1。
 	ContentLength int64
+
+	// connSeen/connClose/connKeepAlive 是解析器对 Connection 头的预计算。
+	//
+	// wantClose 每个请求都要判一次；把它放在解析时算好（Connection 头
+	// 本来就在遍历），就省掉了每请求一次 map 查找 + 两次 containsFold。
+	connSeen      bool
+	connClose     bool
+	connKeepAlive bool
 }
 
 // maxPreallocBody 是"按 Content-Length 预分配"的上限。

@@ -16,6 +16,7 @@ package grpc
 
 import (
 	"sync"
+	"sync/atomic"
 
 	"github.com/antlabs/fio/http2"
 )
@@ -70,12 +71,15 @@ type ServerCall struct {
 
 	// parser 从这个流的数据里切 gRPC 消息（一条消息可能跨多个 DATA 帧）
 	parser *MessageParser
-	// replied 响应发过没有（trailer 发出去才算）
-	replied bool
+	// replied 响应发过没有（trailer 发出去才算）。
+	//
+	// 用 atomic：业务有时会在别的 goroutine 里回复（或者在 OnEnd 之外
+	// 补一个回复），而 OnCall/OnMessage/OnEnd 的错误分支会读它。
+	replied atomic.Bool
 }
 
 // Replied 这次调用回复过没有。
-func (sc *ServerCall) Replied() bool { return sc.replied }
+func (sc *ServerCall) Replied() bool { return sc.replied.Load() }
 
 // Reply 回答一次一元调用：响应头 + 一条消息 + trailer（带状态）。
 func (sc *ServerCall) Reply(c *http2.Conn, msg []byte, st *Status) error {
@@ -103,12 +107,12 @@ func (sc *ServerCall) Send(c *http2.Conn, msg []byte, last bool) error {
 // Finish 收尾：trailer（带状态）。
 func (sc *ServerCall) Finish(c *http2.Conn, st *Status) error {
 	if st == nil {
-		st = StatusOK()
+		st = statusOK // 只读，不走 StatusOK() 的分配
 	}
 	if err := c.WriteTrailers(sc.StreamID, AppendStatus(nil, st)); err != nil {
 		return err
 	}
-	sc.replied = true
+	sc.replied.Store(true)
 	return nil
 }
 
@@ -145,6 +149,19 @@ func NewServerHandler(h Handler) *ServerHandler {
 // content-type 不对的流回 415——HTTP/2 上完全可能跑着非 gRPC 的东西，
 // 这里不该瞎接（真实场景里就是"同一个端口既跑 gRPC 又跑普通 HTTP/2"）。
 func (s *ServerHandler) OnHeaders(c *http2.Conn, streamID uint32, headers []http2.HeaderField, endStream bool) {
+	// 第二次 HEADERS 是 trailer（客户端流式调用结束时可能发）。请求头
+	// 在第一次就已经收好了；这里只按 END_STREAM 收尾，不要当成新请求
+	// 去查 content-type（trailer 里没有 content-type，会被误判成 415）。
+	s.mu.Lock()
+	existing := s.calls[streamID]
+	s.mu.Unlock()
+	if existing != nil {
+		if endStream {
+			s.end(c, streamID, existing)
+		}
+		return
+	}
+
 	var path, ctype string
 	for _, f := range headers {
 		switch f.Name {
@@ -176,7 +193,7 @@ func (s *ServerHandler) OnHeaders(c *http2.Conn, streamID uint32, headers []http
 	s.calls[streamID] = call
 	s.mu.Unlock()
 
-	if err := s.handler.OnCall(c, call); err != nil && !call.replied {
+	if err := s.handler.OnCall(c, call); err != nil && !call.Replied() {
 		_ = call.ReplyError(c, StatusInternal(err.Error()))
 	}
 
@@ -198,11 +215,11 @@ func (s *ServerHandler) OnData(c *http2.Conn, streamID uint32, data []byte, endS
 	// 切出一条交一条：一条消息可能跨好几个 DATA 帧，一个 DATA 帧里也
 	// 可能有好几条消息，所以**不能**假定"一帧一条"。
 	if _, err := call.parser.Parse(data, func(msg []byte) error {
-		if serr := s.handler.OnMessage(c, call, msg); serr != nil && !call.replied {
+		if serr := s.handler.OnMessage(c, call, msg); serr != nil && !call.Replied() {
 			_ = call.ReplyError(c, StatusInternal(serr.Error()))
 		}
 		return nil
-	}); err != nil && !call.replied {
+	}); err != nil && !call.Replied() {
 		// 解析失败（消息超限、压缩标志置位……）：告诉对端，别让它干等
 		_ = call.ReplyError(c, StatusInvalidArgument(err.Error()))
 		s.forget(streamID)
@@ -222,7 +239,7 @@ func (s *ServerHandler) OnRSTStream(c *http2.Conn, streamID uint32, code http2.E
 // end 流的 END_STREAM 到了。
 func (s *ServerHandler) end(c *http2.Conn, streamID uint32, call *ServerCall) {
 	defer s.forget(streamID)
-	if err := s.handler.OnEnd(c, call); err != nil && !call.replied {
+	if err := s.handler.OnEnd(c, call); err != nil && !call.Replied() {
 		_ = call.ReplyError(c, StatusInternal(err.Error()))
 	}
 }

@@ -18,9 +18,10 @@ import "strconv"
 
 // 状态码 -> 原因短语。
 //
-// 用查表而不是 map：状态行是每个响应都要拼的，map 查一次要算哈希，
-// 而且这些值不可能变（RFC 9110 定死的）。
-var statusText = map[int]string{
+// 用**数组**而不是 map：状态行是每个响应都要拼的，数组查一次没有哈希，
+// 而且这些值不可能变（RFC 9110 定死的）。600 个 string 头约 9.6KB，
+// 一次性常驻，换掉每响应的哈希查找。
+var statusText = [600]string{
 	100: "Continue",
 	101: "Switching Protocols",
 	102: "Processing",
@@ -92,8 +93,10 @@ var statusText = map[int]string{
 // StatusText 返回状态码对应原因短语。不认识的就返回一个不空串
 // （状态行里那句不能空着）。
 func StatusText(code int) string {
-	if s, ok := statusText[code]; ok {
-		return s
+	if code >= 0 && code < len(statusText) {
+		if s := statusText[code]; s != "" {
+			return s
+		}
 	}
 	return "Status " + strconv.Itoa(code)
 }

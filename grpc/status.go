@@ -143,6 +143,12 @@ type Status struct {
 //
 // **名字不能和 Code 的常量重名**（OK、Internal 这些已经是常量了），
 // 所以用 StatusOK / StatusInternal 这种前缀。
+//
+// statusOK 是内部用的共享 OK 状态（只读）。不通过 StatusOK() 暴露共享
+// 指针：调用方可能改 Message，共享会串数据。Finish 这种只读
+// AppendStatus 的热路径用它省一次分配。
+var statusOK = &Status{Code: OK}
+
 func StatusOK() *Status                        { return &Status{Code: OK} }
 func StatusNotFound(msg string) *Status        { return &Status{Code: NotFound, Message: msg} }
 func StatusUnimplemented(msg string) *Status   { return &Status{Code: Unimplemented, Message: msg} }

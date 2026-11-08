@@ -216,8 +216,19 @@ func (p *Parser) parseHeaderBlock(block []byte) error {
 		if equalFoldString(name, "upgrade") {
 			p.upgrade = true
 		}
+		// Connection 的 close/keep-alive 在这里一次算好，wantClose 每请求
+		// 直接用标志位，不再查 map + containsFold。
+		if equalFoldString(name, "connection") {
+			p.req.connSeen = true
+			if containsFoldBytes(value, "close") {
+				p.req.connClose = true
+			}
+			if containsFoldBytes(value, "keep-alive") {
+				p.req.connKeepAlive = true
+			}
+		}
 		// 同名头用逗号合并（RFC 9110 5.3）
-		key := string(name)
+		key := internHeaderName(name)
 		if last, ok := p.req.Header[key]; ok {
 			merged := last + ", " + string(value)
 			p.req.Header[key] = merged
@@ -245,6 +256,86 @@ func indexCRLF(b []byte, off int) int {
 		}
 	}
 	return -1
+}
+
+// internedHeaderNames 是常见头名的常量串表。
+//
+// map 查找的 key 写成 string(name) 时，编译器对"只读查找"不做分配
+// （runtime.mapaccess 收的是 string header），所以命中时头名一个堆分配
+// 都没有。键同时收常见的大小写两种写法，保持 Request.Header 的"名字
+// 原样"语义。
+var internedHeaderNames = map[string]string{
+	"Host": "Host", "host": "host",
+	"User-Agent": "User-Agent", "user-agent": "user-agent",
+	"Accept": "Accept", "accept": "accept",
+	"Accept-Encoding": "Accept-Encoding", "accept-encoding": "accept-encoding",
+	"Accept-Language": "Accept-Language", "accept-language": "accept-language",
+	"Connection": "Connection", "connection": "connection",
+	"Content-Type": "Content-Type", "content-type": "content-type",
+	"Content-Length": "Content-Length", "content-length": "content-length",
+	"Cookie": "Cookie", "cookie": "cookie",
+	"Origin": "Origin", "origin": "origin",
+	"Referer": "Referer", "referer": "referer",
+	"Authorization": "Authorization", "authorization": "authorization",
+	"Cache-Control": "Cache-Control", "cache-control": "cache-control",
+	"Pragma": "Pragma", "pragma": "pragma",
+	"Upgrade": "Upgrade", "upgrade": "upgrade",
+	"If-None-Match":            "If-None-Match",
+	"If-Modified-Since":        "If-Modified-Since",
+	"Range":                    "Range",
+	"X-Forwarded-For":          "X-Forwarded-For",
+	"X-Real-Ip":                "X-Real-Ip",
+	"Sec-WebSocket-Key":        "Sec-WebSocket-Key",
+	"Sec-WebSocket-Version":    "Sec-WebSocket-Version",
+	"Sec-WebSocket-Protocol":   "Sec-WebSocket-Protocol",
+	"Sec-WebSocket-Extensions": "Sec-WebSocket-Extensions",
+	"Sec-Fetch-Mode":           "Sec-Fetch-Mode",
+	"Sec-Fetch-Site":           "Sec-Fetch-Site",
+	"Sec-Fetch-Dest":           "Sec-Fetch-Dest",
+	"Sec-Fetch-User":           "Sec-Fetch-User",
+}
+
+// internHeaderName 命中常见头名时返回常量串，避免每请求一次堆分配。
+func internHeaderName(name []byte) string {
+	if s, ok := internedHeaderNames[string(name)]; ok {
+		return s
+	}
+	return string(name)
+}
+
+// containsFoldBytes 是大小写无关的子串查找（ASCII）。
+func containsFoldBytes(b []byte, sub string) bool {
+	if len(sub) == 0 {
+		return true
+	}
+	if len(b) < len(sub) {
+		return false
+	}
+	for i := 0; i+len(sub) <= len(b); i++ {
+		if equalFoldBytes(b[i:i+len(sub)], sub) {
+			return true
+		}
+	}
+	return false
+}
+
+func equalFoldBytes(a []byte, b string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := 0; i < len(a); i++ {
+		ca, cb := a[i], b[i]
+		if 'A' <= ca && ca <= 'Z' {
+			ca += 'a' - 'A'
+		}
+		if 'A' <= cb && cb <= 'Z' {
+			cb += 'a' - 'A'
+		}
+		if ca != cb {
+			return false
+		}
+	}
+	return true
 }
 
 func equalFoldString(b []byte, s string) bool {

@@ -77,6 +77,10 @@ type ResponseWriter struct {
 	chunked bool
 	// finished chunked 的收尾块发过没有
 	finished bool
+
+	// chunkBuf 是"小块 chunked 拼成一次 send"用的复用缓冲（连接级）。
+	// 大块走 writev，不用它。
+	chunkBuf []byte
 }
 
 // Header 返回可以设置的头。
@@ -159,19 +163,41 @@ func (w *ResponseWriter) writeChunkedFirst(body []byte) (int, error) {
 	return len(body), nil
 }
 
+// maxStackChunk 是"拼到 chunkBuf 里一次 send"的 chunk 上限。
+const maxStackChunk = 4096
+
+// crlf 是 chunked 的分隔符（只读，不分配）。
+var crlf = []byte("\r\n")
+
 // writeChunk 按 chunked 格式写一段体：`<十六进制长度>\r\n<数据>\r\n`。
+//
+// 小块（≤4KB）拼到连接级复用的 chunkBuf 里**一次 send**；大块用
+// sendv(头, 体) 一次 writev + CRLF 单独写。原来是无条件三次 send，
+// 逐块 Write 的流式响应每块多 2 次系统调用。
 func (w *ResponseWriter) writeChunk(body []byte) error {
 	var head [18]byte
 	n := copy(head[:], strconv.AppendInt(head[:0], int64(len(body)), 16))
 	head[n] = '\r'
 	head[n+1] = '\n'
-	if err := w.send(head[:n+2]); err != nil {
+	headLen := n + 2
+
+	if len(body) <= maxStackChunk {
+		need := headLen + len(body) + 2
+		if cap(w.chunkBuf) < need {
+			w.chunkBuf = make([]byte, 0, need)
+		}
+		b := w.chunkBuf[:0]
+		b = append(b, head[:headLen]...)
+		b = append(b, body...)
+		b = append(b, '\r', '\n')
+		return w.send(b)
+	}
+
+	// 大块：头 + 体一次 writev，CRLF 单独写（两次系统调用）。
+	if err := w.sendv(head[:headLen], body); err != nil {
 		return err
 	}
-	if err := w.send(body); err != nil {
-		return err
-	}
-	return w.send([]byte("\r\n"))
+	return w.send(crlf)
 }
 
 // finish 响应收尾：chunked 的补一个"最后一块"（长度 0 的 chunk）。
@@ -566,10 +592,23 @@ func (ch *ConnHandler) OnClose(c *engine.Conn, err error) {}
 //   - HTTP/1.1 默认复用，除非显式 Connection: close
 //   - HTTP/1.0 默认关，除非显式 Connection: keep-alive
 func wantClose(r *Request) bool {
+	// 解析器已经把 Connection 里的 close/keep-alive 预计算好了
+	// （见 parseHeaderBlock），这里不查 map、不再扫头值。
+	if r.connSeen {
+		if r.connClose {
+			return true
+		}
+		if r.connKeepAlive && r.Proto != proto11 {
+			return false
+		}
+		return r.Proto != proto11
+	}
+
+	// 手工构造的 Request（没经过 parser）走兼容路径。
 	conn, ok := r.Get("Connection")
 	if !ok {
 		// 没有这个头：1.1 复用，1.0 关
-		return r.Proto != "HTTP/1.1"
+		return r.Proto != proto11
 	}
 	// 有的话按它说的来（大小写无关，值里可能有多个 token）
 	hasClose := containsFold(conn, "close")
@@ -577,10 +616,10 @@ func wantClose(r *Request) bool {
 	if hasClose {
 		return true
 	}
-	if hasKeepAlive && r.Proto != "HTTP/1.1" {
+	if hasKeepAlive && r.Proto != proto11 {
 		return false
 	}
-	return r.Proto != "HTTP/1.1"
+	return r.Proto != proto11
 }
 
 // containsFold 是大小写无关的子串查找（ASCII）。
@@ -677,6 +716,7 @@ func (w *ResponseWriter) reset(c *engine.Conn, proto string) {
 	w.finished = false
 	w.closeAfterWrite = false
 	w.deferred = false
+	w.chunkBuf = w.chunkBuf[:0]
 	// **用 clear 而不是逐个 delete**：clear 是 runtime 内建，小 map 上比
 	// 遍历 delete 快得多（原来那个循环还要顺便回收头值切片，见下面）。
 	// 实测（baseline，gcannon 混合 GET/POST）：reset 在 profile 里占 3.11%，

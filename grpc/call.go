@@ -17,6 +17,7 @@ package grpc
 import (
 	"fmt"
 	"strings"
+	"sync"
 
 	"github.com/antlabs/fio/http2"
 )
@@ -101,9 +102,16 @@ type Call struct {
 	// StreamID 是这次调用用的 HTTP/2 流
 	StreamID uint32
 
-	// parser 是收消息用的（一个流一个）
+	// parser 是收消息用的（一个流一个）。只由收包 goroutine 访问
+	// （OnData），Send 不碰它。
 	parser *MessageParser
 
+	// mu 保护下面这几个收包侧字段：OnHeaders 在收包 goroutine 写，
+	// 用户的 Status/Done/Headers 可能在另一个 goroutine 读。
+	//
+	// 注意 OnData 不持这把锁调用用户回调——回调里可以安全地调
+	// Status/Done（RLock 可重入读）。
+	mu sync.RWMutex
 	// status 是调用的结果。trailer 到了才有值。
 	status *Status
 	// gotStatus trailer 到了没有
@@ -121,6 +129,9 @@ func NewCall(streamID uint32) *Call {
 // OnHeaders 收到头（可能是响应头，也可能是 trailer——gRPC 的 trailer 就是
 // 一个带 END_STREAM 的 HEADERS 帧）。
 func (c *Call) OnHeaders(fields []http2.HeaderField, endStream bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
 	// 有 grpc-status 的就是 trailer
 	for _, f := range fields {
 		if f.Name == headerStatus {
@@ -143,6 +154,8 @@ func (c *Call) OnData(data []byte, fn func(msg []byte) error) error {
 
 // Status 返回调用结果。trailer 还没到返回 nil。
 func (c *Call) Status() *Status {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
 	if !c.gotStatus {
 		return nil
 	}
@@ -150,10 +163,26 @@ func (c *Call) Status() *Status {
 }
 
 // Done 调用结束了吗（收到 trailer）。
-func (c *Call) Done() bool { return c.gotStatus }
+func (c *Call) Done() bool {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.gotStatus
+}
 
 // Headers 响应头。
-func (c *Call) Headers() []http2.HeaderField { return c.headers }
+//
+// 返回拷贝：内部的切片会被下一帧头块复用，直接交出去会让调用方读到
+// 已经被覆盖的内容。
+func (c *Call) Headers() []http2.HeaderField {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if len(c.headers) == 0 {
+		return nil
+	}
+	out := make([]http2.HeaderField, len(c.headers))
+	copy(out, c.headers)
+	return out
+}
 
 // ClientConn 是客户端这边的一次调用发起者。
 //

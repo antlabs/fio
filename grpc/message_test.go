@@ -103,6 +103,39 @@ func TestMessageSplitAcrossFrames(t *testing.T) {
 	}
 }
 
+// 大消息跨很多帧：每次都把未消费的部分往前搬的话是 O(n²)，这里用
+// 1MB / 4KB 一帧把正确性和攒缓冲的路径都过一遍。
+func TestLargeMessageAcrossManyFrames(t *testing.T) {
+	const (
+		size  = 1 << 20
+		frame = 4096
+	)
+	msg := bytes.Repeat([]byte("0123456789abcdef"), size/16)
+	wire := Encode(nil, msg)
+
+	p := NewMessageParser(0)
+	var got []byte
+	for off := 0; off < len(wire); {
+		n := frame
+		if off+n > len(wire) {
+			n = len(wire) - off
+		}
+		if _, err := p.Parse(wire[off:off+n], func(m []byte) error {
+			got = append(got, m...)
+			return nil
+		}); err != nil {
+			t.Fatalf("offset %d: %v", off, err)
+		}
+		off += n
+	}
+	if !bytes.Equal(got, msg) {
+		t.Fatalf("消息长度 = %d, want %d", len(got), len(msg))
+	}
+	if p.Buffered() != 0 {
+		t.Errorf("还有 %d 字节攒着", p.Buffered())
+	}
+}
+
 // 一次喂一条半：切出一条，剩下半条留着。
 func TestPartialMessageBuffered(t *testing.T) {
 	first := Encode(nil, []byte("first"))
